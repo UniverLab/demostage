@@ -29,6 +29,7 @@ demo capture  ──>  demo.toml  ──>  demo record  ──>  demo.rec  ─�
 | `export`    | `demo.rec`       | `dist/…`         | Render the recording to `gif` or `mp4`. Never executes. Needs `--force` for a faithful capture. |
 | `edit`      | `demo.toml`       | `demo.toml`     | Edit the timeline interactively — mark several steps for bulk edits. |
 | `doctor`    | —                 | a report         | Check the browser/ffmpeg/display deps and report fixes (`--fix` installs them on apt). |
+| `update`    | —                 | a newer `demo`   | Explicitly check for and install a newer stable release — always asks first; refuses cargo installs. |
 
 **Live control** (run during a `demo capture`, from the captured shell or another
 terminal in the same directory):

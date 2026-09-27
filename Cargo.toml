@@ -33,6 +33,12 @@ headless_chrome = { version = "1", features = ["fetch"] }
 png = "0.17"
 regex = "1"
 hayro = "0.7.1"
+# Update path (`demo update`) — all already in the lock as transitives of
+# headless_chrome/ffmpeg-sidecar, so promoting them adds no new crate.
+ureq = "3"      # existing HTTP stack (rustls + webpki-roots) — NOT reqwest
+flate2 = "1"    # tar.gz decode
+tar = "0.4"     # archive entry extraction
+sha2 = "0.11"   # SHA256 of the release asset
+tempfile = "3"  # staging directory + same-dir rename (promoted from dev-deps)
 
 [dev-dependencies]
-tempfile = "3"

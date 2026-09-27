@@ -56,7 +56,8 @@ use std::process::ExitCode;
 use cli::{Cli, Command};
 
 /// Dispatch a parsed CLI invocation to its command, returning the process exit
-/// code. Only `check` reports failure through the exit code; everything else
+/// code. Only `check` and `update` report through the exit code (`update`
+/// uses `1` for "an update is available" in `--check` mode); everything else
 /// surfaces problems as an [`Error`].
 pub fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command {
@@ -64,6 +65,8 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
         Command::Record(args) => commands::record::run(args).map(|()| ExitCode::SUCCESS),
         Command::Export(args) => commands::export::run(args).map(|()| ExitCode::SUCCESS),
         Command::Doctor(args) => commands::doctor::run(args).map(|()| ExitCode::SUCCESS),
+        Command::Update(args) => commands::update::run_update(args.check, args.yes)
+            .map(|code| ExitCode::from(code as u8)),
         Command::Edit(args) => commands::edit::run(args).map(|()| ExitCode::SUCCESS),
         Command::Stop => commands::stop::run().map(|()| ExitCode::SUCCESS),
         Command::Open(args) => commands::open::run(args).map(|()| ExitCode::SUCCESS),

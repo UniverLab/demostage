@@ -204,6 +204,38 @@ It reports three checks:
 ffmpeg) — it runs `sudo`, so it prompts in your terminal. On other platforms it
 prints the exact `fix:` commands to run yourself.
 
+## `demo update`
+
+```sh
+demo update [--check] [--yes]
+```
+
+Check GitHub for a newer stable release and — only after you say yes — replace
+the running `demo` binary.
+
+- **It always asks first.** The prompt defaults to **no**; declining (or
+  Ctrl-C) leaves everything exactly as it was. `--yes` skips the prompt for
+  scripts.
+- **`--check` changes nothing.** Exit code **1** = a newer stable release
+  exists, **0** = you're current. It downloads nothing and touches no local
+  path.
+- **Stable only.** Releases are read from the `/releases` list and filtered in
+  code: no drafts, no prereleases, and only tags strictly newer than your
+  version (numeric per-component compare, so `0.3.10` beats `0.3.9`).
+- **The right asset, verified.** The archive is named exactly as the release
+  workflow publishes it — `demo-<tag>-<target>.tar.gz`, e.g.
+  `demo-v0.3.2-x86_64-unknown-linux-musl.tar.gz` — and is checked against the
+  release's `SHA256SUMS.txt` when one ships (a missing file skips, a mismatch
+  is fatal).
+- **State survives the swap.** The new binary is staged beside the running one
+  and renamed over it. `demo.toml` scores, recordings (`.rec`), the raw macro
+  and the capture sources are never read or written.
+- **Refusals.** A `demo` installed under `~/.cargo/bin` is owned by cargo —
+  run `cargo install --force demo-stage`. Platforms with no published
+  `tar.gz` asset (Windows, linux/arm64) are refused before any download.
+- **No background check.** DemoStage only ever contacts GitHub when you run
+  `demo update`, and it reports network failures loudly.
+
 ## `demo edit`
 
 ```sh

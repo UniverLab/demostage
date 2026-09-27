@@ -534,6 +534,7 @@ dependencies = [
  "clap",
  "crossterm 0.28.1",
  "ffmpeg-sidecar",
+ "flate2",
  "fontdue",
  "gif",
  "hayro",
@@ -544,9 +545,12 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sha2",
+ "tar",
  "tempfile",
  "thiserror 2.0.18",
  "toml",
+ "ureq",
  "vt100",
 ]
 

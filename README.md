@@ -127,6 +127,33 @@ the clean path the default.
 | `demo export` | Pure playback: render to gif or mp4 (no re-execution, ffmpeg/chromium auto-provisioned) |
 | `demo edit` | Edit the timeline interactively — mark several steps (space) for bulk delete/convert/replace |
 | `demo doctor` | Verify the environment and install missing tools |
+| `demo update` | Check for / install a newer stable release — always asks first (default: no) |
+
+### demo update
+
+```sh
+demo update            # look for a newer stable release, then ask (default: NO)
+demo update --check    # report only — exit 1 = update available, 0 = current
+demo update --yes      # install without the prompt (scriptable)
+```
+
+Never runs on its own: DemoStage has **no background update check** — the only
+network `demo` opens is this explicit command, and it fails loudly when it
+can't reach GitHub. It picks the newest *stable* GitHub release (drafts and
+prereleases excluded), compares it to your version with a semver compare, and
+**asks before doing anything** (the prompt defaults to **no**).
+
+- **Your state survives.** Only the running binary is replaced — `demo.toml`
+  scores, recordings (`.rec`), the raw macro and the capture sources are never
+  touched.
+- **Checksums.** The downloaded archive is verified against the release's
+  `SHA256SUMS.txt` when one ships; a mismatch aborts, a missing file (older
+  releases) skips.
+- **Cargo installs are refused.** A `demo` under `~/.cargo/bin` is owned by
+  cargo: run `cargo install --force demo-stage`.
+- **No published asset? No guessing.** Windows and linux/arm64 have no
+  `tar.gz` in the release matrix, so `update` refuses instead of inventing a
+  name.
 
 ### Live control (during a capture)
 

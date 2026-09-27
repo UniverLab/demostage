@@ -28,6 +28,27 @@ cargo install demo-stage
 curl -fsSL https://get.univerlab.org/demo-stage | sh
 ```
 
+## Self-update
+
+If you installed the `demo` binary yourself (installer script or a GitHub
+release archive), it updates itself — only when you ask:
+
+```sh
+demo update           # asks first; the default answer is no
+demo update --check   # exit 1 = a newer stable release exists, 0 = current
+```
+
+There is **no background update check**: `demo` only contacts GitHub when you
+run `demo update`. The swap replaces just the binary — your `demo.toml`
+scores, recordings and capture sources are untouched.
+
+A binary installed with **cargo** is owned by cargo, so `demo update` refuses
+and tells you to run:
+
+```sh
+cargo install --force demo-stage
+```
+
 ## Optional external tools
 
 `gif` works with **no external dependencies**.

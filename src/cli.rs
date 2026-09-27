@@ -26,6 +26,9 @@ pub enum Command {
     Export(ExportArgs),
     /// Check the environment for browser/video dependencies and report fixes.
     Doctor(DoctorArgs),
+    /// Check for and install a newer stable release. Always asks first
+    /// (default: no) and never runs on its own; refuses cargo installs.
+    Update(UpdateArgs),
     /// Interactively edit timing/wait steps in a demo score.
     Edit(EditArgs),
     /// End the in-progress capture. Run from inside it, or from another
@@ -53,6 +56,18 @@ pub struct DoctorArgs {
     /// instead of the installed Linux one. Reachable without `--fix`.
     #[arg(long)]
     pub route_browser: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct UpdateArgs {
+    /// Only check whether an update exists: exit 1 when a newer stable release
+    /// is out, 0 when current. Downloads nothing and changes nothing.
+    #[arg(long)]
+    pub check: bool,
+
+    /// Skip the confirmation prompt (install without asking).
+    #[arg(long)]
+    pub yes: bool,
 }
 
 #[derive(Debug, Args)]
