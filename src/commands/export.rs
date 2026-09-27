@@ -85,7 +85,8 @@ fn resolve_speed(flag: Option<f64>, from_score: Option<&str>) -> Result<f64> {
     }
 }
 
-/// Resolve the export targets: the score's `[demo] targets`, else every format.
+/// Resolve the export targets: the score's `[demo] targets`, else the defaults
+/// (gif + mp4; `svg` is opt-in).
 fn resolve_targets(from_score: Option<&[String]>) -> Result<Vec<Target>> {
     let Some(names) = from_score else {
         return Ok(all_targets());

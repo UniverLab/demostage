@@ -522,6 +522,9 @@ mod tests {
     fn a_time_past_the_end_clamps_to_the_last_frame() {
         assert_eq!(frame_index(Some(99.0), 15, 10), 9);
         assert_eq!(frame_index(Some(0.61), 15, 10), 9);
+        // Negative seconds never survive `parse_at`, but the selection itself
+        // clamps to the first frame rather than wrapping to a huge index.
+        assert_eq!(frame_index(Some(-1.0), 15, 10), 0);
     }
 
     #[test]
@@ -687,6 +690,62 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("no frames"), "unhelpful: {err}");
         assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The score the replay snapshot below renders: a 10×2 terminal, 10 fps.
+    fn replay_score() -> Score {
+        toml::from_str(
+            r#"
+[demo]
+name = "snap"
+[layout]
+width = 100
+height = 40
+fps = 10
+  [[layout.panes]]
+  id = "c"
+  type = "terminal"
+  x = 0
+  y = 0
+  width = 100
+  height = 40
+"#,
+        )
+        .unwrap()
+    }
+
+    /// Two frames of output: `ab`, then `cd` on the second row.
+    fn replay_rec() -> Recording {
+        Recording {
+            cols: 10,
+            rows: 2,
+            title: "t".into(),
+            events: vec![(0.0, "ab".into()), (0.3, "\r\ncd".into())],
+            captions: vec![],
+            focuses: vec![],
+            duration: 0.5,
+        }
+    }
+
+    #[test]
+    fn a_small_replay_exports_a_byte_stable_poster() {
+        let rec = replay_rec();
+        let score = replay_score();
+        let dir = std::env::temp_dir().join(format!("demostage_svg_replay_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("poster.svg");
+        // No `--at`: the poster picks the LAST frame of the replay, so this
+        // also pins the default frame selection end to end.
+        write_svg(&path, &rec, &score, None).unwrap();
+        let doc = std::fs::read_to_string(&path).unwrap();
+        let expected = r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="100" height="38" viewBox="0 0 100 38">
+<rect x="0" y="0" width="100" height="38" rx="8" fill="#0b0f14"/>
+<text x="0" y="14" font-family="'DejaVu Sans Mono', monospace" font-size="16" fill="#c8c8c8" textLength="20" lengthAdjust="spacing" xml:space="preserve">ab</text>
+<text x="0" y="33" font-family="'DejaVu Sans Mono', monospace" font-size="16" fill="#c8c8c8" textLength="20" lengthAdjust="spacing" xml:space="preserve">cd</text>
+</svg>
+"##;
+        assert_eq!(doc, expected, "deterministic snapshot drifted");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -45,8 +45,9 @@ can't run (offline), you get a clear message and can install ffmpeg yourself.
 ## svg (opt-in)
 
 A **static poster**: one frame of the recording drawn as real vector text.
-Adjacent cells with the same style are merged into a single `<text>` run, coloured
-backgrounds become rounded `<rect>`s, and every run carries `textLength` +
+Adjacent cells with the same style are merged into a single `<text>` run, the
+canvas/pane is one rounded `<rect rx="8">` with a plain `<rect>` per run of
+coloured background cells, and every run carries `textLength` +
 `lengthAdjust="spacing"` so the glyphs land on their grid columns no matter which
 monospace the viewer has — the `font-family` falls back to `monospace`. The result
 is **crisp, selectable and tiny**, and it opens in any browser, editor or print

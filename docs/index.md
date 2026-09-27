@@ -1,6 +1,6 @@
 ---
 title: DemoStage
-description: Demos as Code — record a terminal session, normalize it into a clean declarative score, and compile it to gif or mp4.
+description: Demos as Code — record a terminal session, normalize it into a clean declarative score, and compile it to gif, mp4, or an opt-in SVG poster.
 order: 1
 ---
 
@@ -26,7 +26,7 @@ demo capture  ──>  demo.toml  ──>  demo record  ──>  demo.rec  ─�
 |---|---|---|---|
 | `capture`   | TTY               | `demo.toml` + `demo.rec` (`--raw` adds the macro) | Capture a live session into an editable score + a faithful recording (forces a clean prompt). |
 | `record`    | `demo.toml`       | `demo.rec`      | Validate, then re-execute the score in a PTY → a clean, humanized recording. |
-| `export`    | `demo.rec`       | `dist/…`         | Render the recording to `gif` or `mp4`. Never executes. Needs `--force` for a faithful capture. |
+| `export`    | `demo.rec`       | `dist/…`         | Render the recording to `gif` or `mp4` — or the opt-in `svg` poster. Never executes. Needs `--force` for a faithful capture. |
 | `edit`      | `demo.toml`       | `demo.toml`     | Edit the timeline interactively — mark several steps for bulk edits. |
 | `doctor`    | —                 | a report         | Check the browser/ffmpeg/display deps and report fixes (`--fix` installs them on apt). |
 | `update`    | —                 | a newer `demo`   | Explicitly check for and install a newer stable release — always asks first; refuses cargo installs. |

@@ -78,7 +78,7 @@ rm -f ~/.local/bin/demo-stage
 demo capture                      # run the demo, then `demo stop` (or exit / Ctrl-D) to finish
                                   # → demo.toml (editable score) + demo.rec (faithful take)
 demo record                       # re-run demo.toml for a clean, humanized demo.rec
-demo export                       # no args → every format (gif, mp4)
+demo export                       # no args → the defaults (gif, mp4 — svg is opt-in)
 demo export gif,mp4 --speed 2x        # several at once, retimed 2× faster
 ```
 
@@ -124,7 +124,7 @@ the clean path the default.
 |---|---|
 | `demo capture` | Live capture: record the session, auto-normalize into a clean score and faithful `.rec` |
 | `demo record` | Re-execute `demo.toml` cleanly, producing a humanized recording |
-| `demo export` | Pure playback: render to gif or mp4 (no re-execution, ffmpeg/chromium auto-provisioned) |
+| `demo export` | Pure playback: render to gif or mp4 — or the opt-in `svg` poster (no re-execution, ffmpeg/chromium auto-provisioned) |
 | `demo edit` | Edit the timeline interactively — mark several steps (space) for bulk delete/convert/replace |
 | `demo doctor` | Verify the environment and install missing tools |
 | `demo update` | Check for / install a newer stable release — always asks first (default: no) |
@@ -188,6 +188,7 @@ wizards are kept out of the finished demo.
 |---|---|---|---|
 | `gif`  | animated GIF (rasterized) | READMEs, chat, anywhere `<img>` works | — (pure Rust, embedded font) |
 | `mp4`  | H.264 video | landings / the web (`<video>`) | ffmpeg — **auto-fetched on first use** |
+| `svg`  | static poster (vector text) | README stills, print, docs — **opt-in** | — (pure Rust) |
 | browser panes (PDF/web) | composited into gif/mp4 | a scene beside the terminal | Chromium — **auto-fetched on first use** |
 
 `gif` works fully offline. `mp4` and multi-scene **browser panes** provision

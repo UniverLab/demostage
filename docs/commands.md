@@ -151,13 +151,14 @@ Render a **recording** to one or more formats. Pure playback — it replays a
 recording and **never executes** the demo.
 
 ```sh
-demo export [fmt[,fmt…]] [demo.rec] [--speed 2x]
+demo export [fmt[,fmt…]] [demo.rec] [--speed 2x] [--at SECONDS]
 ```
 
 - `[formats]` — which formats to build, the first argument, **comma-separated**:
-  `gif`, `mp4`, or `all` (see [export targets](export-targets.md)).
+  `gif`, `mp4`, `svg`, or `all` (see [export targets](export-targets.md)).
   Pass several at once (`demo export gif,mp4`) — and **omit it entirely to build
-  every supported format** (`demo export` ≡ `demo export all`).
+  the default formats** (`demo export` ≡ `demo export all` ≡ `gif,mp4`). `svg`
+  is **opt-in**: name it (`demo export svg`, `demo export gif,svg`).
 - `[input]` — the recording to render; defaults to `demo.rec`. Accepts a `.rec`
   from `demo capture` (faithful — handles interactive tools, secrets and side
   effects that re-execution can't) or from `demo record` (a re-executed, humanized
@@ -165,6 +166,9 @@ demo export [fmt[,fmt…]] [demo.rec] [--speed 2x]
   render it directly.
 - `--speed` — retimes the recording: `2x`, `3x`, `0.5x` (a bare number works too).
   `1x` (the default) keeps the recorded pace.
+- `--at` — for the `svg` poster: the frame this many **seconds** into the demo
+  (`--at 12.5`). Defaults to the **last frame**; a value past the end clamps to
+  it. Ignored by `gif`/`mp4`, which render the whole timeline.
 - `--force` — render a **faithful capture** as-is. By default `export` refuses a
   capture's `.rec` (its typing/idle aren't humanized) and points you at
   `demo record` for a clean re-take; pass `--force` to render the live capture
@@ -176,7 +180,9 @@ Each format is written to its default path `<output_dir>/<name>.<ext>`.
 
 For a **multi-pane stage**, `gif`/`mp4` composite the recorded terminal with its
 browser panes — each captured via headless Chromium (auto-provisioned) and
-revealed at the moment the timeline focuses it.
+revealed at the moment the timeline focuses it. An `svg` poster of a staged
+score falls back to embedding **one** composited frame as a base64 PNG — a
+composited canvas has no cell grid to draw as vector text.
 
 ## `demo doctor`
 

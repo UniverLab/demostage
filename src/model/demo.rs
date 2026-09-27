@@ -69,8 +69,9 @@ pub struct DemoMeta {
     /// assets are the only remaining evidence of it. `--speed` still wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speed: Option<String>,
-    /// Which formats this demo publishes (`["gif", "mp4"]`). Absent → every
-    /// supported format. A positional target on the command line still wins.
+    /// Which formats this demo publishes (`["gif", "mp4", "svg"]`). Absent →
+    /// the defaults (gif + mp4 — `svg` is opt-in and must be named). A
+    /// positional target on the command line still wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub targets: Option<Vec<String>>,
 }
