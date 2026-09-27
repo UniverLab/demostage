@@ -66,7 +66,7 @@ pub fn run(args: ExportArgs) -> Result<()> {
         None => resolve_targets(score.demo.targets.as_deref())?,
     };
     for target in targets {
-        let path = render(&rec, &score, target, speed)?;
+        let path = render(&rec, &score, target, speed, args.at)?;
         println!("exported {} → {}", args.input.display(), path.display());
     }
     Ok(())
@@ -98,8 +98,9 @@ fn resolve_targets(from_score: Option<&[String]>) -> Result<Vec<Target>> {
         .map(|n| match n.trim().to_ascii_lowercase().as_str() {
             "gif" => Ok(Target::Gif),
             "mp4" => Ok(Target::Mp4),
+            "svg" => Ok(Target::Svg),
             other => Err(Error::Export(format!(
-                "[demo] targets in the score: unknown format '{other}' (expected gif or mp4)"
+                "[demo] targets in the score: unknown format '{other}' (expected gif, mp4 or svg)"
             ))),
         })
         .collect()
@@ -256,6 +257,18 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("webm"), "unhelpful message: {err}");
+    }
+
+    #[test]
+    fn the_score_targets_list_accepts_svg() {
+        assert_eq!(
+            resolve_targets(Some(&["svg".to_string()])).unwrap(),
+            vec![Target::Svg]
+        );
+        assert_eq!(
+            resolve_targets(Some(&["gif".to_string(), "svg".to_string()])).unwrap(),
+            vec![Target::Gif, Target::Svg]
+        );
     }
 
     use super::*;
@@ -525,6 +538,7 @@ height = 100
             quality: None,
             speed: Some(1.0),
             force: false,
+            at: None,
         };
         let r = resolve_export_resolution(&args, 1920, 1080).unwrap();
         assert_eq!(r, Some((800, 600)));
@@ -540,6 +554,7 @@ height = 100
             quality: Some("hd".into()),
             speed: Some(1.0),
             force: false,
+            at: None,
         };
         let r = resolve_export_resolution(&args, 1920, 1080).unwrap();
         assert_eq!(r, Some((1280, 720)));
@@ -555,6 +570,7 @@ height = 100
             quality: Some("fullhd".into()),
             speed: Some(1.0),
             force: false,
+            at: None,
         };
         let r = resolve_export_resolution(&args, 1920, 1080).unwrap();
         assert_eq!(r, Some((1920, 1080)));
@@ -570,6 +586,7 @@ height = 100
             quality: None,
             speed: Some(1.0),
             force: false,
+            at: None,
         };
         let r = resolve_export_resolution(&args, 1920, 1080).unwrap();
         assert_eq!(r, None);

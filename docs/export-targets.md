@@ -12,10 +12,16 @@ auto-provision their tool (ffmpeg / Chromium) on first use. Pass both at once
 (`demo export gif,mp4`), **omit the format to build them all** (`demo export`),
 and use `--speed 2x` (or `3x`, `0.5x`) to retime the whole demo.
 
+There is also a third, **opt-in** target: **`svg`**, a static poster drawn as
+vector text. Naming no format (or naming `all`) still builds **only `gif` +
+`mp4`** — `svg` is built when you ask for it by name, alone or combined
+(`demo export svg`, `demo export gif,svg`).
+
 | Target | Output | Best for | External tool |
 |---|---|---|---|
 | `gif`  | animated GIF | READMEs, chat, GitHub — anywhere `<img>` works | — (pure Rust) |
 | `mp4`  | H.264 video | landings / the web (`<video>`), CDN-friendly | ffmpeg — **auto-fetched** |
+| `svg`  | static poster (vector text) | README stills, print, docs — **opt-in** | — (pure Rust) |
 | browser panes | composited into gif/mp4 | a PDF / web scene beside the terminal | Chromium — **auto-fetched** |
 
 > A text-based, framework-agnostic web player (a *DemoStagePlayer*, with crisp
@@ -35,6 +41,29 @@ Encoded with **ffmpeg**, which DemoStage provisions **tectonic-style**: if it
 isn't on your `PATH`, the first `mp4` export notifies you and downloads a managed
 static build into a cache, then reuses it. No manual install step. If the download
 can't run (offline), you get a clear message and can install ffmpeg yourself.
+
+## svg (opt-in)
+
+A **static poster**: one frame of the recording drawn as real vector text.
+Adjacent cells with the same style are merged into a single `<text>` run, coloured
+backgrounds become rounded `<rect>`s, and every run carries `textLength` +
+`lengthAdjust="spacing"` so the glyphs land on their grid columns no matter which
+monospace the viewer has — the `font-family` falls back to `monospace`. The result
+is **crisp, selectable and tiny**, and it opens in any browser, editor or print
+workflow.
+
+- **Not animated — on purpose.** No SMIL, no CSS: animation stays with `gif`/`mp4`,
+  which carry the motion. The SVG is a still.
+- **`--at <seconds>`** picks the frame, e.g. `demo export svg --at 12.5 demo.rec`.
+  It defaults to the **last frame**, and a value past the end clamps to it.
+  Ignored by `gif`/`mp4`.
+- **`demo export` (no format / `all`) does not build it** — `svg` is opt-in and
+  must be named: `demo export svg` or `demo export gif,svg`.
+- **Braille cells** (`U+2800`–`U+28FF`, what tools like mapscii draw with) become
+  procedural `<circle>` dots: viewer fonts generally lack those glyphs.
+- **Staged (multi-pane) scores fall back** to embedding **one** rasterized frame
+  as a base64 PNG inside the SVG — a composited canvas has no cell grid to draw
+  from. Documented limitation, not vector text.
 
 ## browser panes (multi-scene)
 

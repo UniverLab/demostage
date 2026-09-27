@@ -1,6 +1,6 @@
 ---
 title: Commands
-description: Reference for demo capture, record, export, edit, doctor and the live capture-control commands.
+description: Reference for demo capture, record, export, edit, doctor, update and the live capture-control commands.
 order: 5
 ---
 

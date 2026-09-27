@@ -188,8 +188,9 @@ pub struct RecordArgs {
 
 #[derive(Debug, Args)]
 pub struct ExportArgs {
-    /// Formats to build, comma-separated — `gif`, `mp4`, or `all` (e.g. `gif,mp4`).
-    /// Omit it to build every supported format.
+    /// Formats to build, comma-separated — `gif`, `mp4`, `svg`, or `all` (e.g.
+    /// `gif,mp4` or `gif,svg`). `all` means gif + mp4 — `svg` is opt-in and
+    /// only built when asked for by name. Omit it to build every default format.
     #[arg(value_parser = parse_targets)]
     pub targets: Option<TargetList>,
 
@@ -226,18 +227,25 @@ pub struct ExportArgs {
     /// `1920x1080`). Overrides the capture-time resolution.
     #[arg(long, conflicts_with_all = ["aspect", "quality"])]
     pub resolution: Option<String>,
+
+    /// For `svg` posters: the frame at this many seconds into the demo, e.g.
+    /// `--at 12.5`. Defaults to the last frame (values past the end clamp to
+    /// it). Ignored by gif/mp4, which render the whole timeline.
+    #[arg(long, value_name = "SECONDS", value_parser = parse_at)]
+    pub at: Option<f64>,
 }
 
 /// One or more export targets parsed from a comma-separated token.
 #[derive(Debug, Clone)]
 pub struct TargetList(pub Vec<Target>);
 
-/// Every format `demo export` builds when no target is given.
+/// Every format `demo export` builds when no target is given. `svg` is
+/// opt-in — it is deliberately absent here and must be asked for by name.
 pub fn all_targets() -> Vec<Target> {
     vec![Target::Gif, Target::Mp4]
 }
 
-/// Parse `gif,mp4` (or `all`) into a deduplicated list of targets.
+/// Parse `gif,mp4,svg` (or `all`) into a deduplicated list of targets.
 fn parse_targets(s: &str) -> Result<TargetList, String> {
     let mut out: Vec<Target> = Vec::new();
     for part in s.split(',') {
@@ -249,13 +257,13 @@ fn parse_targets(s: &str) -> Result<TargetList, String> {
             return Ok(TargetList(all_targets()));
         }
         let t = <Target as ValueEnum>::from_str(p, true)
-            .map_err(|_| format!("invalid format '{p}' (expected gif, mp4 or all)"))?;
+            .map_err(|_| format!("invalid format '{p}' (expected gif, mp4, svg or all)"))?;
         if !out.contains(&t) {
             out.push(t);
         }
     }
     if out.is_empty() {
-        return Err("no export formats given (try gif, mp4 or all)".to_string());
+        return Err("no export formats given (try gif, mp4, svg or all)".to_string());
     }
     Ok(TargetList(out))
 }
@@ -274,11 +282,29 @@ pub fn parse_speed(s: &str) -> Result<f64, String> {
     }
 }
 
+/// Parse an `--at` seconds value like `12.5`. Both failure paths name the
+/// flag, so the message is actionable wherever it surfaces.
+pub fn parse_at(s: &str) -> Result<f64, String> {
+    let v: f64 = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid --at value '{s}' (expected seconds, e.g. 12.5)"))?;
+    if v.is_finite() && v >= 0.0 {
+        Ok(v)
+    } else {
+        Err(format!(
+            "--at must be a non-negative number of seconds (got '{s}')"
+        ))
+    }
+}
+
 /// Supported export targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Target {
     Gif,
     Mp4,
+    /// The static poster (vector text) — opt-in, never part of `all`.
+    Svg,
 }
 
 #[derive(Debug, Args)]
@@ -429,6 +455,58 @@ mod tests {
     fn parse_targets_leading_trailing_comma() {
         let result = parse_targets(",gif,mp4,").unwrap();
         assert_eq!(result.0.len(), 2);
+    }
+
+    #[test]
+    fn parse_targets_accepts_svg() {
+        let result = parse_targets("svg").unwrap();
+        assert_eq!(result.0, vec![Target::Svg]);
+    }
+
+    #[test]
+    fn parse_targets_mixes_svg_with_gif_and_mp4() {
+        let result = parse_targets("gif,svg,mp4").unwrap();
+        assert_eq!(result.0, vec![Target::Gif, Target::Svg, Target::Mp4]);
+        // And `all` still means gif + mp4, even when named beside svg.
+        assert_eq!(
+            parse_targets("svg,all").unwrap().0,
+            vec![Target::Gif, Target::Mp4]
+        );
+    }
+
+    #[test]
+    fn all_targets_stays_gif_and_mp4_only() {
+        let targets = all_targets();
+        assert_eq!(targets, vec![Target::Gif, Target::Mp4]);
+        assert!(
+            !targets.contains(&Target::Svg),
+            "svg is opt-in and must never join `all`"
+        );
+    }
+
+    #[test]
+    fn the_at_parser_errors_name_the_flag() {
+        let not_a_number = parse_at("soon").unwrap_err();
+        assert!(
+            not_a_number.contains("--at"),
+            "unhelpful message: {not_a_number}"
+        );
+        let negative = parse_at("-3").unwrap_err();
+        assert!(negative.contains("--at"), "unhelpful message: {negative}");
+        let not_finite = parse_at("nan").unwrap_err();
+        assert!(
+            not_finite.contains("--at"),
+            "unhelpful message: {not_finite}"
+        );
+        let infinite = parse_at("inf").unwrap_err();
+        assert!(infinite.contains("--at"), "unhelpful message: {infinite}");
+    }
+
+    #[test]
+    fn parse_at_accepts_bare_seconds() {
+        assert_eq!(parse_at("0").unwrap(), 0.0);
+        assert_eq!(parse_at("12.5").unwrap(), 12.5);
+        assert_eq!(parse_at(" 3 ").unwrap(), 3.0);
     }
 
     #[test]

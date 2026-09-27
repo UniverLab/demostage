@@ -110,6 +110,30 @@ impl FallbackReport {
     }
 }
 
+/// One cell of the text-grid snapshot a poster is drawn from. `fg`/`bg` are
+/// already resolved through the same palette logic the raster uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextCell {
+    pub ch: char,
+    pub fg: [u8; 3],
+    pub bg: [u8; 3],
+    pub bold: bool,
+}
+
+/// The vt100 grid at one point in the replay, with the geometry and colors
+/// needed to redraw it as vector text. `cells` is row-major, `cols * rows`.
+#[derive(Debug, Clone)]
+pub struct TextFrame {
+    pub cols: usize,
+    pub rows: usize,
+    pub cell_w: usize,
+    pub cell_h: usize,
+    pub px: f32,
+    pub font_family: String,
+    pub default_bg: [u8; 3],
+    pub cells: Vec<TextCell>,
+}
+
 fn cell_size(score: &Score) -> (usize, usize) {
     let px = score
         .layout
@@ -142,6 +166,7 @@ pub struct FrameSource<'a> {
     font: Font,
     emoji_font: Font,
     last_resort_font: Font,
+    font_name: String,
     px: f32,
     glyphs: HashMap<char, (Metrics, Vec<u8>)>,
     cols: usize,
@@ -236,6 +261,7 @@ impl<'a> FrameSource<'a> {
             font,
             emoji_font,
             last_resort_font,
+            font_name: font_name.to_owned(),
             px,
             glyphs,
             cols: rec.cols as usize,
@@ -307,6 +333,65 @@ impl<'a> FrameSource<'a> {
     /// Take the fallback report, leaving an empty one in its place.
     pub fn take_fallback_report(&mut self) -> FallbackReport {
         std::mem::take(&mut self.fallback_report)
+    }
+
+    /// Fast-forward the parser to frame `at` WITHOUT rasterizing, so a poster
+    /// can replay straight to the one frame it draws. Monotonic: the vt100
+    /// parser cannot rewind (the debug_assert guards a backwards seek), and
+    /// `at` is clamped to the last frame. It feeds exactly the same `<= t`
+    /// events as [`FrameSource::next_frame`], so the grid afterwards is the one
+    /// `next_frame` would render at that index — a following `next_frame` is
+    /// therefore idempotent.
+    pub fn seek_frame(&mut self, at: usize) {
+        let at = at.min(self.n_frames.saturating_sub(1));
+        debug_assert!(
+            at + 1 >= self.frame || self.frame == 0,
+            "seek_frame({at}) rewinds past frame {} — the vt100 parser cannot replay backwards",
+            self.frame
+        );
+        let t = at as f64 * self.dt;
+        while self.ev_idx < self.rec.events.len() && self.rec.events[self.ev_idx].0 <= t {
+            self.parser
+                .process(self.rec.events[self.ev_idx].1.as_bytes());
+            self.ev_idx += 1;
+        }
+        self.frame = at;
+    }
+
+    /// Snapshot the current grid as styled text — no fontdue rasterization, so
+    /// it costs nothing on the vector path. `fg`/`bg` go through the same
+    /// `resolve` logic [`render_cells`] uses, so the poster and the gif can't
+    /// drift apart on colour.
+    pub fn text_frame(&self) -> TextFrame {
+        let screen = self.parser.screen();
+        let mut cells = Vec::with_capacity(self.cols * self.rows);
+        for row in 0..self.rows {
+            for col in 0..self.cols {
+                let cell = screen.cell(row as u16, col as u16);
+                cells.push(TextCell {
+                    ch: cell
+                        .and_then(|c| c.contents().chars().next())
+                        .unwrap_or(' '),
+                    fg: cell
+                        .map(|c| resolve(c.fgcolor(), DEFAULT_FG))
+                        .unwrap_or(DEFAULT_FG),
+                    bg: cell
+                        .map(|c| resolve(c.bgcolor(), self.default_bg))
+                        .unwrap_or(self.default_bg),
+                    bold: cell.is_some_and(vt100::Cell::bold),
+                });
+            }
+        }
+        TextFrame {
+            cols: self.cols,
+            rows: self.rows,
+            cell_w: self.cell_w,
+            cell_h: self.cell_h,
+            px: self.px,
+            font_family: self.font_name.clone(),
+            default_bg: self.default_bg,
+            cells,
+        }
     }
 }
 
@@ -1817,5 +1902,121 @@ height = 100
             "format must not contain the literal 'primary font', got: {}",
             lines[0]
         );
+    }
+
+    // ── seekable text frames (the vector/poster path) ──────────────
+
+    /// A single full-canvas terminal score at the given fps, for the text-frame
+    /// tests below.
+    fn text_score(fps: u32) -> Score {
+        toml::from_str(&format!(
+            r#"
+[demo]
+name = "t"
+[layout]
+width = 100
+height = 100
+fps = {fps}
+  [[layout.panes]]
+  id = "c"
+  type = "terminal"
+  x = 0
+  y = 0
+  width = 100
+  height = 100
+"#
+        ))
+        .unwrap()
+    }
+
+    fn text_rec(events: Vec<(f64, String)>) -> Recording {
+        Recording {
+            cols: 8,
+            rows: 2,
+            title: "t".into(),
+            events,
+            captions: vec![],
+            focuses: vec![],
+            duration: 1.0,
+        }
+    }
+
+    #[test]
+    fn seeking_forward_renders_the_same_frame_as_playing_through() {
+        let rec = text_rec(vec![
+            (0.0, "one".into()),
+            (0.2, " two".into()),
+            (0.5, "\r\nnext".into()),
+        ]);
+        let score = text_score(10);
+
+        // A: jump straight to frame 3, then render it.
+        let mut seeked = FrameSource::new(&rec, &score).unwrap();
+        seeked.seek_frame(3);
+        let sought = seeked.next_frame().unwrap();
+
+        // B: play the first four frames and keep the last.
+        let mut played = FrameSource::new(&rec, &score).unwrap();
+        let mut played_rgba = Vec::new();
+        for _ in 0..4 {
+            played_rgba = played.next_frame().unwrap();
+        }
+
+        assert_eq!(sought, played_rgba, "seeking must replay the same frame");
+    }
+
+    #[test]
+    fn text_frame_exposes_colors_and_bold_per_cell() {
+        let rec = text_rec(vec![(0.0, "\x1b[1mH\x1b[0m\x1b[31mi".into())]);
+        let score = text_score(10);
+        let mut source = FrameSource::new(&rec, &score).unwrap();
+        source.seek_frame(0);
+        let tf = source.text_frame();
+
+        assert_eq!(tf.cols, 8);
+        assert_eq!(tf.cells.len(), 8 * 2);
+        assert_eq!(
+            tf.cells[0],
+            TextCell {
+                ch: 'H',
+                fg: DEFAULT_FG,
+                bg: tf.default_bg,
+                bold: true,
+            }
+        );
+        assert_eq!(
+            tf.cells[1],
+            TextCell {
+                ch: 'i',
+                fg: ANSI16[1],
+                bg: tf.default_bg,
+                bold: false,
+            }
+        );
+        // Untouched cells are blanks in the default colours.
+        assert_eq!(
+            tf.cells[2],
+            TextCell {
+                ch: ' ',
+                fg: DEFAULT_FG,
+                bg: tf.default_bg,
+                bold: false,
+            }
+        );
+    }
+
+    #[test]
+    fn text_frame_resolves_colors_like_the_raster() {
+        let rec = text_rec(vec![(0.0, "\x1b[48;5;196m\x1b[38;5;21mZ".into())]);
+        let score = text_score(10);
+        let mut source = FrameSource::new(&rec, &score).unwrap();
+        source.seek_frame(0);
+        let tf = source.text_frame();
+        let z = tf.cells[0];
+
+        assert_eq!(z.ch, 'Z');
+        assert_eq!(z.bg, resolve(Color::Idx(196), tf.default_bg));
+        assert_eq!(z.fg, resolve(Color::Idx(21), DEFAULT_FG));
+        assert_eq!(z.bg, xterm256(196), "the vector path must not drift");
     }
 }

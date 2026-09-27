@@ -56,7 +56,7 @@ use std::process::ExitCode;
 use cli::{Cli, Command};
 
 /// Dispatch a parsed CLI invocation to its command, returning the process exit
-/// code. Only `check` and `update` report through the exit code (`update`
+/// code. Only `update` reports through the exit code (`update`
 /// uses `1` for "an update is available" in `--check` mode); everything else
 /// surfaces problems as an [`Error`].
 pub fn run(cli: Cli) -> Result<ExitCode> {

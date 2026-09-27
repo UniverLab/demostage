@@ -2,8 +2,9 @@
 //!
 //! `cast`/`html` run the score in a PTY and capture text (no external deps).
 //! `gif` rasterizes that capture in pure Rust. `mp4` provisions ffmpeg on first
-//! use. Multi-pane scores (with a `browser` pane) composite via the stage, which
-//! drives Chromium for browser panes (PDF panes render natively via hayro).
+//! use. `svg` (opt-in) draws one frame as vector text — a static poster, never
+//! animated. Multi-pane scores (with a `browser` pane) composite via the stage,
+//! which drives Chromium for browser panes (PDF panes render natively via hayro).
 
 pub mod browser;
 pub mod composite;
@@ -16,6 +17,7 @@ pub mod raster;
 pub mod recording;
 pub mod run;
 pub mod stage;
+pub mod svg;
 
 use std::path::{Path, PathBuf};
 
@@ -72,8 +74,16 @@ pub fn rewrite_local_urls(score: &Score, server_port: u16) -> Score {
 /// Render an already-captured `recording` to `target`, returning the path
 /// written. Pure playback — it never executes the demo. `score` carries the
 /// layout/styling (its timeline is unused here). `speed` is the resolved export
-/// speed multiplier, threaded through to the PDF pan path.
-pub fn render(rec: &Recording, score: &Score, target: Target, speed: f64) -> Result<PathBuf> {
+/// speed multiplier, threaded through to the PDF pan path. `at_secs` picks the
+/// frame the `svg` poster draws (default: the last one) — only `Target::Svg`
+/// consumes it; gif/mp4 ignore it.
+pub fn render(
+    rec: &Recording,
+    score: &Score,
+    target: Target,
+    speed: f64,
+    at_secs: Option<f64>,
+) -> Result<PathBuf> {
     let problems = validate(score);
     if !problems.is_empty() {
         return Err(Error::Validation(problems.join("\n")));
@@ -176,6 +186,48 @@ pub fn render(rec: &Recording, score: &Score, target: Target, speed: f64) -> Res
                     report = r;
                     Ok(())
                 })?;
+                progress_clear();
+            }
+            for line in report.format(&score.demo.name) {
+                eprintln!("{line}");
+            }
+            Ok(path)
+        }
+        Target::Svg => {
+            let path = resolve_output(&score, "svg");
+            ensure_parent(&path)?;
+            let mut report = raster::FallbackReport::new();
+            if staged {
+                // Fallback, documented in docs/export-targets.md: a staged
+                // score has no cell grid to draw, so replay the stage and keep
+                // ONE composited frame, embedded as a base64 PNG in the SVG.
+                let keep = svg::frame_index(at_secs, fps, total_frames);
+                let mut n = 0usize;
+                let mut browser_reports = Vec::new();
+                svg::encode(&path, cw, ch, keep, |emit| {
+                    let r = stage::render_stage(rec, &score, speed, |f| {
+                        n += 1;
+                        progress_bar("exporting svg", n, total_frames);
+                        emit(&svg::PosterFrame::Rgba(f));
+                    })?;
+                    report = r.0;
+                    browser_reports = r.1;
+                    Ok(())
+                })?;
+                progress_clear();
+                for br in &browser_reports {
+                    eprintln!(
+                        "demo: browser pane '{}' — {} frames captured in {:.1}s",
+                        br.pane_id,
+                        br.frame_count,
+                        br.elapsed.as_secs_f64()
+                    );
+                }
+            } else {
+                // Single terminal: seek to the chosen frame and draw it as
+                // vector text — the frames in between are never rasterized.
+                progress_bar("exporting svg", 1, 1);
+                svg::write_svg(&path, rec, &score, at_secs)?;
                 progress_clear();
             }
             for line in report.format(&score.demo.name) {
