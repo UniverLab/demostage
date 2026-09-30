@@ -5,20 +5,20 @@
 //! produces a natural char-by-char appearance in the capture. A clean `PS1` is
 //! forced before the clock starts, so demos never leak `user@host`.
 
-use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver};
-use std::sync::Arc;
+use std::io::Write;
+use std::sync::mpsc::Receiver;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use vt100::Parser as VtParser;
 
 use crate::error::{Error, Result};
 use crate::model::{PaneKind, Score, Step};
-use crate::normalize::salt::humanize_delays;
 use crate::normalize::Rng;
+
+mod pty;
+
+use pty::{finish, secret_step, type_step, CapturePty};
 
 /// Assumed monospace cell size (px), inverse of the normalizer's sizing.
 const CELL_W: u32 = 10;
@@ -86,6 +86,176 @@ pub fn run_terminal(score: &Score) -> Result<Recording> {
     run_with_pane(score, pane)
 }
 
+/// The three timestamped streams a timeline run produces: what the shell
+/// printed, plus the captions/focuses that happened while it ran.
+#[derive(Default)]
+struct Captures {
+    events: Vec<(f64, String)>,
+    captions: Vec<(f64, String)>,
+    focuses: Vec<(f64, String)>,
+}
+
+/// VT screen wait state: the cached parser, how many events have been fed
+/// into it, and the grid dimensions it was built for.
+struct ScreenWait {
+    parser: Option<VtParser>,
+    fed: usize,
+    rows: u16,
+    cols: u16,
+}
+
+/// Mutable state a timeline run threads through each step: the PTY, the
+/// in-memory secrets, typing config, and the captures accumulated so far.
+struct StepRunner<'a> {
+    pty: &'a mut CapturePty,
+    secrets: &'a std::collections::HashMap<String, String>,
+    typing: crate::model::Typing,
+    rng: Rng,
+    events: Vec<(f64, String)>,
+    captions: Vec<(f64, String)>,
+    focuses: Vec<(f64, String)>,
+    screen: ScreenWait,
+    t0: Instant,
+}
+
+/// Type one keypress into the PTY, giving TUIs extra time for ESC.
+fn press_key_step(key: &str, pty: &mut CapturePty, events: &mut Vec<(f64, String)>, t0: Instant) {
+    let _ = pty.writer.write_all(&key_to_bytes(key));
+    let _ = pty.writer.flush();
+    let delay = if key == "esc" || key == "escape" {
+        200
+    } else {
+        60
+    };
+    sleep_collecting(delay, events, &pty.rx, t0);
+}
+
+/// Apply one timeline step, appending to the runner's captures.
+/// Returns false when the timeline should stop (`Terminate`).
+fn apply_step(step: &Step, runner: &mut StepRunner<'_>) -> bool {
+    match step {
+        Step::Focus { pane } => {
+            if let Some(target) = pane.clone() {
+                runner
+                    .focuses
+                    .push((runner.t0.elapsed().as_secs_f64(), target));
+            }
+        }
+        Step::Caption { text } => {
+            runner
+                .captions
+                .push((runner.t0.elapsed().as_secs_f64(), text.clone()));
+        }
+        Step::Type { text, human_salt } => {
+            type_step(
+                text,
+                *human_salt,
+                &runner.typing,
+                &mut runner.rng,
+                runner.pty,
+                &mut runner.events,
+                runner.t0,
+            );
+        }
+        Step::Keypress { key } => {
+            press_key_step(key, runner.pty, &mut runner.events, runner.t0);
+        }
+        Step::Wait { duration_ms } => {
+            sleep_collecting(*duration_ms, &mut runner.events, &runner.pty.rx, runner.t0);
+        }
+        Step::WaitForStdout { pattern, .. } => {
+            wait_for(pattern, &mut runner.events, &runner.pty.rx, runner.t0);
+        }
+        Step::WaitForQuiet { quiet_ms, max_ms } => {
+            settle(
+                &mut runner.events,
+                &runner.pty.rx,
+                runner.t0,
+                *quiet_ms,
+                max_ms.unwrap_or(WAIT_FOR_TIMEOUT_MS),
+            );
+        }
+        Step::WaitForScreen {
+            pattern,
+            timeout_ms,
+        } => {
+            wait_for_screen(
+                pattern,
+                &mut runner.events,
+                &runner.pty.rx,
+                runner.t0,
+                &mut runner.screen,
+                timeout_ms.unwrap_or(WAIT_FOR_TIMEOUT_MS),
+            );
+        }
+        Step::Secret { prompt } => {
+            secret_step(
+                prompt,
+                runner.secrets,
+                runner.pty,
+                &mut runner.events,
+                runner.t0,
+            );
+        }
+        Step::Scroll { .. } => {} // browser-only; no-op for terminal capture
+        Step::Terminate => return false,
+    }
+    true
+}
+
+/// Replay the score's timeline against the PTY, collecting the timed events and
+/// the captions/focuses that happened during them.
+fn drive_timeline(
+    score: &Score,
+    pty: &mut CapturePty,
+    secrets: &std::collections::HashMap<String, String>,
+    t0: Instant,
+) -> Captures {
+    let typing = score.typing.clone().unwrap_or_default();
+    let rng = Rng::new(typing.seed.unwrap_or(DEFAULT_SEED));
+    let (rows, cols) = (pty.rows, pty.cols);
+    let mut runner = StepRunner {
+        pty,
+        secrets,
+        typing,
+        rng,
+        events: Vec::new(),
+        captions: Vec::new(),
+        focuses: Vec::new(),
+        screen: ScreenWait {
+            parser: None,
+            fed: 0,
+            rows,
+            cols,
+        },
+        t0,
+    };
+
+    // The startup prompt was discarded above; emit one fresh prompt so the first
+    // command has a clean prompt (`$ `) in front of it.
+    let _ = runner.pty.writer.write_all(b"\r");
+    let _ = runner.pty.writer.flush();
+    // Capture that fresh prompt so it leads the first command.
+    sleep_collecting(120, &mut runner.events, &runner.pty.rx, t0);
+
+    let total_steps = score.timeline.len();
+    for (step_idx, step) in score.timeline.iter().enumerate() {
+        progress_bar("recording", step_idx + 1, total_steps);
+        if !apply_step(step, &mut runner) {
+            break;
+        }
+    }
+
+    // Clear the progress line.
+    progress_clear();
+
+    Captures {
+        events: runner.events,
+        captions: runner.captions,
+        focuses: runner.focuses,
+    }
+}
+
 /// Run the score's timeline in a PTY sized to `pane`, capturing its output.
 /// Browser steps (focus/scroll on browser panes) are no-ops here; the stage
 /// drives browser panes separately and composites the result.
@@ -94,251 +264,25 @@ pub fn run_with_pane(score: &Score, pane: &crate::model::Pane) -> Result<Recordi
     // only in memory for this run; they're typed at each `Secret` step below.
     let secrets = collect_secrets(score)?;
 
-    let cols = (pane.width / CELL_W).clamp(1, 1000) as u16;
-    let rows = (pane.height / CELL_H).clamp(1, 1000) as u16;
-
-    let pair = native_pty_system()
-        .openpty(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|e| Error::Export(format!("openpty: {e}")))?;
-
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-    let prompt = score
-        .demo
-        .prompt
-        .as_deref()
-        .map(|p| p.to_string())
-        .unwrap_or_else(|| default_prompt_for(&shell));
-    let mut cmd = CommandBuilder::new(&shell);
-    let ps_var = if is_zsh(&shell) { "PROMPT" } else { "PS1" };
-    cmd.env(ps_var, &prompt);
-    cmd.env("PS2", "> ");
-    cmd.env("TERM", "xterm-256color");
-    let mut child = pair
-        .slave
-        .spawn_command(cmd)
-        .map_err(|e| Error::Export(format!("spawn {shell}: {e}")))?;
-    drop(pair.slave);
-
-    let mut reader = pair
-        .master
-        .try_clone_reader()
-        .map_err(|e| Error::Export(format!("pty reader: {e}")))?;
-    let mut writer = pair
-        .master
-        .take_writer()
-        .map_err(|e| Error::Export(format!("pty writer: {e}")))?;
-
-    let (tx, rx) = mpsc::channel::<(Instant, Vec<u8>)>();
-    let reader_done = Arc::new(AtomicBool::new(false));
-    {
-        let reader_done = reader_done.clone();
-        thread::spawn(move || {
-            let mut buf = [0u8; 4096];
-            while let Ok(n) = reader.read(&mut buf) {
-                if n == 0 || tx.send((Instant::now(), buf[..n].to_vec())).is_err() {
-                    break;
-                }
-            }
-            reader_done.store(true, Ordering::SeqCst);
-        });
-    }
-
-    // ── Pre-roll (untimed): force a clean prompt + run setup, then discard. ──
-    if let Some(setup) = score.env.as_ref().and_then(|e| e.setup_script.as_deref()) {
-        let _ = writeln!(writer, "{setup}");
-    }
-    // Force the prompt after the rc files (which usually set their own PS1), so a
-    // demo never leaks `user@host`. Other env (tokens, etc.) is inherited.
-    let _ = writeln!(writer, "{ps_var}={}; clear", sh_single_quote(&prompt));
-    // A readiness marker makes the start deterministic: wait until the shell
-    // echoes it back, which proves all rc/startup chatter and our setup have
-    // flushed. A fixed delay (or plain quiet-detection) is racy on slow shells
-    // (e.g. WSL) where startup output arrives *after* the silence we'd wait out,
-    // leaking `user@host`/`PS1=…` into the demo.
-    // The printed marker is assembled by the shell so it differs from the typed
-    // command text — otherwise we'd match the PTY's *instant* line-discipline
-    // echo of the command (15 ms) instead of the shell actually running it.
-    let _ = writeln!(writer, "printf 'demostage_%s_ready\\n' OK");
-    wait_for_marker(&rx, "demostage_OK_ready", PREROLL_MAX_MS);
-    // Discard the marker's own output and the prompt that follows it.
-    drain_until_quiet(&rx, PREROLL_QUIET_MS, PREROLL_MAX_MS);
+    let mut pty = CapturePty::new(score, pane)?;
+    pty.pre_roll(score);
 
     // ── Timed run. ───────────────────────────────────────────────────────
     let t0 = Instant::now();
-    // The startup prompt was discarded above; emit one fresh prompt so the first
-    // command has a clean prompt (`$ `) in front of it.
-    let _ = writer.write_all(b"\r");
-    let _ = writer.flush();
-    let mut events: Vec<(f64, String)> = Vec::new();
-    let mut captions: Vec<(f64, String)> = Vec::new();
-    let mut focuses: Vec<(f64, String)> = Vec::new();
-    let typing = score.typing.clone().unwrap_or_default();
-    let mut rng = Rng::new(typing.seed.unwrap_or(DEFAULT_SEED));
-    // Capture that fresh prompt so it leads the first command.
-    sleep_collecting(120, &mut events, &rx, t0);
-
-    // Index into `events` up to which the VT parser has been fed. Used by
-    // wait_for_screen to avoid re-processing already-consumed events.
-    let mut vt: Option<VtParser> = None;
-    let mut vt_fed: usize = 0;
-
-    let total_steps = score.timeline.len();
-    for (step_idx, step) in score.timeline.iter().enumerate() {
-        progress_bar("recording", step_idx + 1, total_steps);
-
-        match step {
-            Step::Focus { pane } => {
-                let Some(target) = pane.clone() else {
-                    continue;
-                };
-                focuses.push((t0.elapsed().as_secs_f64(), target));
-            }
-            Step::Caption { text } => {
-                captions.push((t0.elapsed().as_secs_f64(), text.clone()));
-            }
-            Step::Type { text, human_salt } => {
-                let delays = if *human_salt {
-                    humanize_delays(text, typing.base_ms, typing.salt_ms, &mut rng)
-                } else {
-                    vec![0; text.chars().count()]
-                };
-                let mut b = [0u8; 4];
-                for (ch, d) in text.chars().zip(delays) {
-                    if d > 0 {
-                        thread::sleep(Duration::from_millis(d));
-                    }
-                    let _ = writer.write_all(ch.encode_utf8(&mut b).as_bytes());
-                    let _ = writer.flush();
-                    collect(&mut events, &rx, t0);
-                }
-            }
-            Step::Keypress { key } => {
-                let _ = writer.write_all(&key_to_bytes(key));
-                let _ = writer.flush();
-                // ESC needs extra time for TUIs to process and close dialogs.
-                let delay = if key == "esc" || key == "escape" {
-                    200
-                } else {
-                    60
-                };
-                sleep_collecting(delay, &mut events, &rx, t0);
-            }
-            Step::Wait { duration_ms } => sleep_collecting(*duration_ms, &mut events, &rx, t0),
-            Step::WaitForStdout { pattern, .. } => wait_for(pattern, &mut events, &rx, t0),
-            Step::WaitForQuiet { quiet_ms, max_ms } => {
-                settle(
-                    &mut events,
-                    &rx,
-                    t0,
-                    *quiet_ms,
-                    max_ms.unwrap_or(WAIT_FOR_TIMEOUT_MS),
-                );
-            }
-            Step::WaitForScreen {
-                pattern,
-                timeout_ms,
-            } => {
-                wait_for_screen(
-                    pattern,
-                    &mut events,
-                    &rx,
-                    t0,
-                    &mut vt,
-                    &mut vt_fed,
-                    rows,
-                    cols,
-                    timeout_ms.unwrap_or(WAIT_FOR_TIMEOUT_MS),
-                );
-            }
-            Step::Secret { prompt } => {
-                // Supply the secret ONLY once the matching prompt is actually
-                // showing, so it can never land in the wrong field (e.g. the repo
-                // name). Wait for the prompt label to appear (or confirm it already
-                // printed), then type the value collected up front (in memory only).
-                let needle = secret_needle(prompt);
-                if !needle.is_empty() && !recent_contains(&events, &needle) {
-                    wait_for(&needle, &mut events, &rx, t0);
-                }
-                sleep_collecting(150, &mut events, &rx, t0);
-                if let Some(val) = secrets.get(prompt) {
-                    let _ = writer.write_all(val.as_bytes());
-                }
-                let _ = writer.write_all(b"\r");
-                let _ = writer.flush();
-                sleep_collecting(150, &mut events, &rx, t0);
-            }
-            Step::Scroll { .. } => {} // browser-only; no-op for terminal capture
-            Step::Terminate => break,
-        }
-    }
-
-    // Clear the progress line.
-    progress_clear();
+    let mut caps = drive_timeline(score, &mut pty, &secrets, t0);
 
     // ── Settle: hold after the last step until output goes quiet, so the final
     // result (a command's output, an error) finishes rendering and is held on
     // screen — rather than being cut off by a fixed timer. ──────────────────
-    let settle_end = settle(&mut events, &rx, t0, SETTLE_QUIET_MS, SETTLE_MAX_MS);
-
-    // ── Teardown + close. ──────────────────────────────────────────────────
-    if let Some(td) = score
-        .env
-        .as_ref()
-        .and_then(|e| e.teardown_script.as_deref())
-    {
-        let _ = writeln!(writer, "{td} >/dev/null 2>&1");
-    }
-    let _ = writer.write_all(b"\nexit\n");
-    let _ = writer.flush();
-    drop(writer);
-
-    // Bounded shutdown: give the shell a grace period to exit on its own, then
-    // kill it. Without this, a demo whose last command leaves a process in the
-    // foreground hangs export indefinitely.
-    let deadline = Instant::now() + Duration::from_millis(EXIT_GRACE_MS);
-    loop {
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            break;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            break;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-
-    // Drain trailing output, waiting — bounded — for the capture thread to reach
-    // EOF. A stray foreground process can keep the PTY open, so we never join it
-    // unconditionally; the thread is detached and reaped when the process exits.
-    thread::sleep(Duration::from_millis(50));
-    let join_deadline = Instant::now() + Duration::from_millis(READER_JOIN_MS);
-    while !reader_done.load(Ordering::SeqCst) && Instant::now() < join_deadline {
-        collect(&mut events, &rx, t0);
-        thread::sleep(Duration::from_millis(20));
-    }
-    collect(&mut events, &rx, t0);
-
-    // Drop the post-settle teardown noise (the `exit` echo) and hold the final
-    // frame for the settle's quiet period.
-    events.retain(|(t, _)| *t <= settle_end);
-    let duration = settle_end.max(events.last().map(|(t, _)| *t).unwrap_or(0.0)) + 0.2;
-    Ok(Recording {
-        cols,
-        rows,
-        title: score.demo.name.clone(),
-        events,
-        captions,
-        focuses,
-        duration,
-    })
+    let settle_end = settle(
+        &mut caps.events,
+        &pty.rx,
+        t0,
+        SETTLE_QUIET_MS,
+        SETTLE_MAX_MS,
+    );
+    Ok(finish(score, pty, settle_end, t0, caps))
 }
-
 /// Ask for every secret the score enters, up front, keeping the values only in
 /// memory for this run (they're typed at each [`Step::Secret`]). Returns a map of
 /// prompt label → value. No `Secret` steps → no prompts.
@@ -463,38 +407,43 @@ fn wait_for(
 
 /// Block until `pattern` is visible on the parsed VT screen buffer.
 /// Unlike `wait_for`, this strips escape codes and checks only rendered text.
-#[allow(clippy::too_many_arguments)]
 fn wait_for_screen(
     pattern: &str,
     events: &mut Vec<(f64, String)>,
     rx: &Receiver<(Instant, Vec<u8>)>,
     t0: Instant,
-    vt: &mut Option<VtParser>,
-    vt_fed: &mut usize,
-    rows: u16,
-    cols: u16,
+    screen: &mut ScreenWait,
     timeout_ms: u64,
 ) {
-    let parser = vt.get_or_insert_with(|| {
-        let mut p = VtParser::new(rows, cols, 0);
-        // Feed all events accumulated so far.
+    let rows = screen.rows;
+    let cols = screen.cols;
+    if screen.parser.is_none() {
+        let mut fresh = VtParser::new(rows, cols, 0);
         for (_, data) in events.iter() {
-            p.process(data.as_bytes());
+            fresh.process(data.as_bytes());
         }
-        *vt_fed = events.len();
-        p
-    });
+        screen.fed = events.len();
+        screen.parser = Some(fresh);
+    }
 
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     while Instant::now() < deadline {
         collect(events, rx, t0);
         // Feed new events into the VT parser.
-        for (_, data) in &events[*vt_fed..] {
-            parser.process(data.as_bytes());
-        }
-        *vt_fed = events.len();
+        let fed = screen.fed;
+        let found = {
+            let parser = screen
+                .parser
+                .as_mut()
+                .expect("screen parser initialised above");
+            for (_, data) in &events[fed..] {
+                parser.process(data.as_bytes());
+            }
+            screen_contains(parser, pattern)
+        };
+        screen.fed = events.len();
         // Check if pattern is visible on the rendered screen.
-        if screen_contains(parser, pattern) {
+        if found {
             return;
         }
         thread::sleep(Duration::from_millis(15));
@@ -948,6 +897,31 @@ mod tests {
     #[test]
     fn progress_bar_zero_total() {
         progress_bar("test", 0, 0);
+    }
+
+    #[test]
+    fn collect_secrets_without_secret_steps_prompts_nothing() {
+        // No `secret` steps → the inquire password prompts are never built,
+        // so this runs headless (no TTY) and yields an empty map.
+        let score: Score = toml::from_str(
+            r#"
+[demo]
+name = "t"
+[layout]
+width = 100
+height = 100
+  [[layout.panes]]
+  id = "c"
+  type = "terminal"
+  x = 0
+  y = 0
+  width = 100
+  height = 100
+"#,
+        )
+        .unwrap();
+        let secrets = collect_secrets(&score).unwrap();
+        assert!(secrets.is_empty());
     }
 
     #[test]

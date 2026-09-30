@@ -89,67 +89,34 @@ pub fn needs_stage(score: &Score) -> bool {
     has_browser || terminals > 1 || offset_terminal
 }
 
-/// Composite a multi-pane score from an already-captured terminal `rec`,
-/// emitting each composited canvas frame. Pure playback — the terminal pane comes
-/// from `rec` (never re-run); browser panes are captured here via Chromium.
-/// Returns the fallback report and any browser capture reports for cost printing.
-/// `speed` is the resolved export speed multiplier, threaded through to the PDF
-/// pan path.
-pub fn render_stage(
+/// The browser panes of a stage once captured: their scenes (each with the
+/// pane's on-screen window), the temp-dir guards keeping their frame
+/// directories alive, and the cost reports to print.
+struct BrowserScenes<'a> {
+    scenes: Vec<(&'a Pane, browser::AnyScene, f64, Option<f64>)>,
+    _guards: Vec<browser::TempDirGuard>,
+    reports: Vec<browser::BrowserCaptureReport>,
+}
+
+/// Capture every browser pane up front (Chromium). Each scene reveals at the
+/// moment it is first focused (recorded during the terminal run) — so it
+/// "opens" exactly when the demo focuses it, e.g. once a server is up or a PDF
+/// has compiled.
+fn capture_browser_scenes<'a>(
+    score: &'a Score,
     rec: &Recording,
-    score: &Score,
+    total: f64,
+    fps: f64,
     speed: f64,
-    mut on_frame: impl FnMut(&[u8]),
-) -> Result<(raster::FallbackReport, Vec<browser::BrowserCaptureReport>)> {
-    let canvas_w = score.layout.width as usize;
-    let canvas_h = score.layout.height as usize;
-    let bg = score
-        .layout
-        .background
-        .as_deref()
-        .and_then(raster::parse_hex)
-        .unwrap_or([11, 15, 20]);
-
-    let term_pane = score
-        .layout
-        .panes
-        .iter()
-        .find(|p| p.kind == PaneKind::Terminal)
-        .ok_or_else(|| Error::Export("a multi-scene stage needs a terminal pane".to_string()))?;
-
-    // Captions are drawn on the composited canvas, so keep them out of the
-    // terminal sub-frames (render the terminal from a captions-free copy).
-    let font_name = score
-        .layout
-        .font_family
-        .as_deref()
-        .unwrap_or(crate::fonts::DEFAULT_FONT);
-    let mut caption = if rec.captions.is_empty() {
-        None
-    } else {
-        Some(raster::CaptionOverlay::new(
-            rec.captions.clone(),
-            20.0,
-            font_name,
-            crate::fonts::load_emoji(),
-            crate::fonts::load_last_resort(),
-        )?)
+) -> Result<BrowserScenes<'a>> {
+    let mut captured = BrowserScenes {
+        scenes: Vec::new(),
+        _guards: Vec::new(),
+        reports: Vec::new(),
     };
-    let mut term_rec = rec.clone();
-    term_rec.captions.clear();
-    let mut term_src = raster::FrameSource::new(&term_rec, score)?;
-    let (tw, th) = term_src.dims();
-    let n = term_src.n_frames();
-    let fps = score.layout.fps.max(1) as f64;
-    let total = n as f64 / fps;
-    let mut fallback_report = term_src.take_fallback_report();
-
     // Browser panes captured up front (Chromium). Each reveals at the moment it
     // is first focused (recorded during the terminal run) — so it "opens" exactly
     // when the demo focuses it, e.g. once a server is up or a PDF has compiled.
-    let mut scenes: Vec<(&Pane, browser::AnyScene, f64, Option<f64>)> = Vec::new();
-    let mut _guards: Vec<browser::TempDirGuard> = Vec::new();
-    let mut browser_reports: Vec<browser::BrowserCaptureReport> = Vec::new();
     for pane in score
         .layout
         .panes
@@ -182,21 +149,29 @@ pub fn render_stage(
             effective_speed,
         )?;
         if let Some(report) = result.report {
-            browser_reports.push(report);
+            captured.reports.push(report);
         }
-        _guards.push(result._guard);
-        scenes.push((pane, result.scene, reveal_at, hide_at));
+        captured._guards.push(result._guard);
+        captured
+            .scenes
+            .push((pane, result.scene, reveal_at, hide_at));
     }
+    Ok(captured)
+}
 
-    // A PDF pane exists to show its document, so it may need more time on screen
-    // than the recording gives it. When such a pane runs to the end of the demo,
-    // the demo waits for it: the terminal underneath holds its last frame while
-    // the pan finishes. A pane that hides mid-demo cannot be extended without
-    // shifting everything after it, so that one is reported instead of silently
-    // truncating the document.
-    let mut n = n;
-    let mut total = total;
-    for (pane, scene, reveal_at, hide_at) in &scenes {
+/// A PDF pane exists to show its document, so it may need more time on screen
+/// than the recording gives it. When such a pane runs to the end of the demo,
+/// the demo waits for it: the terminal underneath holds its last frame while
+/// the pan finishes. A pane that hides mid-demo cannot be extended without
+/// shifting everything after it, so that one is reported instead of silently
+/// truncating the document. Returns the grown `(frame_count, total_secs)`.
+fn extend_for_pdf_panes(
+    scenes: &[(&Pane, browser::AnyScene, f64, Option<f64>)],
+    mut n: usize,
+    mut total: f64,
+    fps: f64,
+) -> (usize, f64) {
+    for (pane, scene, reveal_at, hide_at) in scenes {
         let needed = scene.needed_seconds();
         if needed <= 0.0 {
             continue;
@@ -223,19 +198,67 @@ pub fn render_stage(
             ),
         }
     }
+    (n, total)
+}
 
-    // The window may have grown above; every scene maps progress over the window
-    // it is actually given, so tell them the final one.
-    for (_, scene, reveal_at, hide_at) in scenes.iter_mut() {
-        let window = (hide_at.unwrap_or(total) - *reveal_at).max(0.0);
-        scene.set_window_frames((window * fps).round() as usize);
-    }
+/// Owned terminal input for the stage: a captions-free copy of the recording
+/// plus the canvas-level caption overlay drawn over the composite.
+struct TerminalSource {
+    recording: Recording,
+    caption: Option<raster::CaptionOverlay>,
+}
 
+/// Build the captions-free terminal recording and its canvas caption overlay.
+/// Captions are drawn on the composited canvas, so the terminal sub-frames
+/// render from a captions-free copy.
+fn prepare_terminal_source(rec: &Recording, score: &Score) -> Result<TerminalSource> {
+    let font_name = score
+        .layout
+        .font_family
+        .as_deref()
+        .unwrap_or(crate::fonts::DEFAULT_FONT);
+    let caption = if rec.captions.is_empty() {
+        None
+    } else {
+        Some(raster::CaptionOverlay::new(
+            rec.captions.clone(),
+            20.0,
+            font_name,
+            crate::fonts::load_emoji(),
+            crate::fonts::load_last_resort(),
+        )?)
+    };
+    let mut recording = rec.clone();
+    recording.captions.clear();
+    Ok(TerminalSource { recording, caption })
+}
+
+/// Geometry and pacing a composite run renders at.
+struct CompositeParams {
+    canvas_w: usize,
+    canvas_h: usize,
+    background: [u8; 3],
+    fps: f64,
+    total: f64,
+    frames: usize,
+}
+
+/// Emit every composited canvas frame: the terminal holds its last frame past
+/// the end of the recording so a PDF pane can finish panning, browser scenes
+/// play over their on-screen window, and captions draw on the canvas.
+fn composite_frames(
+    term_src: &mut raster::FrameSource<'_>,
+    captured: &mut BrowserScenes<'_>,
+    term_pane: &Pane,
+    params: &CompositeParams,
+    caption: &mut Option<raster::CaptionOverlay>,
+    fallback_report: &mut raster::FallbackReport,
+    on_frame: &mut impl FnMut(&[u8]),
+) {
+    let (tw, th) = term_src.dims();
     let mut held_term_frame: Vec<u8> = Vec::new();
-    for i in 0..n {
-        let t = i as f64 / fps;
-        // Past the end of the recording the terminal holds its last frame rather
-        // than going blank — that is what lets a PDF pane finish panning.
+    for i in 0..params.frames {
+        let t = i as f64 / params.fps;
         let term_frame = match term_src.next_frame() {
             Some(f) => {
                 held_term_frame = f;
@@ -252,17 +275,14 @@ pub fn render_stage(
             h: th,
             rgba: &term_frame,
         }];
-        for (pane, scene, reveal_at, hide_at) in &mut scenes {
+        for (pane, scene, reveal_at, hide_at) in &mut captured.scenes {
             if t < *reveal_at {
-                continue; // not revealed yet
+                continue;
             }
             if (*hide_at).is_some_and(|h| t >= h) {
-                continue; // switched away — the pane beneath (terminal) shows again
+                continue;
             }
-            // Scene-local progress: 0 at the reveal, 1 at the end of its window —
-            // so a scene's scroll keyframes play across the time it's on screen,
-            // not across the whole demo (which would mostly be before it opened).
-            let window_end = (*hide_at).unwrap_or(total);
+            let window_end = (*hide_at).unwrap_or(params.total);
             let span = (window_end - *reveal_at).max(1e-6);
             let progress = ((t - *reveal_at) / span).clamp(0.0, 1.0);
             layers.push(composite::Layer {
@@ -273,19 +293,86 @@ pub fn render_stage(
                 rgba: scene.frame_at(progress),
             });
         }
-        let mut canvas = composite::composite(canvas_w, canvas_h, bg, &layers);
-        if let Some(caption) = &mut caption {
+        let mut canvas =
+            composite::composite(params.canvas_w, params.canvas_h, params.background, &layers);
+        if let Some(caption) = caption {
             caption.draw(
                 &mut canvas,
-                canvas_w,
-                canvas_h,
-                i as f64 / fps,
-                &mut fallback_report,
+                params.canvas_w,
+                params.canvas_h,
+                i as f64 / params.fps,
+                fallback_report,
             );
         }
         on_frame(&canvas);
     }
-    Ok((fallback_report, browser_reports))
+}
+/// Composite a multi-pane score from an already-captured terminal `rec`,
+/// emitting each composited canvas frame. Pure playback — the terminal pane comes
+/// from `rec` (never re-run); browser panes are captured here via Chromium.
+/// Returns the fallback report and any browser capture reports for cost printing.
+/// `speed` is the resolved export speed multiplier, threaded through to the PDF
+/// pan path.
+pub fn render_stage(
+    rec: &Recording,
+    score: &Score,
+    speed: f64,
+    mut on_frame: impl FnMut(&[u8]),
+) -> Result<(raster::FallbackReport, Vec<browser::BrowserCaptureReport>)> {
+    let canvas_w = score.layout.width as usize;
+    let canvas_h = score.layout.height as usize;
+    let bg = score
+        .layout
+        .background
+        .as_deref()
+        .and_then(raster::parse_hex)
+        .unwrap_or([11, 15, 20]);
+
+    let term_pane = score
+        .layout
+        .panes
+        .iter()
+        .find(|p| p.kind == PaneKind::Terminal)
+        .ok_or_else(|| Error::Export("a multi-scene stage needs a terminal pane".to_string()))?;
+
+    let TerminalSource {
+        recording: term_rec,
+        mut caption,
+    } = prepare_terminal_source(rec, score)?;
+    let mut term_src = raster::FrameSource::new(&term_rec, score)?;
+    let n = term_src.n_frames();
+    let fps = score.layout.fps.max(1) as f64;
+    let total = n as f64 / fps;
+    let mut fallback_report = term_src.take_fallback_report();
+
+    let mut captured = capture_browser_scenes(score, rec, total, fps, speed)?;
+    let (n, total) = extend_for_pdf_panes(&captured.scenes, n, total, fps);
+
+    // The window may have grown above; every scene maps progress over the window
+    // it is actually given, so tell them the final one.
+    for (_, scene, reveal_at, hide_at) in captured.scenes.iter_mut() {
+        let window = (hide_at.unwrap_or(total) - *reveal_at).max(0.0);
+        scene.set_window_frames((window * fps).round() as usize);
+    }
+
+    let params = CompositeParams {
+        canvas_w,
+        canvas_h,
+        background: bg,
+        fps,
+        total,
+        frames: n,
+    };
+    composite_frames(
+        &mut term_src,
+        &mut captured,
+        term_pane,
+        &params,
+        &mut caption,
+        &mut fallback_report,
+        &mut on_frame,
+    );
+    Ok((fallback_report, captured.reports))
 }
 
 /// A browser pane's on-screen window `[reveal, hide)`. The recording's focus

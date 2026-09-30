@@ -238,212 +238,277 @@ fn orphan_osc_cluster_len(chars: &[char]) -> Option<usize> {
     }
 }
 
+/// The state a [`reconstruct`] replay threads through the input: the actions
+/// emitted so far, the typed run being accumulated (and when it started and
+/// ended), and the escape-sequence machine the next character is fed to.
+struct ReconstructState {
+    actions: Vec<Action>,
+    buf: Vec<char>,
+    start_ms: u64,
+    end_ms: u64,
+    esc: Esc,
+}
+
+impl ReconstructState {
+    fn new() -> Self {
+        Self {
+            actions: Vec::new(),
+            buf: Vec::new(),
+            start_ms: 0,
+            end_ms: 0,
+            esc: Esc::None,
+        }
+    }
+
+    /// Emit the pending typed run (if any) as a Type action.
+    fn flush(&mut self) {
+        if self.buf.is_empty() {
+            return;
+        }
+        self.actions.push(Action::Type {
+            text: self.buf.iter().collect(),
+            t_ms: self.start_ms,
+            end_ms: self.end_ms,
+        });
+        self.buf.clear();
+    }
+
+    /// Feed one character of the replay, timestamped `t`.
+    fn feed_char(&mut self, ch: char, t: u64) {
+        // Take the escape state out so every handler can be its own method
+        // (each one puts the advanced state back).
+        let esc = std::mem::replace(&mut self.esc, Esc::None);
+        if !self.dispatch(esc, ch, t) {
+            self.feed_plain(ch, t);
+        }
+    }
+
+    /// Run the escape-sequence machine for `ch`. Returns false when the
+    /// character is not consumed by it — plain text, or an `ESC` that must be
+    /// emitted as a keypress before the character itself is processed.
+    fn dispatch(&mut self, esc: Esc, ch: char, t: u64) -> bool {
+        match esc {
+            Esc::Csi(params) => self.feed_csi(params, ch, t),
+            Esc::Ss3 => self.feed_ss3(ch, t),
+            Esc::Osc | Esc::Str => self.feed_osc_str(esc, ch),
+            Esc::St => {
+                self.esc = Esc::None;
+                true
+            }
+            Esc::Paste => self.feed_paste(ch, t),
+            Esc::PasteSaw => self.feed_paste_saw(ch),
+            Esc::PasteCsi(params) => self.feed_paste_csi(params, ch),
+            Esc::Saw => self.feed_saw(ch, t),
+            Esc::None => false,
+        }
+    }
+
+    /// `ESC [ …` — a CSI sequence: accumulate parameters until a final byte
+    /// maps to a key; a `200` final marks the start of a bracketed paste.
+    fn feed_csi(&mut self, mut params: String, ch: char, t: u64) -> bool {
+        if ('\u{40}'..='\u{7e}').contains(&ch) {
+            if ch == '~' && params == "200" {
+                self.esc = Esc::Paste;
+            } else if let Some(key) = csi_key(&params, ch) {
+                self.flush();
+                self.actions.push(Action::Key { key, t_ms: t });
+                self.esc = Esc::None;
+            } else {
+                self.esc = Esc::None;
+            }
+        } else {
+            params.push(ch);
+            self.esc = Esc::Csi(params);
+        }
+        true
+    }
+
+    /// `ESC O …` — an SS3 sequence (application-mode arrows and function keys).
+    fn feed_ss3(&mut self, ch: char, t: u64) -> bool {
+        if let Some(key) = ss3_key(ch) {
+            self.flush();
+            self.actions.push(Action::Key {
+                key: key.to_string(),
+                t_ms: t,
+            });
+        }
+        self.esc = Esc::None;
+        true
+    }
+
+    /// `ESC ] …` (OSC) and `ESC P`/`^`/`X …` (string) — swallow the body until
+    /// BEL or ST terminates it; anything else is body text, so the state
+    /// stands.
+    fn feed_osc_str(&mut self, state: Esc, ch: char) -> bool {
+        self.esc = match ch {
+            '\u{07}' => Esc::None,
+            '\u{1b}' => Esc::St,
+            _ => state,
+        };
+        true
+    }
+
+    /// Inside a bracketed paste: keep the text verbatim — Enter still submits
+    /// the pasted block, edits prune the run, ESC ends the paste.
+    fn feed_paste(&mut self, ch: char, t: u64) -> bool {
+        if ch == '\u{1b}' {
+            self.esc = Esc::PasteSaw;
+            return true;
+        }
+        // Anything else is paste content: the paste continues.
+        self.esc = Esc::Paste;
+        if ch == '\r' || ch == '\n' {
+            self.flush();
+            self.actions.push(Action::Key {
+                key: "enter".to_string(),
+                t_ms: t,
+            });
+        } else if ch == '\u{7f}' || ch == '\u{8}' {
+            self.buf.pop();
+        } else if ch == '\u{15}' {
+            self.buf.clear();
+        } else if !ch.is_control() {
+            if self.buf.is_empty() {
+                self.start_ms = t;
+            }
+            self.end_ms = t;
+            self.buf.push(ch);
+        }
+        true
+    }
+
+    /// After `ESC` inside a bracketed paste: `[` starts the end-marker CSI,
+    /// anything else is ordinary paste content.
+    fn feed_paste_saw(&mut self, ch: char) -> bool {
+        self.esc = if ch == '[' {
+            Esc::PasteCsi(String::new())
+        } else {
+            Esc::Paste
+        };
+        true
+    }
+
+    /// After the paste-ending `ESC [`: `201` closes the paste, anything else
+    /// is a key sequence that ends up back in normal paste handling.
+    fn feed_paste_csi(&mut self, mut params: String, ch: char) -> bool {
+        if ('\u{40}'..='\u{7e}').contains(&ch) {
+            self.esc = if ch == '~' && params == "201" {
+                Esc::None
+            } else {
+                Esc::Paste
+            };
+        } else {
+            params.push(ch);
+            self.esc = Esc::PasteCsi(params);
+        }
+        true
+    }
+
+    /// An `ESC` was just seen: route the next character into a sequence, or —
+    /// when it does not start one — emit the `esc` keypress and let the
+    /// character be processed normally.
+    fn feed_saw(&mut self, ch: char, t: u64) -> bool {
+        match ch {
+            '[' => self.esc = Esc::Csi(String::new()),
+            'O' => self.esc = Esc::Ss3,
+            ']' => self.esc = Esc::Osc,
+            'P' => self.esc = Esc::Str,
+            '_' | '^' | 'X' => self.esc = Esc::Str,
+            _ => {
+                // ESC + unrecognized char: emit "esc" as a keypress
+                // and process the following character normally.
+                self.flush();
+                self.actions.push(Action::Key {
+                    key: "esc".to_string(),
+                    t_ms: t,
+                });
+                self.esc = Esc::None;
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Process a character that is not part of an escape sequence.
+    fn feed_plain(&mut self, ch: char, t: u64) {
+        match ch {
+            // ESC: start of a special-key sequence.
+            '\u{1b}' => self.esc = Esc::Saw,
+            // Enter: submit. ALWAYS kept — a bare Enter accepts a selector
+            // default, which interactive programs depend on.
+            '\r' | '\n' => {
+                self.flush();
+                self.actions.push(Action::Key {
+                    key: "enter".to_string(),
+                    t_ms: t,
+                });
+            }
+            // Backspace / DEL: prune a typo from the current run.
+            '\u{7f}' | '\u{8}' => {
+                self.buf.pop();
+            }
+            // Ctrl-U: kill the whole line.
+            '\u{15}' => self.buf.clear(),
+            // Ctrl-C: cancel — kept as a key so replay matches.
+            '\u{3}' => {
+                self.buf.clear();
+                self.actions.push(Action::Key {
+                    key: "ctrl+c".to_string(),
+                    t_ms: t,
+                });
+            }
+            // Ctrl-S: XOFF / save — kept as a key so replay matches.
+            '\u{13}' => {
+                self.flush();
+                self.actions.push(Action::Key {
+                    key: "ctrl+s".to_string(),
+                    t_ms: t,
+                });
+            }
+            // Tab: completion / field navigation — kept as a key.
+            '\t' => {
+                self.flush();
+                self.actions.push(Action::Key {
+                    key: "tab".to_string(),
+                    t_ms: t,
+                });
+            }
+            // Ignore other stray control bytes (Bell, …).
+            c if c.is_control() => {}
+            c => {
+                if self.buf.is_empty() {
+                    self.start_ms = t;
+                }
+                self.end_ms = t;
+                self.buf.push(c);
+            }
+        }
+    }
+
+    /// Finish the replay: flush the pending run and, if input ended right after
+    /// an `ESC`, emit that ESC as a keypress so it isn't silently dropped.
+    fn finish(mut self) -> Vec<Action> {
+        self.flush();
+        if let Esc::Saw = self.esc {
+            self.actions.push(Action::Key {
+                key: "esc".to_string(),
+                t_ms: self.end_ms,
+            });
+        }
+        self.actions
+    }
+}
+
 /// Replay timestamped input chunks into an ordered list of clean actions.
 pub fn reconstruct(inputs: &[(u64, &str)]) -> Vec<Action> {
-    let mut actions = Vec::new();
-    let mut buf: Vec<char> = Vec::new();
-    let mut start_ms = 0u64;
-    let mut end_ms = 0u64;
-    let mut esc = Esc::None;
-
-    // Emit the pending typed run (if any) as a Type action.
-    let flush = |actions: &mut Vec<Action>, buf: &mut Vec<char>, start: u64, end: u64| {
-        if !buf.is_empty() {
-            actions.push(Action::Type {
-                text: buf.iter().collect(),
-                t_ms: start,
-                end_ms: end,
-            });
-            buf.clear();
-        }
-    };
-
+    let mut state = ReconstructState::new();
     for &(t, bytes) in inputs {
         let bytes = strip_orphan_osc_bodies(bytes);
         for ch in bytes.chars() {
-            match esc {
-                Esc::Csi(ref mut params) => {
-                    if ('\u{40}'..='\u{7e}').contains(&ch) {
-                        if ch == '~' && params == "200" {
-                            esc = Esc::Paste;
-                        } else if let Some(key) = csi_key(params, ch) {
-                            flush(&mut actions, &mut buf, start_ms, end_ms);
-                            actions.push(Action::Key { key, t_ms: t });
-                            esc = Esc::None;
-                        } else {
-                            esc = Esc::None;
-                        }
-                    } else {
-                        params.push(ch);
-                    }
-                    continue;
-                }
-                Esc::Ss3 => {
-                    if let Some(key) = ss3_key(ch) {
-                        flush(&mut actions, &mut buf, start_ms, end_ms);
-                        actions.push(Action::Key {
-                            key: key.to_string(),
-                            t_ms: t,
-                        });
-                    }
-                    esc = Esc::None;
-                    continue;
-                }
-                Esc::Osc | Esc::Str => {
-                    match ch {
-                        '\u{07}' => esc = Esc::None,
-                        '\u{1b}' => esc = Esc::St,
-                        _ => {}
-                    }
-                    continue;
-                }
-                Esc::St => {
-                    esc = Esc::None;
-                    continue;
-                }
-                Esc::Paste => {
-                    if ch == '\u{1b}' {
-                        esc = Esc::PasteSaw;
-                    } else if ch == '\r' || ch == '\n' {
-                        flush(&mut actions, &mut buf, start_ms, end_ms);
-                        actions.push(Action::Key {
-                            key: "enter".to_string(),
-                            t_ms: t,
-                        });
-                    } else if ch == '\u{7f}' || ch == '\u{8}' {
-                        buf.pop();
-                    } else if ch == '\u{15}' {
-                        buf.clear();
-                    } else if !ch.is_control() {
-                        if buf.is_empty() {
-                            start_ms = t;
-                        }
-                        end_ms = t;
-                        buf.push(ch);
-                    }
-                    continue;
-                }
-                Esc::PasteSaw => {
-                    esc = if ch == '[' {
-                        Esc::PasteCsi(String::new())
-                    } else {
-                        Esc::Paste
-                    };
-                    continue;
-                }
-                Esc::PasteCsi(ref mut params) => {
-                    if ('\u{40}'..='\u{7e}').contains(&ch) {
-                        esc = if ch == '~' && params == "201" {
-                            Esc::None
-                        } else {
-                            Esc::Paste
-                        };
-                    } else {
-                        params.push(ch);
-                    }
-                    continue;
-                }
-                Esc::Saw => {
-                    match ch {
-                        '[' => {
-                            esc = Esc::Csi(String::new());
-                            continue;
-                        }
-                        'O' => {
-                            esc = Esc::Ss3;
-                            continue;
-                        }
-                        ']' => {
-                            esc = Esc::Osc;
-                            continue;
-                        }
-                        'P' => {
-                            esc = Esc::Str;
-                            continue;
-                        }
-                        '_' | '^' | 'X' => {
-                            esc = Esc::Str;
-                            continue;
-                        }
-                        _ => {
-                            // ESC + unrecognized char: emit "esc" as a keypress
-                            // and process the following character normally.
-                            flush(&mut actions, &mut buf, start_ms, end_ms);
-                            actions.push(Action::Key {
-                                key: "esc".to_string(),
-                                t_ms: t,
-                            });
-                            esc = Esc::None;
-                            // Fall through to the main match ch below.
-                        }
-                    }
-                }
-                Esc::None => {}
-            }
-            match ch {
-                // ESC: start of a special-key sequence.
-                '\u{1b}' => esc = Esc::Saw,
-                // Enter: submit. ALWAYS kept — a bare Enter accepts a selector
-                // default, which interactive programs depend on.
-                '\r' | '\n' => {
-                    flush(&mut actions, &mut buf, start_ms, end_ms);
-                    actions.push(Action::Key {
-                        key: "enter".to_string(),
-                        t_ms: t,
-                    });
-                }
-                // Backspace / DEL: prune a typo from the current run.
-                '\u{7f}' | '\u{8}' => {
-                    buf.pop();
-                }
-                // Ctrl-U: kill the whole line.
-                '\u{15}' => buf.clear(),
-                // Ctrl-C: cancel — kept as a key so replay matches.
-                '\u{3}' => {
-                    buf.clear();
-                    actions.push(Action::Key {
-                        key: "ctrl+c".to_string(),
-                        t_ms: t,
-                    });
-                }
-                // Ctrl-S: XOFF / save — kept as a key so replay matches.
-                '\u{13}' => {
-                    flush(&mut actions, &mut buf, start_ms, end_ms);
-                    actions.push(Action::Key {
-                        key: "ctrl+s".to_string(),
-                        t_ms: t,
-                    });
-                }
-                // Tab: completion / field navigation — kept as a key.
-                '\t' => {
-                    flush(&mut actions, &mut buf, start_ms, end_ms);
-                    actions.push(Action::Key {
-                        key: "tab".to_string(),
-                        t_ms: t,
-                    });
-                }
-                // Ignore other stray control bytes (Bell, …).
-                c if c.is_control() => {}
-                c => {
-                    if buf.is_empty() {
-                        start_ms = t;
-                    }
-                    end_ms = t;
-                    buf.push(c);
-                }
-            }
+            state.feed_char(ch, t);
         }
     }
-    flush(&mut actions, &mut buf, start_ms, end_ms);
-    // A bare ESC at the end of input (no following character) — emit it as a
-    // keypress so it doesn't get silently dropped.
-    if let Esc::Saw = esc {
-        actions.push(Action::Key {
-            key: "esc".to_string(),
-            t_ms: end_ms,
-        });
-    }
-    actions
+    state.finish()
 }
 
 #[cfg(test)]

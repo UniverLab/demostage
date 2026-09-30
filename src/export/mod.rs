@@ -71,6 +71,31 @@ pub fn rewrite_local_urls(score: &Score, server_port: u16) -> Score {
     score
 }
 
+/// The resolved geometry and rate a target renders at, plus how the frames are
+/// produced (staged compositing vs. a single terminal grid).
+struct RenderPlan {
+    /// Multi-pane scores composite on the canvas through [`stage::render_stage`].
+    staged: bool,
+    cw: usize,
+    ch: usize,
+    fps: u32,
+    total_frames: usize,
+    /// The resolved export speed multiplier, threaded through to the PDF pan path.
+    speed: f64,
+}
+
+/// Print one line per browser pane that was captured for a staged export.
+fn report_browser_captures(reports: &[browser::BrowserCaptureReport]) {
+    for br in reports {
+        eprintln!(
+            "demo: browser pane '{}' — {} frames captured in {:.1}s",
+            br.pane_id,
+            br.frame_count,
+            br.elapsed.as_secs_f64()
+        );
+    }
+}
+
 /// Render an already-captured `recording` to `target`, returning the path
 /// written. Pure playback — it never executes the demo. `score` carries the
 /// layout/styling (its timeline is unused here). `speed` is the resolved export
@@ -103,139 +128,141 @@ pub fn render(
         (plan.width, plan.height)
     };
     let total_frames = (rec.duration * fps as f64).ceil() as usize + 1;
+    let plan = RenderPlan {
+        staged,
+        cw,
+        ch,
+        fps,
+        total_frames,
+        speed,
+    };
 
     match target {
-        Target::Gif => {
-            let path = resolve_output(&score, "gif");
-            ensure_parent(&path)?;
-            let mut report = raster::FallbackReport::new();
-            if staged {
-                let mut n = 0usize;
-                let mut browser_reports = Vec::new();
-                gif::encode(&path, cw, ch, fps, |emit| {
-                    let r = stage::render_stage(rec, &score, speed, |f| {
-                        n += 1;
-                        progress_bar("exporting gif", n, total_frames);
-                        emit(f);
-                    })?;
-                    report = r.0;
-                    browser_reports = r.1;
-                    Ok(())
-                })?;
-                progress_clear();
-                for br in &browser_reports {
-                    eprintln!(
-                        "demo: browser pane '{}' — {} frames captured in {:.1}s",
-                        br.pane_id,
-                        br.frame_count,
-                        br.elapsed.as_secs_f64()
-                    );
-                }
-            } else {
-                let mut n = 0usize;
-                gif::encode(&path, cw, ch, fps, |emit| {
-                    let (_plan, r) = raster::render_frames(rec, &score, |f| {
-                        n += 1;
-                        progress_bar("exporting gif", n, total_frames);
-                        emit(f);
-                    })?;
-                    report = r;
-                    Ok(())
-                })?;
-                progress_clear();
-            }
-            for line in report.format(&score.demo.name) {
-                eprintln!("{line}");
-            }
-            Ok(path)
-        }
-        Target::Mp4 => {
-            let path = resolve_output(&score, "mp4");
-            ensure_parent(&path)?;
-            let mut report = raster::FallbackReport::new();
-            if staged {
-                let mut n = 0usize;
-                let mut browser_reports = Vec::new();
-                mp4::encode(&path, cw, ch, fps, |emit| {
-                    let r = stage::render_stage(rec, &score, speed, |f| {
-                        n += 1;
-                        progress_bar("exporting mp4", n, total_frames);
-                        emit(f);
-                    })?;
-                    report = r.0;
-                    browser_reports = r.1;
-                    Ok(())
-                })?;
-                progress_clear();
-                for br in &browser_reports {
-                    eprintln!(
-                        "demo: browser pane '{}' — {} frames captured in {:.1}s",
-                        br.pane_id,
-                        br.frame_count,
-                        br.elapsed.as_secs_f64()
-                    );
-                }
-            } else {
-                let mut n = 0usize;
-                mp4::encode(&path, cw, ch, fps, |emit| {
-                    let (_plan, r) = raster::render_frames(rec, &score, |f| {
-                        n += 1;
-                        progress_bar("exporting mp4", n, total_frames);
-                        emit(f);
-                    })?;
-                    report = r;
-                    Ok(())
-                })?;
-                progress_clear();
-            }
-            for line in report.format(&score.demo.name) {
-                eprintln!("{line}");
-            }
-            Ok(path)
-        }
-        Target::Svg => {
-            let path = resolve_output(&score, "svg");
-            ensure_parent(&path)?;
-            let mut report = raster::FallbackReport::new();
-            if staged {
-                // Fallback, documented in docs/export-targets.md: a staged
-                // score has no cell grid to draw, so replay the stage and keep
-                // ONE composited frame, embedded as a base64 PNG in the SVG.
-                let keep = svg::frame_index(at_secs, fps, total_frames);
-                let mut n = 0usize;
-                let mut browser_reports = Vec::new();
-                svg::encode(&path, cw, ch, keep, |emit| {
-                    let r = stage::render_stage(rec, &score, speed, |f| {
-                        n += 1;
-                        progress_bar("exporting svg", n, total_frames);
-                        emit(&svg::PosterFrame::Rgba(f));
-                    })?;
-                    report = r.0;
-                    browser_reports = r.1;
-                    Ok(())
-                })?;
-                progress_clear();
-                for br in &browser_reports {
-                    eprintln!(
-                        "demo: browser pane '{}' — {} frames captured in {:.1}s",
-                        br.pane_id,
-                        br.frame_count,
-                        br.elapsed.as_secs_f64()
-                    );
-                }
-            } else {
-                // Single terminal: seek to the chosen frame and draw it as
-                // vector text — the frames in between are never rasterized.
-                progress_bar("exporting svg", 1, 1);
-                svg::write_svg(&path, rec, &score, at_secs)?;
-                progress_clear();
-            }
-            for line in report.format(&score.demo.name) {
-                eprintln!("{line}");
-            }
-            Ok(path)
-        }
+        Target::Gif => render_gif(rec, &score, &plan),
+        Target::Mp4 => render_mp4(rec, &score, &plan),
+        Target::Svg => render_svg(rec, &score, &plan, at_secs),
     }
+}
+
+/// Render every frame into an animated GIF at the resolved geometry.
+fn render_gif(rec: &Recording, score: &Score, plan: &RenderPlan) -> Result<PathBuf> {
+    let path = resolve_output(score, "gif");
+    ensure_parent(&path)?;
+    let mut report = raster::FallbackReport::new();
+    if plan.staged {
+        let mut n = 0usize;
+        let mut browser_reports = Vec::new();
+        gif::encode(&path, plan.cw, plan.ch, plan.fps, |emit| {
+            let r = stage::render_stage(rec, score, plan.speed, |f| {
+                n += 1;
+                progress_bar("exporting gif", n, plan.total_frames);
+                emit(f);
+            })?;
+            report = r.0;
+            browser_reports = r.1;
+            Ok(())
+        })?;
+        progress_clear();
+        report_browser_captures(&browser_reports);
+    } else {
+        let mut n = 0usize;
+        gif::encode(&path, plan.cw, plan.ch, plan.fps, |emit| {
+            let (_plan, r) = raster::render_frames(rec, score, |f| {
+                n += 1;
+                progress_bar("exporting gif", n, plan.total_frames);
+                emit(f);
+            })?;
+            report = r;
+            Ok(())
+        })?;
+        progress_clear();
+    }
+    for line in report.format(&score.demo.name) {
+        eprintln!("{line}");
+    }
+    Ok(path)
+}
+
+/// Render every frame into an MP4 (via ffmpeg) at the resolved geometry.
+fn render_mp4(rec: &Recording, score: &Score, plan: &RenderPlan) -> Result<PathBuf> {
+    let path = resolve_output(score, "mp4");
+    ensure_parent(&path)?;
+    let mut report = raster::FallbackReport::new();
+    if plan.staged {
+        let mut n = 0usize;
+        let mut browser_reports = Vec::new();
+        mp4::encode(&path, plan.cw, plan.ch, plan.fps, |emit| {
+            let r = stage::render_stage(rec, score, plan.speed, |f| {
+                n += 1;
+                progress_bar("exporting mp4", n, plan.total_frames);
+                emit(f);
+            })?;
+            report = r.0;
+            browser_reports = r.1;
+            Ok(())
+        })?;
+        progress_clear();
+        report_browser_captures(&browser_reports);
+    } else {
+        let mut n = 0usize;
+        mp4::encode(&path, plan.cw, plan.ch, plan.fps, |emit| {
+            let (_plan, r) = raster::render_frames(rec, score, |f| {
+                n += 1;
+                progress_bar("exporting mp4", n, plan.total_frames);
+                emit(f);
+            })?;
+            report = r;
+            Ok(())
+        })?;
+        progress_clear();
+    }
+    for line in report.format(&score.demo.name) {
+        eprintln!("{line}");
+    }
+    Ok(path)
+}
+
+/// Draw one frame as vector text (the poster) — staged scores replay the stage
+/// and keep ONE composited frame, embedded as a base64 PNG in the SVG.
+fn render_svg(
+    rec: &Recording,
+    score: &Score,
+    plan: &RenderPlan,
+    at_secs: Option<f64>,
+) -> Result<PathBuf> {
+    let path = resolve_output(score, "svg");
+    ensure_parent(&path)?;
+    let mut report = raster::FallbackReport::new();
+    if plan.staged {
+        // Fallback, documented in docs/export-targets.md: a staged
+        // score has no cell grid to draw, so replay the stage and keep
+        // ONE composited frame, embedded as a base64 PNG in the SVG.
+        let keep = svg::frame_index(at_secs, plan.fps, plan.total_frames);
+        let mut n = 0usize;
+        let mut browser_reports = Vec::new();
+        svg::encode(&path, plan.cw, plan.ch, keep, |emit| {
+            let r = stage::render_stage(rec, score, plan.speed, |f| {
+                n += 1;
+                progress_bar("exporting svg", n, plan.total_frames);
+                emit(&svg::PosterFrame::Rgba(f));
+            })?;
+            report = r.0;
+            browser_reports = r.1;
+            Ok(())
+        })?;
+        progress_clear();
+        report_browser_captures(&browser_reports);
+    } else {
+        // Single terminal: seek to the chosen frame and draw it as
+        // vector text — the frames in between are never rasterized.
+        progress_bar("exporting svg", 1, 1);
+        svg::write_svg(&path, rec, score, at_secs)?;
+        progress_clear();
+    }
+    for line in report.format(&score.demo.name) {
+        eprintln!("{line}");
+    }
+    Ok(path)
 }
 
 /// Retime a recording by `1/speed` (so `speed = 2.0` plays twice as fast, `0.5`

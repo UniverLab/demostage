@@ -1,4 +1,53 @@
+use super::cells::{block_cell, box_arms, box_cell, braille_cell, solid_cell, xterm256, ANSI16};
+use super::glyph::{rasterize_with_fallback, GlyphBlit};
 use super::*;
+use vt100::Color;
+
+#[test]
+fn precache_glyphs_caches_what_the_recording_prints() {
+    let rec = Recording {
+        cols: 16,
+        rows: 2,
+        title: "t".into(),
+        events: vec![(0.0, "\u{2588}\u{2591}\u{2192} caf\u{e9}".into())],
+        captions: vec![],
+        focuses: vec![],
+        duration: 0.1,
+    };
+    let font = fonts::load(fonts::DEFAULT_FONT);
+    let emoji = fonts::load_emoji();
+    let last_resort = fonts::load_last_resort();
+    let mut glyphs = HashMap::new();
+    let mut report = FallbackReport::new();
+
+    precache_glyphs(
+        &rec,
+        &mut glyphs,
+        &font,
+        &emoji,
+        &last_resort,
+        16.0,
+        &mut report,
+    );
+
+    // Every non-ASCII glyph the capture prints is cached up front …
+    assert!(
+        glyphs.contains_key(&'\u{2588}'),
+        "banner block must be cached"
+    );
+    assert!(
+        glyphs.contains_key(&'\u{2591}'),
+        "shade block must be cached"
+    );
+    assert!(glyphs.contains_key(&'\u{2192}'), "arrow must be cached");
+    assert!(
+        glyphs.contains_key(&'\u{e9}'),
+        "accented letter must be cached"
+    );
+    // … but control characters and whitespace never are.
+    assert!(!glyphs.contains_key(&'\n'));
+    assert!(!glyphs.contains_key(&' '));
+}
 
 #[test]
 fn parses_hex_colors() {
@@ -581,7 +630,14 @@ fn blit_glyph_draws_within_bounds() {
         },
     };
     let cov = vec![255u8; 8 * 12];
-    blit_glyph(&mut img, 20, 20, 2, 4, &m, &cov, [255, 0, 0]);
+    GlyphBlit {
+        m: &m,
+        cov: &cov,
+        ox: 2,
+        top: 4,
+        fg: [255, 0, 0],
+    }
+    .draw(&mut img, 20, 20);
     // Some pixels should be red now
     let mut found = false;
     for y in 0..20 {
@@ -620,9 +676,23 @@ fn blit_glyph_clips_at_top() {
     };
     let cov = vec![255u8; 4 * 8];
     // top = -4 clips the top half of the glyph
-    blit_glyph(&mut img_clipped, 20, 20, 0, -4, &m, &cov, [0, 255, 0]);
+    GlyphBlit {
+        m: &m,
+        cov: &cov,
+        ox: 0,
+        top: -4,
+        fg: [0, 255, 0],
+    }
+    .draw(&mut img_clipped, 20, 20);
     // top = 0 draws the full glyph
-    blit_glyph(&mut img_full, 20, 20, 0, 0, &m, &cov, [0, 255, 0]);
+    GlyphBlit {
+        m: &m,
+        cov: &cov,
+        ox: 0,
+        top: 0,
+        fg: [0, 255, 0],
+    }
+    .draw(&mut img_full, 20, 20);
     let clipped_pixels: usize = img_clipped
         .as_chunks::<4>()
         .0
@@ -660,7 +730,14 @@ fn blit_glyph_clips_at_right() {
     };
     let cov = vec![255u8; 8 * 4];
     // ox = 6, so pixels 6..14 would go out of bounds (w=10)
-    blit_glyph(&mut img, 10, 10, 6, 0, &m, &cov, [0, 0, 255]);
+    GlyphBlit {
+        m: &m,
+        cov: &cov,
+        ox: 6,
+        top: 0,
+        fg: [0, 0, 255],
+    }
+    .draw(&mut img, 10, 10);
     // Column 9 should have blue, columns 10+ should be untouched
     for y in 0..4 {
         let p = (y * 10 + 9) * 4;
@@ -686,7 +763,14 @@ fn blit_glyph_zero_coverage_does_nothing() {
         },
     };
     let cov = vec![0u8; 4 * 4]; // all zeros
-    blit_glyph(&mut img, 10, 10, 0, 0, &m, &cov, [255, 255, 255]);
+    GlyphBlit {
+        m: &m,
+        cov: &cov,
+        ox: 0,
+        top: 0,
+        fg: [255, 255, 255],
+    }
+    .draw(&mut img, 10, 10);
     // Nothing should change
     assert!(img.iter().all(|&p| p == 128));
 }

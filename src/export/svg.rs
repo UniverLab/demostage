@@ -107,6 +107,37 @@ pub fn frame_index(at_secs: Option<f64>, fps: u32, n_frames: usize) -> usize {
     }
 }
 
+/// One row's braille cells as `<circle>` dots, one element per dot.
+/// Cells without braille (or the blank U+2800) contribute nothing.
+fn paint_braille_row(tf: &TextFrame, row: usize) -> String {
+    let mut out = String::new();
+    let Some(cells) = row_cells(tf, row) else {
+        return out;
+    };
+    for (col, cell) in cells.iter().enumerate() {
+        if !is_braille(cell.ch) {
+            continue;
+        }
+        let dots = braille_dots(row, col, cell.ch, cell.fg, tf);
+        if dots.is_empty() {
+            continue;
+        }
+        out.push_str(&dots);
+        out.push('\n');
+    }
+    out
+}
+
+/// One row's merged text runs as `<text>` elements, one per line.
+fn paint_text_row(tf: &TextFrame, row: usize) -> String {
+    let mut out = String::new();
+    for run in merge_runs(tf, row) {
+        out.push_str(&run_text(&run, row, tf));
+        out.push('\n');
+    }
+    out
+}
+
 /// The whole `<svg>` for a cell-grid frame: rounded canvas, the background runs
 /// of every row, then each row's braille dots and text runs. Geometry is all
 /// integers (the one `f32` — the font size — is rounded once here), so the
@@ -126,21 +157,8 @@ pub(crate) fn poster_document(tf: &TextFrame, w: usize, h: usize) -> String {
         out.push('\n');
     }
     for row in 0..tf.rows {
-        if let Some(cells) = row_cells(tf, row) {
-            for (col, cell) in cells.iter().enumerate() {
-                if is_braille(cell.ch) {
-                    let dots = braille_dots(row, col, cell.ch, cell.fg, tf);
-                    if !dots.is_empty() {
-                        out.push_str(&dots);
-                        out.push('\n');
-                    }
-                }
-            }
-        }
-        for run in merge_runs(tf, row) {
-            out.push_str(&run_text(&run, row, tf));
-            out.push('\n');
-        }
+        out.push_str(&paint_braille_row(tf, row));
+        out.push_str(&paint_text_row(tf, row));
     }
     out.push_str("</svg>\n");
     out

@@ -198,11 +198,10 @@ fn source_hint(sources: &[Source]) -> String {
     }
 }
 
-/// Pick 1–2 sources (orientation for two, presentation, and when to reveal) from
-/// the capture's sources.
-fn wizard(sources: &[Source], args: &FocusArgs) -> Result<WizardOutcome> {
-    println!("\n  demo focus — switch the view\n");
-    // "main" (the terminal) is always available, plus any browser sources.
+/// The revealable ids: `main` (the terminal, always available) plus every
+/// browser source of the capture — with a note when there are no browser
+/// sources to pick from.
+fn pick_pane_ids(sources: &[Source]) -> Vec<String> {
     let mut ids: Vec<String> = vec!["main".to_string()];
     ids.extend(
         sources
@@ -214,6 +213,98 @@ fn wizard(sources: &[Source], args: &FocusArgs) -> Result<WizardOutcome> {
         println!("  (this capture has no browser sources — only the terminal.");
         println!("   configure them when starting `demo capture`, or reveal an ad-hoc page with `demo open <url>`)\n");
     }
+    ids
+}
+
+/// How long a static browser reveal holds, in ms. Duplicates the seconds
+/// validator locally (same message as `demo open`) rather than sharing it.
+fn ask_hold_secs() -> Result<u64> {
+    let secs = ask(Text::new("Hold for how many seconds?")
+        .with_default("6")
+        .with_validator(|s: &str| {
+            let s = s.trim();
+            match s.parse::<f64>() {
+                Ok(n) if n > 0.0 => Ok(inquire::validator::Validation::Valid),
+                _ => Ok(inquire::validator::Validation::Invalid(
+                    "enter a positive number of seconds (e.g. 6)".into(),
+                )),
+            }
+        })
+        .prompt())?;
+    let secs: f64 = secs.trim().parse().unwrap_or(6.0);
+    Ok((secs.max(0.5) * 1000.0) as u64)
+}
+
+/// How the chosen browser pane is shown: a static hold (its duration in ms) or
+/// a scroll. Returns `(hold_ms, scroll)`.
+fn ask_browser_behavior() -> Result<(Option<u64>, bool)> {
+    let behavior = ask(Select::new(
+        "Show it as:",
+        vec![
+            "Static — hold for a few seconds",
+            "Scroll the page down (pan)",
+        ],
+    )
+    .prompt())?;
+    let scroll = behavior.starts_with("Scroll");
+    let hold_ms = if behavior.starts_with("Static") {
+        Some(ask_hold_secs()?)
+    } else {
+        None
+    };
+    Ok((hold_ms, scroll))
+}
+
+/// When the reveal fires. Same choices as the `demo open` wizard, so a focus
+/// can be armed ahead of a long-running command instead of firing immediately.
+/// Returns `(when_pattern, after)`.
+fn ask_trigger() -> Result<(Option<String>, bool)> {
+    let trigger = ask(Select::new(
+        "Switch:",
+        vec![
+            "now",
+            "when the current command finishes",
+            "when a line appears in the output",
+        ],
+    )
+    .prompt())?;
+    if trigger.starts_with("when the current") {
+        return Ok((None, true));
+    }
+    if trigger.starts_with("when a line") {
+        let pat = ask(Text::new("Cue line (a substring of the output):").prompt())?;
+        let pat = pat.trim();
+        return Ok(((!pat.is_empty()).then(|| pat.to_string()), false));
+    }
+    Ok((None, false))
+}
+
+/// Assemble the wizard result from its already-asked parts.
+fn build_outcome(
+    sources: Vec<String>,
+    orientation: String,
+    when: Option<String>,
+    after: bool,
+    hold_ms: Option<u64>,
+    scroll: bool,
+    split_with_main: bool,
+) -> WizardOutcome {
+    WizardOutcome {
+        sources,
+        orientation,
+        when,
+        after,
+        hold_ms,
+        scroll,
+        split_with_main,
+    }
+}
+
+/// Pick 1–2 sources (orientation for two, presentation, and when to reveal) from
+/// the capture's sources.
+fn wizard(sources: &[Source], args: &FocusArgs) -> Result<WizardOutcome> {
+    println!("\n  demo focus — switch the view\n");
+    let ids = pick_pane_ids(sources);
 
     let chosen = ask(MultiSelect::new("Show (pick one or two):", ids)
         .with_help_message("space toggles, enter accepts")
@@ -254,70 +345,24 @@ fn wizard(sources: &[Source], args: &FocusArgs) -> Result<WizardOutcome> {
     };
 
     let (hold_ms, scroll) = if has_browser {
-        let behavior = ask(Select::new(
-            "Show it as:",
-            vec![
-                "Static — hold for a few seconds",
-                "Scroll the page down (pan)",
-            ],
-        )
-        .prompt())?;
-        let scroll = behavior.starts_with("Scroll");
-        let hold_ms = if behavior.starts_with("Static") {
-            let secs = ask(Text::new("Hold for how many seconds?")
-                .with_default("6")
-                .with_validator(|s: &str| {
-                    let s = s.trim();
-                    match s.parse::<f64>() {
-                        Ok(n) if n > 0.0 => Ok(inquire::validator::Validation::Valid),
-                        _ => Ok(inquire::validator::Validation::Invalid(
-                            "enter a positive number of seconds (e.g. 6)".into(),
-                        )),
-                    }
-                })
-                .prompt())?;
-            let secs: f64 = secs.trim().parse().unwrap_or(6.0);
-            Some((secs.max(0.5) * 1000.0) as u64)
-        } else {
-            None
-        };
-        (hold_ms, scroll)
+        ask_browser_behavior()?
     } else {
         (None, false)
     };
+    let (when, after) = ask_trigger()?;
 
-    // When to switch — same choices as the `demo open` wizard, so a focus can be
-    // armed ahead of a long-running command instead of firing immediately.
-    let trigger = ask(Select::new(
-        "Switch:",
-        vec![
-            "now",
-            "when the current command finishes",
-            "when a line appears in the output",
-        ],
-    )
-    .prompt())?;
-    let (when, after) = if trigger.starts_with("when the current") {
-        (None, true)
-    } else if trigger.starts_with("when a line") {
-        let pat = ask(Text::new("Cue line (a substring of the output):").prompt())?;
-        let pat = pat.trim();
-        ((!pat.is_empty()).then(|| pat.to_string()), false)
-    } else {
-        (None, false)
-    };
-
-    Ok(WizardOutcome {
-        sources: chosen,
+    Ok(build_outcome(
+        chosen,
         orientation,
         when,
         after,
         hold_ms,
         scroll,
         split_with_main,
-    })
+    ))
 }
 
+/// Unwrap a prompt result, mapping inquire's failure onto our own error.
 fn ask<T>(r: std::result::Result<T, inquire::InquireError>) -> Result<T> {
     r.map_err(|e| Error::Export(format!("wizard: {e}")))
 }
@@ -325,6 +370,15 @@ fn ask<T>(r: std::result::Result<T, inquire::InquireError>) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The wizard's `ask` wrapper compiles against inquire's error type (0.9):
+    /// a prompt that cannot run (no TTY) surfaces as our own error.
+    #[test]
+    fn ask_maps_inquire_errors_to_export_errors() {
+        let err = ask::<String>(Err(inquire::InquireError::NotTTY)).unwrap_err();
+        assert!(matches!(err, Error::Export(_)));
+        assert_eq!(ask::<String>(Ok("ok".to_string())).unwrap(), "ok");
+    }
 
     #[test]
     fn is_terminal_id_matches_main_and_terminal() {
