@@ -85,7 +85,7 @@ demo export gif,mp4 --speed 2x        # several at once, retimed 2× faster
 ## Documentation
 
 See [`docs/`](docs/) — overview, the `demo.toml` DSL, the commands, the normalizer,
-and the export targets. (Published on the UniverLab site at `/demo-stage/docs`.)
+and the export targets. (Published on the UniverLab site at `/demostage/docs`.)
 
 ---
 
