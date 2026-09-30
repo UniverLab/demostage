@@ -24,6 +24,8 @@ Instead of capturing brittle pixels, it records a session as **events**, normali
 human imperfections into a clean **score** (`demo.toml`), and compiles that score to
 several formats. One demo, version-controlled, re-runnable, diffable.
 
+Project home: [univerlab.org/demostage](https://univerlab.org/demostage/)
+
 <p align="center">
   <img src="demo/dist/demo.gif" alt="A ghScaff wizard demo captured and rendered with DemoStage" width="800"/>
 </p>
@@ -53,15 +55,9 @@ several formats. One demo, version-controlled, re-runnable, diffable.
 ## Install
 
 ```sh
-cargo install --path .          # from this repo
-# or, once published:
-# curl -fsSL https://get.univerlab.org/demo-stage | sh
-```
-
-### Via cargo
-
-```bash
-cargo install demo-stage
+curl -fsSL https://install.univerlab.org/demostage | sh
+cargo install demo-stage        # from crates.io
+cargo install --path .          # from a checkout
 ```
 
 ### Uninstall

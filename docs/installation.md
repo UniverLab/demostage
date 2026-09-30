@@ -8,24 +8,24 @@ order: 2
 
 DemoStage ships a single binary, `demo`.
 
+## One-line installer
+
+```sh
+curl -fsSL https://install.univerlab.org/demostage | sh
+```
+
+## With cargo
+
+```sh
+cargo install demo-stage
+```
+
 ## From source
 
 ```sh
 git clone https://github.com/UniverLab/demo-stage
 cd demo-stage
 cargo install --path .
-```
-
-## With cargo (once published)
-
-```sh
-cargo install demo-stage
-```
-
-## One-line installer (once the domain is live)
-
-```sh
-curl -fsSL https://get.univerlab.org/demo-stage | sh
 ```
 
 ## Self-update
