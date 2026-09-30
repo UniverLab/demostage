@@ -154,7 +154,7 @@ fn insert_step(score: &mut Score, indices: &[usize]) -> Result<usize> {
 }
 
 /// Replace the key of every selected `keypress` step with the key the user
-/// types (an empty answer leaves the timeline untouched).
+/// types (an empty answer is rejected).
 fn edit_keypress(score: &mut Score, indices: &[usize]) -> Result<()> {
     let current = match &score.timeline[indices[0]] {
         Step::Keypress { key } => key.clone(),
