@@ -209,6 +209,12 @@ cargo test
 
 ---
 
+## Contributing
+
+`docs/` is published at univerlab.org/demostage/docs and holds user documentation only; design records are kept outside the repository.
+
+---
+
 ## License
 
 MIT — see [`LICENSE`](LICENSE). The embedded font has its own permissive license,
