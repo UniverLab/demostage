@@ -21,7 +21,7 @@ vector text. Naming no format (or naming `all`) still builds **only `gif` +
 |---|---|---|---|
 | `gif`  | animated GIF | READMEs, chat, GitHub — anywhere `<img>` works | — (pure Rust) |
 | `mp4`  | H.264 video | landings / the web (`<video>`), CDN-friendly | ffmpeg — **auto-fetched** |
-| `svg`  | static poster (vector text) | README stills, print, docs — **opt-in** | — (pure Rust) |
+| `svg`  | animated SVG (vector text), terminal-only | README embeds (`<img>`), crisp at any size — **opt-in** | — (pure Rust) |
 | browser panes | composited into gif/mp4 | a PDF / web scene beside the terminal | Chromium — **auto-fetched** |
 
 > A text-based, framework-agnostic web player (a *DemoStagePlayer*, with crisp
@@ -44,27 +44,36 @@ can't run (offline), you get a clear message and can install ffmpeg yourself.
 
 ## svg (opt-in)
 
-A **static poster**: one frame of the recording drawn as real vector text.
-Adjacent cells with the same style are merged into a single `<text>` run, the
-canvas/pane is one rounded `<rect rx="8">` with a plain `<rect>` per run of
-coloured background cells, and every run carries `textLength` +
-`lengthAdjust="spacing"` so the glyphs land on their grid columns no matter which
-monospace the viewer has — the `font-family` falls back to `monospace`. The result
-is **crisp, selectable and tiny**, and it opens in any browser, editor or print
-workflow.
+An **animated** SVG of the whole timeline — for demos whose visible panes are
+**terminal panes only**. Every distinct screen state becomes a `<g>` of merged
+text runs, shown and hidden with CSS `@keyframes` using `steps()` timing so
+each state holds for its real duration; the animation loops forever. To stay
+small, a state identical to an earlier one reuses it (`<use href>`), and runs
+that do not change between consecutive states are drawn once in a persistent
+layer spanning their lifetime.
 
-- **Not animated — on purpose.** No SMIL, no CSS: animation stays with `gif`/`mp4`,
-  which carry the motion. The SVG is a still.
-- **`--at <seconds>`** picks the frame, e.g. `demo export svg --at 12.5 demo.rec`.
-  It defaults to the **last frame**, and a value past the end clamps to it.
-  Ignored by `gif`/`mp4`.
+- **Text alignment without embedded fonts.** The stack is `ui-monospace,
+  SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", monospace`, and every
+  run carries `textLength` + `lengthAdjust="spacingAndGlyphs"` computed from
+  its cell count, so the grid holds with whatever monospace the viewer has.
+- **`prefers-reduced-motion: reduce` shows the final state**, static.
+- **README-safe:** no scripts, no external references, no `<foreignObject>` —
+  everything inline. Embed it with `![demo](dist/demo.svg)` or
+  `<img src="dist/demo.svg" alt="demo">`.
+- **`--at <seconds>`** keeps producing the **static poster** of that frame
+  (e.g. `demo export svg --at 12.5 demo.rec`), now written to
+  `dist/<name>-at-12.5.svg` so posters never overwrite each other or the
+  animated `dist/<name>.svg`. It defaults to the **last frame**, and a value
+  past the end clamps to it. Ignored by `gif`/`mp4`.
 - **`demo export` (no format / `all`) does not build it** — `svg` is opt-in and
   must be named: `demo export svg` or `demo export gif,svg`.
 - **Braille cells** (`U+2800`–`U+28FF`, what tools like mapscii draw with) become
   procedural `<circle>` dots: viewer fonts generally lack those glyphs.
-- **Staged (multi-pane) scores fall back** to embedding **one** rasterized frame
-  as a base64 PNG inside the SVG — a composited canvas has no cell grid to draw
-  from. Documented limitation, not vector text.
+- **Multi-pane demos refuse the animated path**: `demo export svg` without
+  `--at` fails with `animated svg supports terminal-only demos; this score
+  shows a <kind> pane at <time>s — use gif/mp4, or --at <s> for a poster`.
+  The poster path keeps its PNG fallback (one rasterized frame embedded as a
+  base64 PNG — a composited canvas has no cell grid to draw from).
 
 ## browser panes (multi-scene)
 

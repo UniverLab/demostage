@@ -1128,6 +1128,30 @@ fn seeking_forward_renders_the_same_frame_as_playing_through() {
 }
 
 #[test]
+fn next_text_frame_walks_the_same_states_as_seek() {
+    let rec = text_rec(vec![
+        (0.0, "one".into()),
+        (0.2, " two".into()),
+        (0.5, "\r\nnext".into()),
+    ]);
+    let score = text_score(10);
+
+    let mut walked = FrameSource::new(&rec, &score).unwrap();
+    let n = walked.n_frames();
+    let mut states = Vec::new();
+    while let Some(tf) = walked.next_text_frame() {
+        states.push(tf.cells.clone());
+    }
+    assert_eq!(states.len(), n, "the walk must cover every frame");
+
+    let mut seeker = FrameSource::new(&rec, &score).unwrap();
+    for (i, cells) in states.iter().enumerate() {
+        seeker.seek_frame(i);
+        assert_eq!(&seeker.text_frame().cells, cells, "frame {i} drifted");
+    }
+}
+
+#[test]
 fn text_frame_exposes_colors_and_bold_per_cell() {
     let rec = text_rec(vec![(0.0, "\x1b[1mH\x1b[0m\x1b[31mi".into())]);
     let score = text_score(10);

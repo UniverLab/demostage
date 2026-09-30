@@ -272,8 +272,10 @@ impl<'a> FrameSource<'a> {
         (self.cols * self.cell_w, self.rows * self.cell_h)
     }
 
-    /// Render the next frame, or `None` once exhausted.
-    pub fn next_frame(&mut self) -> Option<Vec<u8>> {
+    /// Feed the events up to the current frame's time and step forward.
+    /// Returns the frame time, or `None` once exhausted. [`next_frame`] and
+    /// [`next_text_frame`] share it so the raster and vector paths cannot drift.
+    fn advance(&mut self) -> Option<f64> {
         if self.frame >= self.n_frames {
             return None;
         }
@@ -284,6 +286,12 @@ impl<'a> FrameSource<'a> {
             self.ev_idx += 1;
         }
         self.frame += 1;
+        Some(t)
+    }
+
+    /// Render the next frame, or `None` once exhausted.
+    pub fn next_frame(&mut self) -> Option<Vec<u8>> {
+        let t = self.advance()?;
         let fonts = FontSet {
             primary: &self.font,
             emoji: &self.emoji_font,
@@ -323,6 +331,14 @@ impl<'a> FrameSource<'a> {
     /// Take the fallback report, leaving an empty one in its place.
     pub fn take_fallback_report(&mut self) -> FallbackReport {
         std::mem::take(&mut self.fallback_report)
+    }
+
+    /// The next frame's cell grid, without rasterizing. Feeds exactly the same
+    /// `<= t` events as [`FrameSource::next_frame`], so the vector (SVG) path
+    /// walks the same states as the gif — minus the fontdue work.
+    pub fn next_text_frame(&mut self) -> Option<TextFrame> {
+        self.advance()?;
+        Some(self.text_frame())
     }
 
     /// Fast-forward the parser to frame `at` WITHOUT rasterizing, so a poster

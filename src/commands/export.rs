@@ -52,6 +52,22 @@ pub fn run(args: ExportArgs) -> Result<()> {
         );
     }
 
+    // Same precedence as the speed: the command line, then the score, then all.
+    let targets = match args.targets.map(|t| t.0) {
+        Some(t) => t,
+        None => resolve_targets(score.demo.targets.as_deref())?,
+    };
+
+    // The animated SVG has no cell grid to walk on a staged score: refuse
+    // before starting the local server or any render work. (Mixed targets
+    // still start the server — gif/mp4 need it — and refuse at the svg step.)
+    if args.at.is_none() && targets == [Target::Svg] && crate::export::stage::needs_stage(&score) {
+        return Err(Error::Export(
+            crate::export::svg::animated_refusal(&score)
+                .expect("staged score without --at must refuse"),
+        ));
+    }
+
     // Start the local file server once (if needed) and keep it alive for all targets.
     let _server = ensure_local_server(&score)?;
     let score = if let Some(server) = _server.as_ref() {
@@ -60,11 +76,6 @@ pub fn run(args: ExportArgs) -> Result<()> {
         score
     };
 
-    // Same precedence as the speed: the command line, then the score, then all.
-    let targets = match args.targets.map(|t| t.0) {
-        Some(t) => t,
-        None => resolve_targets(score.demo.targets.as_deref())?,
-    };
     for target in targets {
         let path = render(&rec, &score, target, speed, args.at)?;
         println!("exported {} → {}", args.input.display(), path.display());

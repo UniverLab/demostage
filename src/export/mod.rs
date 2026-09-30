@@ -2,8 +2,9 @@
 //!
 //! `cast`/`html` run the score in a PTY and capture text (no external deps).
 //! `gif` rasterizes that capture in pure Rust. `mp4` provisions ffmpeg on first
-//! use. `svg` (opt-in) draws one frame as vector text — a static poster, never
-//! animated. Multi-pane scores (with a `browser` pane) composite via the stage,
+//! use. `svg` (opt-in) exports the whole timeline as animated vector text for
+//! terminal-only demos, or one static poster frame with `--at <seconds>`.
+//! Multi-pane scores (with a `browser` pane) composite via the stage,
 //! which drives Chromium for browser panes (PDF panes render natively via hayro).
 
 pub mod browser;
@@ -99,9 +100,10 @@ fn report_browser_captures(reports: &[browser::BrowserCaptureReport]) {
 /// Render an already-captured `recording` to `target`, returning the path
 /// written. Pure playback — it never executes the demo. `score` carries the
 /// layout/styling (its timeline is unused here). `speed` is the resolved export
-/// speed multiplier, threaded through to the PDF pan path. `at_secs` picks the
-/// frame the `svg` poster draws (default: the last one) — only `Target::Svg`
-/// consumes it; gif/mp4 ignore it.
+/// speed multiplier, threaded through to the PDF pan path. `at_secs` is only
+/// `Target::Svg`: `None` exports the animated timeline (terminal-only), while
+/// `Some(t)` draws the poster of the frame at `t` seconds (default: the last
+/// one) — gif/mp4 ignore it.
 pub fn render(
     rec: &Recording,
     score: &Score,
@@ -224,14 +226,42 @@ fn render_mp4(rec: &Recording, score: &Score, plan: &RenderPlan) -> Result<PathB
 
 /// Draw one frame as vector text (the poster) — staged scores replay the stage
 /// and keep ONE composited frame, embedded as a base64 PNG in the SVG.
+/// Without `--at`, a single-terminal score exports the whole timeline as an
+/// animated SVG; staged scores refuse the animated path (no cell grid to walk)
+/// and must name `--at` for a poster.
 fn render_svg(
     rec: &Recording,
     score: &Score,
     plan: &RenderPlan,
     at_secs: Option<f64>,
 ) -> Result<PathBuf> {
-    let path = resolve_output(score, "svg");
+    let path = resolve_svg_output(score, at_secs);
     ensure_parent(&path)?;
+    if at_secs.is_some() {
+        return render_svg_poster(rec, score, plan, &path, at_secs);
+    }
+    if plan.staged {
+        return Err(Error::Export(
+            svg::animated_refusal(score).expect("staged score without --at must refuse"),
+        ));
+    }
+    // Single terminal: walk the whole replay as vector states — the frames in
+    // between are never rasterized.
+    progress_bar("exporting svg", 1, 1);
+    svg::write_animated(&path, rec, score)?;
+    progress_clear();
+    Ok(path)
+}
+
+/// The `--at` poster: one frame, vector text for a single terminal or one
+/// embedded PNG for a staged score.
+fn render_svg_poster(
+    rec: &Recording,
+    score: &Score,
+    plan: &RenderPlan,
+    path: &Path,
+    at_secs: Option<f64>,
+) -> Result<PathBuf> {
     let mut report = raster::FallbackReport::new();
     if plan.staged {
         // Fallback, documented in docs/export-targets.md: a staged
@@ -240,7 +270,7 @@ fn render_svg(
         let keep = svg::frame_index(at_secs, plan.fps, plan.total_frames);
         let mut n = 0usize;
         let mut browser_reports = Vec::new();
-        svg::encode(&path, plan.cw, plan.ch, keep, |emit| {
+        svg::encode(path, plan.cw, plan.ch, keep, |emit| {
             let r = stage::render_stage(rec, score, plan.speed, |f| {
                 n += 1;
                 progress_bar("exporting svg", n, plan.total_frames);
@@ -256,13 +286,13 @@ fn render_svg(
         // Single terminal: seek to the chosen frame and draw it as
         // vector text — the frames in between are never rasterized.
         progress_bar("exporting svg", 1, 1);
-        svg::write_svg(&path, rec, score, at_secs)?;
+        svg::write_svg(path, rec, score, at_secs)?;
         progress_clear();
     }
     for line in report.format(&score.demo.name) {
         eprintln!("{line}");
     }
-    Ok(path)
+    Ok(path.to_path_buf())
 }
 
 /// Retime a recording by `1/speed` (so `speed = 2.0` plays twice as fast, `0.5`
@@ -347,6 +377,20 @@ fn resolve_output(score: &Score, ext: &str) -> PathBuf {
         .demo
         .output_dir
         .join(format!("{}.{ext}", sanitize(&score.demo.name)))
+}
+
+/// The SVG output path: the animated timeline is `dist/<name>.svg`, while a
+/// `--at` poster carries its timestamp (`dist/<name>-at-12.5.svg`) so posters
+/// never overwrite each other or the animation. The filename uses the
+/// requested value, not the clamped frame.
+fn resolve_svg_output(score: &Score, at_secs: Option<f64>) -> PathBuf {
+    match at_secs {
+        None => resolve_output(score, "svg"),
+        Some(t) => score
+            .demo
+            .output_dir
+            .join(format!("{}-at-{t}.svg", sanitize(&score.demo.name))),
+    }
 }
 
 fn sanitize(name: &str) -> String {
@@ -603,6 +647,38 @@ height = 100
         .unwrap();
         let path = resolve_output(&score, "gif");
         assert_eq!(path, std::path::PathBuf::from("./dist/my-demo-.gif"));
+    }
+
+    fn svg_score() -> Score {
+        toml::from_str(
+            r#"
+[demo]
+name = "demo"
+output_dir = "./dist"
+[layout]
+width = 100
+height = 100
+"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn poster_filename_is_per_at() {
+        assert_eq!(
+            resolve_svg_output(&svg_score(), None),
+            std::path::PathBuf::from("./dist/demo.svg")
+        );
+        assert_eq!(
+            resolve_svg_output(&svg_score(), Some(12.5)),
+            std::path::PathBuf::from("./dist/demo-at-12.5.svg")
+        );
+        // Rust prints 12.0 as "12": posters never overwrite each other or the
+        // animation, and the name uses the requested value, not the clamp.
+        assert_eq!(
+            resolve_svg_output(&svg_score(), Some(12.0)),
+            std::path::PathBuf::from("./dist/demo-at-12.svg")
+        );
     }
 
     #[test]

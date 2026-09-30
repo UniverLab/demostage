@@ -238,9 +238,12 @@ pub struct ExportArgs {
     #[arg(long, conflicts_with_all = ["aspect", "quality"])]
     pub resolution: Option<String>,
 
-    /// For `svg` posters: the frame at this many seconds into the demo, e.g.
-    /// `--at 12.5`. Defaults to the last frame (values past the end clamp to
-    /// it). Ignored by gif/mp4, which render the whole timeline.
+    /// For `svg`: without it, a terminal-only demo exports as an animated SVG
+    /// of the whole timeline; with it (e.g. `--at 12.5`), the SVG is a static
+    /// poster of that frame, written to `dist/<name>-at-12.5.svg` (defaults to
+    /// the last frame; values past the end clamp to it). Multi-pane demos
+    /// refuse the animated path — use gif/mp4, or `--at` for a poster.
+    /// Ignored by gif/mp4, which render the whole timeline.
     #[arg(long, value_name = "SECONDS", value_parser = parse_at)]
     pub at: Option<f64>,
 }
@@ -313,7 +316,9 @@ pub fn parse_at(s: &str) -> Result<f64, String> {
 pub enum Target {
     Gif,
     Mp4,
-    /// The static poster (vector text) — opt-in, never part of `all`.
+    /// The animated vector target (terminal-only) — opt-in, never part of `all`.
+    /// Without `--at` it exports the whole timeline as an animated SVG; with
+    /// `--at <seconds>` it draws a static poster of that frame instead.
     Svg,
 }
 

@@ -124,7 +124,7 @@ the clean path the default.
 |---|---|
 | `demo capture` | Live capture: record the session, auto-normalize into a clean score and faithful `.rec` |
 | `demo record` | Re-execute `demo.toml` cleanly, producing a humanized recording |
-| `demo export` | Pure playback: render to gif or mp4 — or the opt-in `svg` poster (no re-execution, ffmpeg/chromium auto-provisioned) |
+| `demo export` | Pure playback: render to gif or mp4 — or the opt-in `svg` animation (terminal-only; `--at` for a poster) (no re-execution, ffmpeg/chromium auto-provisioned) |
 | `demo edit` | Edit the timeline interactively — mark several steps (space) for bulk delete/convert/replace |
 | `demo doctor` | Verify the environment and install missing tools |
 | `demo update` | Check for / install a newer stable release — always asks first (default: no) |
@@ -192,7 +192,7 @@ wizards are kept out of the finished demo.
 |---|---|---|---|
 | `gif`  | animated GIF (rasterized) | READMEs, chat, anywhere `<img>` works | — (pure Rust, embedded font) |
 | `mp4`  | H.264 video | landings / the web (`<video>`) | ffmpeg — **auto-fetched on first use** |
-| `svg`  | static poster (vector text) | README stills, print, docs — **opt-in** | — (pure Rust) |
+| `svg`  | animated SVG (vector text), terminal-only; `--at` for a poster | crisp README embeds (`<img>`), print, docs — **opt-in** | — (pure Rust) |
 | browser panes (PDF/web) | composited into gif/mp4 | a scene beside the terminal | Chromium — **auto-fetched on first use** |
 
 `gif` works fully offline. `mp4` and multi-scene **browser panes** provision
@@ -200,6 +200,24 @@ their tool **tectonic-style** — the first export downloads a managed ffmpeg /
 Chromium into a cache (a system install is used if present). Run **`demo doctor`**
 to check these and get platform-specific fixes (`--fix` installs them on apt-based
 Linux; it also flags the snap Chromium, which can't be driven headless).
+
+### Embed the animated SVG
+
+For a terminal-only demo, `demo export svg` writes `dist/<name>.svg` — an
+animated, terminal-only vector version of the timeline (no scripts, so it plays
+inside a README `<img>`):
+
+```md
+![demo](dist/demo.svg)
+```
+
+```html
+<img src="dist/demo.svg" alt="demo">
+```
+
+Need one still instead (`--at 12.5` writes `dist/<name>-at-12.5.svg`), or a
+multi-pane demo (animated SVG refuses those — use gif/mp4, or `--at` for a
+poster)? See [`docs/export-targets.md`](docs/export-targets.md).
 
 ---
 
