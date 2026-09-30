@@ -222,9 +222,12 @@ the running `demo` binary.
 - **It always asks first.** The prompt defaults to **no**; declining (or
   Ctrl-C) leaves everything exactly as it was. `--yes` skips the prompt for
   scripts.
-- **`--check` changes nothing.** Exit code **1** = a newer stable release
-  exists, **0** = you're current. It downloads nothing and touches no local
-  path.
+- **`--check` changes nothing.** Read-only: downloads nothing and touches no local path.
+- **Exit codes.** `exit 0` = up to date (update installed, prompt declined, or cargo
+  refusal), `exit 1` = a newer stable release exists (`--check`), `exit 2` = the check
+  could not be completed (network, DNS, TLS, HTTP ≥ 400 or an unparsable response) —
+  the cause is printed as one line on stderr, for `--check` and plain `demo update`
+  alike. Failures after a successful check (download, checksum, permissions) exit `1`.
 - **Stable only.** Releases are read from the `/releases` list and filtered in
   code: no drafts, no prereleases, and only tags strictly newer than your
   version (numeric per-component compare, so `0.3.10` beats `0.3.9`).
@@ -240,7 +243,7 @@ the running `demo` binary.
   run `cargo install --force demo-stage`. Platforms with no published
   `tar.gz` asset (Windows, linux/arm64) are refused before any download.
 - **No background check.** DemoStage only ever contacts GitHub when you run
-  `demo update`, and it reports network failures loudly.
+  `demo update`, and a failed check exits `2` with the cause on one stderr line.
 
 ## `demo edit`
 

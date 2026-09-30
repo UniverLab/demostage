@@ -56,9 +56,12 @@ use std::process::ExitCode;
 use cli::{Cli, Command};
 
 /// Dispatch a parsed CLI invocation to its command, returning the process exit
-/// code. Only `update` reports through the exit code (`update`
-/// uses `1` for "an update is available" in `--check` mode); everything else
-/// surfaces problems as an [`Error`].
+/// code. Only `update` reports through the exit code: `0` = up to date
+/// (also: update installed, prompt declined, or a cargo-managed install),
+/// `1` = `--check` found an update is available (plain `update`: a failure
+/// after a successful check), `2` = the release check could not be completed
+/// (the cause is the single line on stderr); everything else surfaces
+/// problems as an [`Error`].
 pub fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command {
         Command::Capture(args) => commands::capture::run(args).map(|()| ExitCode::SUCCESS),

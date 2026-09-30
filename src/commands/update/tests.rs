@@ -18,6 +18,20 @@ impl ReleaseFetcher for FakeFetcher {
     }
 }
 
+/// A lookup that fails exactly like the production fetcher: one loud line.
+struct FailingFetcher {
+    message: &'static str,
+}
+
+impl ReleaseFetcher for FailingFetcher {
+    fn get(&self, _url: &str) -> Result<String> {
+        Err(Error::Export(format!(
+            "failed to fetch GitHub releases: {}",
+            self.message
+        )))
+    }
+}
+
 struct RecordingDownloader {
     called: Cell<bool>,
     bytes: Vec<u8>,
@@ -557,13 +571,18 @@ fn install_with_yes_replaces_binary() {
 
 // ── Loud failures ───────────────────────────────────────────
 
+/// A failed lookup must exit 2 — never an `Err`: main.rs turns an `Err` into
+/// exit 1 and a script would read the outage as "an update is available".
 #[test]
-fn explicit_errors_loudly_without_network() {
+fn lookup_failure_exits_2_for_check_and_plain_update() {
     let dir = tempfile::tempdir().unwrap();
     let exe = dir.path().join("demo");
     let cargo_bin = dir.path().join("not-cargo");
+    write(&exe, b"old");
     let downloader = RecordingDownloader::new(Vec::new(), None);
-    let confirm = || false;
+    let confirm = || {
+        panic!("a failed check must not prompt");
+    };
     let deps = deps(
         Err("connection refused".to_string()),
         &exe,
@@ -571,12 +590,135 @@ fn explicit_errors_loudly_without_network() {
         &downloader,
         &confirm,
     );
-    let error = run_update_with(false, true, &deps).unwrap_err();
-    assert!(
-        error.to_string().contains("release lookup failed"),
-        "got: {error}"
+    assert_eq!(run_update_with(true, false, &deps).unwrap(), 2);
+    assert_eq!(run_update_with(false, true, &deps).unwrap(), 2);
+    assert!(!downloader.called.get(), "a failed check downloads nothing");
+    assert_eq!(read(&exe), b"old".to_vec(), "state stays untouched");
+}
+
+/// Wire the injected fetcher exactly like `run_update` does: fetch, carry the
+/// one-line cause through `UpdateDeps`, and assert the hermetic core exits 2
+/// without downloading or touching the binary.
+fn exit_when_lookup_fails(fetcher: &dyn ReleaseFetcher, check: bool) -> i32 {
+    let releases = fetch_releases_with(fetcher);
+    assert!(releases.is_err(), "the fake lookup must fail");
+    let dir = tempfile::tempdir().unwrap();
+    let exe = dir.path().join("demo");
+    let cargo_bin = dir.path().join("not-cargo");
+    write(&exe, b"old");
+    let downloader = RecordingDownloader::new(Vec::new(), None);
+    let confirm = || {
+        panic!("a failed check must not prompt");
+    };
+    let deps = deps(releases, &exe, &cargo_bin, &downloader, &confirm);
+    let code = run_update_with(check, true, &deps).unwrap();
+    assert!(!downloader.called.get(), "a failed check downloads nothing");
+    assert_eq!(read(&exe), b"old".to_vec(), "state stays untouched");
+    code
+}
+
+#[test]
+fn failing_fetcher_exits_2_with_the_cause() {
+    let fetcher = FailingFetcher {
+        message: "dns error: no such host",
+    };
+    assert_eq!(exit_when_lookup_fails(&fetcher, true), 2);
+    assert_eq!(exit_when_lookup_fails(&fetcher, false), 2);
+}
+
+#[test]
+fn unparsable_response_exits_2() {
+    let fetcher = FakeFetcher {
+        body: "not json".to_string(),
+    };
+    assert_eq!(exit_when_lookup_fails(&fetcher, true), 2);
+    assert_eq!(exit_when_lookup_fails(&fetcher, false), 2);
+}
+
+#[test]
+fn check_failure_cause_is_one_stderr_line() {
+    for cause in [
+        "dns error: no such host",
+        "http status: 403",
+        "a\nmulti\nline cause",
+    ] {
+        let line = check_failure_line(cause);
+        assert!(
+            line.starts_with("update check failed: "),
+            "missing prefix: {line:?}"
+        );
+        assert!(!line.contains('\n'), "must stay one line: {line:?}");
+    }
+    assert!(check_failure_line("http status: 403").contains("http status: 403"));
+    assert_eq!(
+        check_failure_line("a\nmulti\nline cause"),
+        "update check failed: a multi line cause"
     );
-    assert!(!downloader.called.get());
+}
+
+// ── Version-line wording ──────────────────────────────────────
+
+#[test]
+fn arrow_line_drops_the_v_prefix() {
+    assert_eq!(arrow_line("0.0.1", "v0.3.1"), "demo 0.0.1 → 0.3.1");
+}
+
+#[test]
+fn up_to_date_line_prints_bare_version() {
+    assert_eq!(up_to_date_line("0.3.1"), "demo 0.3.1 is up to date");
+}
+
+#[test]
+fn prompt_and_success_lines_drop_the_v_prefix() {
+    assert_eq!(update_prompt_line("v0.3.2"), "Update to 0.3.2? [y/N]");
+    assert_eq!(updated_line("v0.3.2"), "✓ updated to 0.3.2");
+}
+
+#[test]
+fn cargo_refusal_is_the_exact_sentence() {
+    assert_eq!(
+        cargo_refusal_line(),
+        "installed with cargo — run: cargo install --force demo-stage"
+    );
+}
+
+/// The `### demo update` / `## Self-update` / `` ## `demo update` `` section
+/// of each doc must name all three exit codes.
+fn doc_update_section(relative: &str, marker: &str) -> String {
+    let path = format!("{}/{}", env!("CARGO_MANIFEST_DIR"), relative);
+    let text = std::fs::read_to_string(&path).expect("read doc");
+    assert!(text.contains(marker), "{marker:?} missing in {relative}");
+    let level = marker.chars().take_while(|c| *c == '#').count();
+    let after = &text[text.find(marker).expect("marker")..];
+    let mut lines = after.lines();
+    let mut out = vec![lines.next().unwrap_or("").to_string()];
+    for line in lines {
+        if line.starts_with('#') {
+            let heading_level = line.chars().take_while(|c| *c == '#').count();
+            if heading_level <= level {
+                break;
+            }
+        }
+        out.push(line.to_string());
+    }
+    out.join("\n")
+}
+
+#[test]
+fn readme_and_docs_document_the_three_exit_codes() {
+    for (relative, marker) in [
+        ("README.md", "### demo update"),
+        ("docs/commands.md", "## `demo update`"),
+        ("docs/installation.md", "## Self-update"),
+    ] {
+        let section = doc_update_section(relative, marker);
+        for literal in ["exit 0", "exit 1", "exit 2"] {
+            assert!(
+                section.contains(literal),
+                "{relative} update section missing {literal:?}:\n{section}"
+            );
+        }
+    }
 }
 
 #[test]

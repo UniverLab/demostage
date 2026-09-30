@@ -35,7 +35,7 @@ release archive), it updates itself — only when you ask:
 
 ```sh
 demo update           # asks first; the default answer is no
-demo update --check   # exit 1 = a newer stable release exists, 0 = current
+demo update --check   # exit 0 = current, exit 1 = a newer stable release exists, exit 2 = the check could not be completed
 ```
 
 There is **no background update check**: `demo` only contacts GitHub when you

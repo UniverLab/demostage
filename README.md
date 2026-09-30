@@ -133,7 +133,7 @@ the clean path the default.
 
 ```sh
 demo update            # look for a newer stable release, then ask (default: NO)
-demo update --check    # report only — exit 1 = update available, 0 = current
+demo update --check    # report only — exit 0 = current, exit 1 = update available, exit 2 = the check could not be completed
 demo update --yes      # install without the prompt (scriptable)
 ```
 
@@ -151,6 +151,10 @@ prereleases excluded), compares it to your version with a semver compare, and
   releases) skips.
 - **Cargo installs are refused.** A `demo` under `~/.cargo/bin` is owned by
   cargo: run `cargo install --force demo-stage`.
+- **Exit codes.** `exit 0` = up to date (update installed, prompt declined, or cargo
+  refusal), `exit 1` = an update is available (`--check`), `exit 2` = the check could not
+  be completed (network, DNS, TLS, HTTP ≥ 400 or an unparsable response — the cause is
+  the single line on stderr). Plain `demo update` exits `2` for the same failures.
 - **No published asset? No guessing.** Windows and linux/arm64 have no
   `tar.gz` in the release matrix, so `update` refuses instead of inventing a
   name.

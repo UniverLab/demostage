@@ -10,6 +10,14 @@
 //! State survives the swap: only the running executable is replaced (see
 //! [`replace_binary`]). `demo.toml` scores, recordings, the raw macro and the
 //! capture sources are never read or written here.
+//!
+//! Exit codes of `demo update [--check]`:
+//!
+//! | code | meaning |
+//! |---|---|
+//! | `0` | up to date / update installed / prompt declined / cargo refusal |
+//! | `1` | `--check`: an update is available; plain `update`: a failure after a successful check |
+//! | `2` | the release check could not be completed (network, DNS, TLS, HTTP ≥ 400, unparsable response); the cause is the single line on stderr — for `--check` and plain `update` alike |
 
 use std::path::{Path, PathBuf};
 
@@ -99,6 +107,10 @@ fn agent() -> ureq::Agent {
 /// Everything the update core needs from the outside world. The production
 /// command fills it with real I/O; tests fill it with fakes and never hit
 /// GitHub, the filesystem outside their tempdir, or the prompt.
+///
+/// `releases: Err(_)` means the release check could not be completed
+/// (network, DNS, TLS, HTTP ≥ 400, unparsable response) — the core prints the
+/// one-line cause on stderr and returns `Ok(2)`.
 pub struct UpdateDeps<'a> {
     pub current: &'a str,
     pub releases: std::result::Result<Vec<GitHubRelease>, String>,
@@ -113,72 +125,98 @@ pub struct UpdateDeps<'a> {
 
 /// Check for and, after consent, install the latest stable release.
 ///
-/// The returned integer is the process exit code: `0` means nothing was
-/// installed (up to date, declined prompt, or a cargo-installed binary) and
-/// `1` is reserved for an available update in `--check` mode or a binary
-/// missing from the downloaded archive.
+/// Exit codes: `0` = up to date (also: update installed, prompt declined, or
+/// a cargo-installed binary), `1` = `--check` found an update is available
+/// (plain `update`: a failure after a successful check), `2` = the release
+/// check could not be completed (network, DNS, TLS, HTTP ≥ 400, unparsable
+/// response) — the cause is the single line on stderr, for `--check` and
+/// plain `demo update` alike.
 pub fn run_update(check: bool, yes: bool) -> Result<i32> {
     let current = current_version();
-    // Loud on failure: this is an explicit command, not a background notice.
-    let releases = fetch_releases_with(&RealFetcher)?;
+    // A failed lookup is not an `Err` (main.rs would exit 1 and a script would
+    // read the outage as "an update is available"): it is the "check could not
+    // complete" outcome, carried as a one-line cause through `UpdateDeps`.
+    let releases = fetch_releases_with(&RealFetcher);
+    let latest = releases
+        .as_ref()
+        .ok()
+        .and_then(|releases| select_latest_stable(releases, current));
 
-    // The report-only pass prints status and, in `--check` mode, the exit
-    // code. It never resolves local paths, so it stays safe on every target.
-    let latest = select_latest_stable(&releases, current);
-    if latest.is_none() || check {
-        report_status(current, latest.as_deref());
-        return Ok(if check && latest.is_some() { 1 } else { 0 });
+    match latest {
+        // An install needs the executable, cargo-guard and target facts;
+        // resolve them only once a newer release is established.
+        Some(latest) if !check => {
+            let releases = releases.expect("a newer release implies a successful lookup");
+            let exe = std::env::current_exe()
+                .map_err(|e| Error::Export(format!("failed to locate demo executable: {e}")))?;
+            let cargo_bin = cargo_bin_dir();
+            if is_cargo_installed(&exe, &cargo_bin) {
+                report_status(current, Some(&latest));
+                println!("{}", cargo_refusal_line());
+                return Ok(0);
+            }
+            let target = resolve_target()?;
+            let deps = UpdateDeps {
+                current,
+                releases: Ok(releases),
+                exe: &exe,
+                cargo_bin: &cargo_bin,
+                target: Ok(target),
+                downloader: &RealDownloader,
+                confirm: &|| {
+                    inquire::Confirm::new(&update_prompt_line(&latest))
+                        .with_default(false)
+                        .prompt()
+                        .unwrap_or(false)
+                },
+            };
+            run_update_core(false, yes, &deps)
+        }
+        // `--check`, an up-to-date install, or a failed lookup: the hermetic
+        // core owns every line and the exit-code contract. The executable
+        // facts below are placeholders that this arm never reaches
+        // (`--check` returns before the cargo guard; "up to date" and a
+        // failed check return before the prompt) — and they must NOT be
+        // `Path::new("")`, because `is_cargo_installed("", "")` is `true`
+        // (empty starts_with empty) and would print a bogus cargo refusal if
+        // the invariant were ever broken. `target: Err(...)` fails loudly if
+        // it were ever read.
+        _ => {
+            let deps = UpdateDeps {
+                current,
+                releases,
+                exe: Path::new("/nonexistent-demo-update-path/demo"),
+                cargo_bin: Path::new("/nonexistent-demo-update-path/bin"),
+                target: Err("placeholder: not reachable in this path".to_string()),
+                downloader: &RealDownloader,
+                confirm: &|| false,
+            };
+            run_update_core(check, yes, &deps)
+        }
     }
-
-    // An install needs the executable, target and prompt facts. Resolve them
-    // only once a newer release is established.
-    let latest = latest.expect("newer release was established above");
-    let exe = std::env::current_exe()
-        .map_err(|e| Error::Export(format!("failed to locate demo executable: {e}")))?;
-    let cargo_bin = cargo_bin_dir();
-    if is_cargo_installed(&exe, &cargo_bin) {
-        report_status(current, Some(&latest));
-        println!("installed with cargo — run: cargo install --force demo-stage");
-        return Ok(0);
-    }
-    let target = resolve_target()?;
-    let deps = UpdateDeps {
-        current,
-        releases: Ok(releases),
-        exe: &exe,
-        cargo_bin: &cargo_bin,
-        target: Ok(target),
-        downloader: &RealDownloader,
-        confirm: &|| {
-            inquire::Confirm::new(&format!("Update to {latest}? [y/N]"))
-                .with_default(false)
-                .prompt()
-                .unwrap_or(false)
-        },
-    };
-    run_update_core(false, yes, &deps, true)
 }
 
 /// Hermetic update flow used by unit tests: no network, no prompt, no setup —
-/// callers provide every external fact through [`UpdateDeps`].
+/// callers provide every external fact through [`UpdateDeps`]. A failed
+/// lookup (`releases: Err(_)`) is the "check could not complete" outcome:
+/// one stderr line, `Ok(2)`.
 pub fn run_update_with(check: bool, yes: bool, deps: &UpdateDeps<'_>) -> Result<i32> {
-    run_update_core(check, yes, deps, true)
+    run_update_core(check, yes, deps)
 }
 
-fn run_update_core(
-    check: bool,
-    yes: bool,
-    deps: &UpdateDeps<'_>,
-    print_status: bool,
-) -> Result<i32> {
-    let releases = deps
-        .releases
-        .as_ref()
-        .map_err(|error| Error::Export(format!("release lookup failed: {error}")))?;
+fn run_update_core(check: bool, yes: bool, deps: &UpdateDeps<'_>) -> Result<i32> {
+    let releases = match deps.releases.as_ref() {
+        Ok(releases) => releases,
+        Err(cause) => {
+            // Contract: the check could not complete — one stderr line, exit 2,
+            // for `--check` and a plain update alike; nothing below runs
+            // (no cargo guard, no target, no prompt, no download).
+            eprintln!("{}", check_failure_line(cause));
+            return Ok(2);
+        }
+    };
     let latest = select_latest_stable(releases, deps.current);
-    if print_status {
-        report_status(deps.current, latest.as_deref());
-    }
+    report_status(deps.current, latest.as_deref());
     let Some(latest) = latest else {
         return Ok(0);
     };
@@ -188,7 +226,7 @@ fn run_update_core(
     }
     // A cargo install is owned by cargo — never overwrite it.
     if is_cargo_installed(deps.exe, deps.cargo_bin) {
-        println!("installed with cargo — run: cargo install --force demo-stage");
+        println!("{}", cargo_refusal_line());
         return Ok(0);
     }
     let target = match &deps.target {
@@ -208,18 +246,58 @@ fn run_update_core(
         return Ok(1);
     }
     replace_binary(&tmp_bin, deps.exe)?;
-    println!("✓ updated to {latest}");
+    println!("{}", updated_line(&latest));
     Ok(0)
 }
 
 // ── Version helpers ─────────────────────────────────────────────
 
+/// A release tag without its leading `v`: every version line prints bare
+/// (`demo 0.0.1 → 0.3.1`) to match the texforge wording. Never used for the
+/// asset name or the download URL — those keep the `v`.
+fn bare_version(tag: &str) -> &str {
+    tag.trim_start_matches('v')
+}
+
+fn up_to_date_line(current: &str) -> String {
+    format!("demo {current} is up to date")
+}
+
+fn arrow_line(current: &str, latest: &str) -> String {
+    format!("demo {current} → {}", bare_version(latest))
+}
+
+/// Byte-stable across the lab; the spec pins this exact sentence.
+fn cargo_refusal_line() -> &'static str {
+    "installed with cargo — run: cargo install --force demo-stage"
+}
+
+fn update_prompt_line(latest: &str) -> String {
+    format!("Update to {}? [y/N]", bare_version(latest))
+}
+
+fn updated_line(latest: &str) -> String {
+    format!("✓ updated to {}", bare_version(latest))
+}
+
+/// What lands on stderr when the check could not complete: exactly one line
+/// that names the cause (a multi-line cause would break a script parsing it).
+fn check_failure_line(cause: &str) -> String {
+    let flat = cause
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("update check failed: {flat}")
+}
+
 /// The shared status line: current version, with the newest stable tag when
 /// one is available.
 fn report_status(current: &str, latest: Option<&str>) {
     match latest {
-        None => println!("demo {current} is up to date"),
-        Some(tag) => println!("demo {current} → {tag}"),
+        None => println!("{}", up_to_date_line(current)),
+        Some(tag) => println!("{}", arrow_line(current, tag)),
     }
 }
 
@@ -272,11 +350,14 @@ pub fn select_latest_stable(releases: &[GitHubRelease], current: &str) -> Option
 
 /// Fetch the release list. The `/releases` endpoint (not `/releases/latest`)
 /// is used so drafts and prereleases stay visible and are filtered in code.
-fn fetch_releases_with(fetcher: &dyn ReleaseFetcher) -> Result<Vec<GitHubRelease>> {
+/// A failure is the one-line "check could not complete" cause carried through
+/// [`UpdateDeps`], never an `Err` (exit 2, not exit 1).
+fn fetch_releases_with(
+    fetcher: &dyn ReleaseFetcher,
+) -> std::result::Result<Vec<GitHubRelease>, String> {
     let url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases");
-    let body = fetcher.get(&url)?;
-    serde_json::from_str(&body)
-        .map_err(|e| Error::Export(format!("failed to parse releases JSON: {e}")))
+    let body = fetcher.get(&url).map_err(|error| error.to_string())?;
+    serde_json::from_str(&body).map_err(|error| format!("failed to parse releases JSON: {error}"))
 }
 
 // ── Target and installation-path helpers ────────────────────────

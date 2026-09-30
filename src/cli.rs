@@ -28,6 +28,15 @@ pub enum Command {
     Doctor(DoctorArgs),
     /// Check for and install a newer stable release. Always asks first
     /// (default: no) and never runs on its own; refuses cargo installs.
+    /// Exit codes: 0 = up to date, 1 = update available (`--check`),
+    /// 2 = the check could not be completed.
+    ///
+    /// Exit 2 covers every failed release check — network, DNS, TLS,
+    /// HTTP ≥ 400 or an unparsable response — printed as one line on stderr,
+    /// for `--check` and plain `demo update` alike. Exit 0 also covers an
+    /// installed update, a declined prompt and a cargo-managed install;
+    /// failures after a successful check (download, checksum, permissions)
+    /// exit 1.
     Update(UpdateArgs),
     /// Interactively edit timing/wait steps in a demo score.
     Edit(EditArgs),
@@ -60,8 +69,9 @@ pub struct DoctorArgs {
 
 #[derive(Debug, Args)]
 pub struct UpdateArgs {
-    /// Only check whether an update exists: exit 1 when a newer stable release
-    /// is out, 0 when current. Downloads nothing and changes nothing.
+    /// Only check whether an update exists: exit 0 = up to date, exit 1 =
+    /// update available, exit 2 = the check could not be completed. Downloads
+    /// nothing and changes nothing.
     #[arg(long)]
     pub check: bool,
 
@@ -396,6 +406,31 @@ pub struct FocusArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_help_documents_the_three_exit_codes() {
+        use clap::CommandFactory;
+        let mut command = crate::cli::Cli::command();
+        let plain = command.clone().render_help().to_string();
+        let mut update = command.find_subcommand_mut("update").unwrap().clone();
+        let detailed = update.render_long_help().to_string();
+        let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let (plain, detailed) = (flat(&plain), flat(&detailed));
+        for phrase in [
+            "0 = up to date",
+            "1 = update available",
+            "2 = the check could not be completed",
+        ] {
+            assert!(
+                plain.contains(phrase),
+                "demo --help missing {phrase:?}:\n{plain}"
+            );
+            assert!(
+                detailed.contains(&format!("exit {phrase}")),
+                "demo update --help missing {phrase:?}:\n{detailed}"
+            );
+        }
+    }
 
     #[test]
     fn parse_targets_gif_only() {
