@@ -216,23 +216,39 @@ fn pick_pane_ids(sources: &[Source]) -> Vec<String> {
     ids
 }
 
+/// The seconds prompt's validation rule, as a pure predicate: valid iff the
+/// trimmed input parses as a positive number. Extracted from the validator
+/// closure (which reads the real TTY) so the logic is unit-testable.
+fn hold_secs_valid(s: &str) -> bool {
+    match s.trim().parse::<f64>() {
+        Ok(n) => n > 0.0,
+        Err(_) => false,
+    }
+}
+
+/// Entered seconds → hold in milliseconds: unparsable input falls back to the
+/// 6s default, and the result is floored at 0.5s (500 ms).
+fn hold_secs_to_ms(raw: &str) -> u64 {
+    let secs: f64 = raw.trim().parse().unwrap_or(6.0);
+    (secs.max(0.5) * 1000.0) as u64
+}
+
 /// How long a static browser reveal holds, in ms. Duplicates the seconds
 /// validator locally (same message as `demo open`) rather than sharing it.
 fn ask_hold_secs() -> Result<u64> {
     let secs = ask(Text::new("Hold for how many seconds?")
         .with_default("6")
         .with_validator(|s: &str| {
-            let s = s.trim();
-            match s.parse::<f64>() {
-                Ok(n) if n > 0.0 => Ok(inquire::validator::Validation::Valid),
-                _ => Ok(inquire::validator::Validation::Invalid(
+            if hold_secs_valid(s) {
+                Ok(inquire::validator::Validation::Valid)
+            } else {
+                Ok(inquire::validator::Validation::Invalid(
                     "enter a positive number of seconds (e.g. 6)".into(),
-                )),
+                ))
             }
         })
         .prompt())?;
-    let secs: f64 = secs.trim().parse().unwrap_or(6.0);
-    Ok((secs.max(0.5) * 1000.0) as u64)
+    Ok(hold_secs_to_ms(&secs))
 }
 
 /// How the chosen browser pane is shown: a static hold (its duration in ms) or
@@ -630,5 +646,116 @@ mod tests {
         assert!(hint.contains("main"));
         assert!(hint.contains("docs"));
         assert!(hint.contains("code"));
+    }
+
+    // --- pick_pane_ids -----------------------------------------------------
+
+    /// No capture sources → just the terminal id. Exact vector equality (not
+    /// `len()`/`contains`) so body-replacement mutants (`vec!["xyzzy".into()]`,
+    /// `vec![String::new()]`, `vec![]`) die here.
+    #[test]
+    fn pick_pane_ids_no_sources_returns_exactly_main() {
+        assert_eq!(pick_pane_ids(&[]), vec!["main".to_string()]);
+    }
+
+    /// Only `Browser` sources are appended after `main`; a `Terminal` source is
+    /// skipped, and the order matches the capture's source order exactly.
+    #[test]
+    fn pick_pane_ids_adds_only_browser_sources_in_order() {
+        let sources = vec![
+            Source {
+                id: "docs".into(),
+                kind: SourceKind::Browser,
+                url: None,
+                theme: None,
+            },
+            Source {
+                id: "term".into(),
+                kind: SourceKind::Terminal,
+                url: None,
+                theme: None,
+            },
+        ];
+        assert_eq!(
+            pick_pane_ids(&sources),
+            vec!["main".to_string(), "docs".to_string()]
+        );
+    }
+
+    /// Several browsers keep the capture's order after the leading `main`.
+    #[test]
+    fn pick_pane_ids_keeps_capture_order_for_browsers() {
+        let sources = vec![
+            Source {
+                id: "term".into(),
+                kind: SourceKind::Terminal,
+                url: None,
+                theme: None,
+            },
+            Source {
+                id: "docs".into(),
+                kind: SourceKind::Browser,
+                url: None,
+                theme: None,
+            },
+            Source {
+                id: "web".into(),
+                kind: SourceKind::Browser,
+                url: None,
+                theme: None,
+            },
+        ];
+        assert_eq!(
+            pick_pane_ids(&sources),
+            vec!["main".to_string(), "docs".to_string(), "web".to_string()]
+        );
+    }
+
+    // --- ask_hold_secs: pure validation/conversion helpers -----------------
+
+    /// The validator's positive-number rule. Kills the extracted `>` mutants
+    /// in the helper: `>`→`<` and `>`→`==` both reject "6" (asserted true).
+    #[test]
+    fn hold_secs_valid_accepts_positive_numbers() {
+        assert!(hold_secs_valid("6"));
+        assert!(hold_secs_valid(" 3 "));
+        assert!(hold_secs_valid("0.5"));
+    }
+
+    /// Zero, negatives and garbage are rejected. Also kills `>`→`>=`
+    /// (0.0 >= 0.0 would be true) and any `false`→`true` literal mutant.
+    #[test]
+    fn hold_secs_valid_rejects_non_positive_or_unparsable() {
+        assert!(!hold_secs_valid("0"));
+        assert!(!hold_secs_valid("0.0"));
+        assert!(!hold_secs_valid("-1"));
+        assert!(!hold_secs_valid("abc"));
+        assert!(!hold_secs_valid(""));
+    }
+
+    /// Seconds → milliseconds, exact values. `*`→`+` gives 1001 for "1.5",
+    /// `*`→`/` gives 0 — both caught by the exact 1500; a `1000.0` literal
+    /// change is caught by the exact 6000.
+    #[test]
+    fn hold_secs_to_ms_converts_seconds_exactly() {
+        assert_eq!(hold_secs_to_ms("6"), 6000);
+        assert_eq!(hold_secs_to_ms("1.5"), 1500);
+        assert_eq!(hold_secs_to_ms(" 2 "), 2000);
+    }
+
+    /// Sub-half-second inputs are floored at 0.5s = 500 ms (kills `0.5`
+    /// literal mutants in `.max(0.5)`).
+    #[test]
+    fn hold_secs_to_ms_floors_at_half_a_second() {
+        assert_eq!(hold_secs_to_ms("0.1"), 500);
+        assert_eq!(hold_secs_to_ms("0.01"), 500);
+    }
+
+    /// Unparsable input falls back to the 6s default (kills `6.0` literal
+    /// mutants in `.unwrap_or(6.0)`).
+    #[test]
+    fn hold_secs_to_ms_defaults_to_six_seconds_when_unparsable() {
+        assert_eq!(hold_secs_to_ms("abc"), 6000);
+        assert_eq!(hold_secs_to_ms(""), 6000);
     }
 }

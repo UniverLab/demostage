@@ -130,6 +130,23 @@ mod tests {
         assert!(lines.len() > 5);
     }
 
+    /// A failing subcommand surfaces as `Err` — `run` must not flatten it
+    /// into a success exit code (`replace run -> Result<ExitCode> with
+    /// Ok(Default::default())` dies here).
+    #[test]
+    fn run_surfaces_subcommand_errors_as_errors() {
+        use crate::cli::{Cli, Command, EditArgs};
+        let cli = Cli {
+            command: Command::Edit(EditArgs {
+                input: "/nonexistent/demostage-missing-score-42.toml".into(),
+            }),
+        };
+        assert!(
+            crate::run(cli).is_err(),
+            "a failing subcommand must come back as Err, not as an exit code"
+        );
+    }
+
     #[test]
     fn stop_command_no_whitespace_around_words() {
         assert_eq!(crate::STOP_COMMAND, "demo stop");

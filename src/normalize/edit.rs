@@ -1226,6 +1226,30 @@ mod tests {
         assert_eq!(strip_orphan_osc_bodies("hello world"), "hello world");
     }
 
+    /// BEL terminates an OSC string: the title is swallowed and the next
+    /// key still parses. Deleting the BEL arm would leave the parser inside
+    /// the string and swallow the arrow too.
+    #[test]
+    fn osc_string_terminated_by_bel_releases_the_parser() {
+        let a = reconstruct(&[(0, "\x1b]0;title\x07\x1b[A")]);
+        assert_eq!(keys(&a), vec!["up"]);
+    }
+
+    /// Only `201~` closes a bracketed paste: a wrong code or a wrong final
+    /// byte keeps the parser in the paste and swallows the arrow.
+    #[test]
+    fn paste_csi_closes_only_on_201_tilde() {
+        // Correct close: the arrow after it is a key.
+        let a = reconstruct(&[(0, "\x1b[200~ab\x1b[201~\x1b[A")]);
+        assert_eq!(keys(&a), vec!["up"]);
+        // Wrong code: still pasting, the arrow is swallowed.
+        let b = reconstruct(&[(0, "\x1b[200~ab\x1b[99~\x1b[A\x1b[201~")]);
+        assert!(!keys(&b).contains(&"up"), "got {:?}", keys(&b));
+        // Wrong final byte: still pasting, the arrow is swallowed.
+        let c = reconstruct(&[(0, "\x1b[200~ab\x1b[201X\x1b[A\x1b[201~")]);
+        assert!(!keys(&c).contains(&"up"), "got {:?}", keys(&c));
+    }
+
     #[test]
     fn reconstruct_multichar_ctrl_s() {
         // Ctrl+S (0x13) flushes before it

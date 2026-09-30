@@ -6,6 +6,63 @@
 use super::*;
 use std::cell::Cell;
 
+// --- mutant-killing tests for exact constants and pure helpers ---
+
+/// Release-list ceiling is exactly 8 MiB. `*`→`+` gives 1032, `*`→`/` gives
+/// 1 — both die on the exact value.
+#[test]
+fn releases_ceiling_is_exactly_8_mib() {
+    assert_eq!(MAX_RELEASES_BYTES, 8 * 1024 * 1024);
+    assert_eq!(MAX_RELEASES_BYTES, 8_388_608);
+}
+
+/// Download ceiling is exactly 256 MiB. Same arithmetic mutants, same fate.
+#[test]
+fn download_ceiling_is_exactly_256_mib() {
+    assert_eq!(MAX_DOWNLOAD_BYTES, 256 * 1024 * 1024);
+    assert_eq!(MAX_DOWNLOAD_BYTES, 268_435_456);
+}
+
+/// current_version is the crate version, never empty and never a placeholder.
+#[test]
+fn current_version_is_the_crate_version() {
+    assert_eq!(current_version(), env!("CARGO_PKG_VERSION"));
+    assert!(!current_version().is_empty());
+    assert_ne!(current_version(), "xyzzy");
+}
+
+/// Empty CARGO_HOME falls back to $HOME/.cargo/bin; a set one wins exactly.
+#[test]
+fn cargo_bin_from_resolves_empty_and_set_homes() {
+    use std::ffi::OsStr;
+    assert_eq!(
+        cargo_bin_from(Some(OsStr::new("/opt/cargo")), Some(OsStr::new("/home/u"))),
+        PathBuf::from("/opt/cargo/bin")
+    );
+    assert_eq!(
+        cargo_bin_from(Some(OsStr::new("")), Some(OsStr::new("/home/u"))),
+        PathBuf::from("/home/u/.cargo/bin"),
+        "empty CARGO_HOME must fall back"
+    );
+    assert_eq!(
+        cargo_bin_from(None, Some(OsStr::new("/home/u"))),
+        PathBuf::from("/home/u/.cargo/bin")
+    );
+    assert_eq!(
+        cargo_bin_from(None, None),
+        PathBuf::from(".").join(".cargo").join("bin")
+    );
+}
+
+/// Status lines are byte-exact: up-to-date names the version, an update
+/// shows the bare (v-stripped) tag.
+#[test]
+fn status_lines_are_exact() {
+    assert_eq!(status_line("0.3.1", None), "demo 0.3.1 is up to date");
+    assert_eq!(status_line("0.3.1", Some("v0.4.0")), "demo 0.3.1 → 0.4.0");
+    assert_eq!(status_line("0.3.1", Some("0.4.0")), "demo 0.3.1 → 0.4.0");
+}
+
 // ── Fakes ───────────────────────────────────────────────────
 
 struct FakeFetcher {
@@ -686,7 +743,7 @@ fn cargo_refusal_is_the_exact_sentence() {
 /// of each doc must name all three exit codes.
 fn doc_update_section(relative: &str, marker: &str) -> String {
     let path = format!("{}/{}", env!("CARGO_MANIFEST_DIR"), relative);
-    let text = std::fs::read_to_string(&path).expect("read doc");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read doc {path}: {e}"));
     assert!(text.contains(marker), "{marker:?} missing in {relative}");
     let level = marker.chars().take_while(|c| *c == '#').count();
     let after = &text[text.find(marker).expect("marker")..];

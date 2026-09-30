@@ -1,5 +1,6 @@
 use super::animated::{
-    fold_scenes, render_document, scene_of, write_animated, DocInput, Geom, Scene, ANIM_FAMILY,
+    fold_scenes, render_document, scene_of, windows_for, write_animated, BgItem, DocInput, DotItem,
+    Geom, Scene, TextItem, ANIM_FAMILY,
 };
 use super::animated_refusal;
 use super::paint::{escape_attr, escape_xml, merge_runs};
@@ -738,4 +739,576 @@ fn a_small_replay_exports_a_byte_stable_poster() {
 "##;
     assert_eq!(doc, expected, "deterministic snapshot drifted");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The earliest browser pane wins the refusal message; ties keep the first
+/// (`<`, not `<=`: equal times must not dethrone the leader).
+#[test]
+fn refusal_names_the_earliest_browser_pane() {
+    let score: Score = toml::from_str(
+        r#"
+[demo]
+name = "t"
+[layout]
+width = 300
+height = 100
+  [[layout.panes]]
+  id = "c"
+  type = "terminal"
+  x = 0
+  y = 0
+  width = 100
+  height = 100
+  [[layout.panes]]
+  id = "late"
+  type = "browser"
+  x = 100
+  y = 0
+  width = 100
+  height = 100
+  url = "https://late.example"
+  reveal_at = 5.0
+  [[layout.panes]]
+  id = "early"
+  type = "browser"
+  x = 200
+  y = 0
+  width = 100
+  height = 100
+  url = "https://early.example"
+  reveal_at = 2.0
+"#,
+    )
+    .unwrap();
+    let msg = animated_refusal(&score).expect("staged must refuse");
+    assert!(msg.contains('2'), "earliest time missing: {msg}");
+    assert!(!msg.contains('5'), "later time must not win: {msg}");
+}
+
+/// A single terminal that is offset or resized is not fullscreen: each
+/// `is_single_terminal` conjunct refuses on its own (`&&`, not `||`).
+#[test]
+fn offset_or_resized_terminal_still_refuses() {
+    for (label, pane_toml) in [
+        ("x offset", "x = 50\ny = 0\nwidth = 100\nheight = 100"),
+        ("y offset", "x = 0\ny = 10\nwidth = 100\nheight = 100"),
+        ("narrow", "x = 0\ny = 0\nwidth = 80\nheight = 100"),
+        ("short", "x = 0\ny = 0\nwidth = 100\nheight = 48"),
+    ] {
+        let score: Score = toml::from_str(&format!(
+            r#"
+[demo]
+name = "t"
+[layout]
+width = 100
+height = 100
+  [[layout.panes]]
+  id = "c"
+  type = "terminal"
+  {pane_toml}
+"#,
+        ))
+        .unwrap();
+        assert!(
+            animated_refusal(&score).is_some(),
+            "{label}: a non-fullscreen terminal must refuse"
+        );
+    }
+}
+
+/// A cell with `ch`, the given fg, and an explicit background.
+fn bg_cell(ch: char, fg: [u8; 3], bg: [u8; 3]) -> TextCell {
+    TextCell {
+        ch,
+        fg,
+        bg,
+        bold: false,
+    }
+}
+
+/// One frame laid out row by row.
+fn frame_rows(rows: &[Vec<TextCell>]) -> TextFrame {
+    let cols = rows[0].len();
+    let cells: Vec<TextCell> = rows.iter().flatten().copied().collect();
+    frame(cols, rows.len(), cells)
+}
+
+/// `scene_of` maps every lane exactly: background spans, merged runs, and
+/// braille cells — but ONLY real braille. The blank U+2800 cell and ordinary
+/// characters never become dot items, and the bits are codepoint − U+2800.
+#[test]
+fn scene_of_builds_the_exact_scene() {
+    let tf = frame(
+        4,
+        2,
+        vec![
+            cell('a', [255, 0, 0]),
+            // a background change splits the run and opens a `<rect>` span
+            TextCell {
+                ch: 'b',
+                fg: [255, 0, 0],
+                bg: [0, 80, 160],
+                bold: false,
+            },
+            // ⣿ = U+28FF → dots; the blank cell draws nothing at all
+            cell('\u{28ff}', [10, 20, 30]),
+            cell('\u{2800}', [10, 20, 30]),
+            // row 1: one run whose trailing spaces trim away
+            cell('c', [0, 255, 0]),
+            cell(' ', [0, 255, 0]),
+            cell(' ', [0, 255, 0]),
+            cell(' ', [0, 255, 0]),
+        ],
+    );
+    assert_eq!(
+        scene_of(&tf),
+        Scene {
+            bg: vec![BgItem {
+                row: 0,
+                start: 1,
+                cells: 1,
+                color: [0, 80, 160],
+            }],
+            text: vec![
+                TextItem {
+                    row: 0,
+                    start: 0,
+                    text: "a".into(),
+                    fg: [255, 0, 0],
+                    bold: false,
+                },
+                TextItem {
+                    row: 0,
+                    start: 1,
+                    text: "b".into(),
+                    fg: [255, 0, 0],
+                    bold: false,
+                },
+                TextItem {
+                    row: 1,
+                    start: 0,
+                    text: "c".into(),
+                    fg: [0, 255, 0],
+                    bold: false,
+                },
+            ],
+            dots: vec![DotItem {
+                row: 0,
+                col: 2,
+                bits: 0xff,
+                fg: [10, 20, 30],
+            }],
+        },
+        "scene_of must map every lane exactly"
+    );
+}
+
+/// Frames fold into first-seen ids and hold windows `[start, end)`: a repeat
+/// extends the running hold, a reprise of an earlier scene opens a new one.
+#[test]
+fn fold_scenes_keeps_first_seen_ids_and_exact_hold_bounds() {
+    let a = scene_of(&frame(2, 1, text_row("aa", 2)));
+    let b = scene_of(&frame(2, 1, text_row("bb", 2)));
+    let (unique, holds) = fold_scenes(vec![a.clone(), a.clone(), b.clone(), a.clone()]);
+    assert_eq!(unique, vec![a, b], "ids must be assigned first-seen");
+    let spans: Vec<(usize, usize, usize)> =
+        holds.iter().map(|h| (h.scene, h.start, h.end)).collect();
+    assert_eq!(
+        spans,
+        vec![(0, 0, 2), (1, 2, 3), (0, 3, 4)],
+        "consecutive frames extend the run; a reprise opens a new hold"
+    );
+}
+
+/// `windows_for` closes a window the moment its item misses a hold, keeps
+/// first-seen order, and leaves windows open until the end of the timeline.
+#[test]
+fn windows_for_reports_exact_first_seen_windows() {
+    let per_hold = vec![vec![1, 2], vec![2], vec![1, 3]];
+    assert_eq!(
+        windows_for(&per_hold),
+        vec![
+            (1, vec![(0, 1), (2, 3)]),
+            (2, vec![(0, 2)]),
+            (3, vec![(2, 3)]),
+        ],
+        "first-seen order, closed on absence, ends exclusive"
+    );
+    assert_eq!(
+        windows_for::<i32>(&[]),
+        Vec::<(i32, Vec<(usize, usize)>)>::new(),
+        "no holds, no windows"
+    );
+}
+
+/// The whole three-state timeline as ONE byte-exact document. Every lane is
+/// represented: a persistent background span (`#pb`), a persistent text run
+/// and a persistent braille cell (`#pt`), transient residuals in the state
+/// groups (`<defs>`), one `<use>` per scene, all six keyframe rules in
+/// emission order (k0…k5), and the reduced-motion `#final` group.
+#[test]
+fn the_full_timeline_document_is_byte_exact() {
+    // State 0: K (blue background + run) then "aaa"; ⣿ on row 1.
+    let f0 = frame_rows(&[
+        vec![
+            TextCell {
+                ch: 'K',
+                fg: [255, 255, 255],
+                bg: [0, 80, 160],
+                bold: false,
+            },
+            cell('a', [200, 200, 200]),
+            cell('a', [200, 200, 200]),
+            cell('a', [200, 200, 200]),
+        ],
+        vec![
+            cell('\u{28ff}', [10, 20, 30]),
+            cell(' ', [200, 200, 200]),
+            cell(' ', [200, 200, 200]),
+            cell(' ', [200, 200, 200]),
+        ],
+    ]);
+    // State 1: K survives, the run after it churns; the braille cell survives.
+    let f1 = frame_rows(&[
+        vec![
+            TextCell {
+                ch: 'K',
+                fg: [255, 255, 255],
+                bg: [0, 80, 160],
+                bold: false,
+            },
+            cell('b', [200, 200, 200]),
+            cell('b', [200, 200, 200]),
+            cell('b', [200, 200, 200]),
+        ],
+        vec![
+            cell('\u{28ff}', [10, 20, 30]),
+            cell(' ', [200, 200, 200]),
+            cell(' ', [200, 200, 200]),
+            cell(' ', [200, 200, 200]),
+        ],
+    ]);
+    // State 2: K and ⣿ are gone; a green run and a lone ⠁ appear instead.
+    let f2 = frame_rows(&[
+        vec![
+            cell('x', [255, 0, 0]),
+            bg_cell('y', [200, 200, 200], [80, 160, 0]),
+            bg_cell('y', [200, 200, 200], [80, 160, 0]),
+            bg_cell('y', [200, 200, 200], [80, 160, 0]),
+        ],
+        vec![
+            cell(' ', [200, 200, 200]),
+            cell(' ', [200, 200, 200]),
+            cell(' ', [200, 200, 200]),
+            cell('\u{2801}', [40, 50, 60]),
+        ],
+    ]);
+    let doc = animated_doc(&[f0, f1, f2], 40, 40, 1);
+    let expected = r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="40" height="40" viewBox="0 0 40 40">
+<style>
+@keyframes k0{0%{opacity:1}66.6667%{opacity:0}100%{opacity:0}}
+@keyframes k1{0%{opacity:1}66.6667%{opacity:0}100%{opacity:0}}
+@keyframes k2{0%{opacity:1}66.6667%{opacity:0}100%{opacity:0}}
+@keyframes k3{0%{opacity:1}33.3333%{opacity:0}100%{opacity:0}}
+@keyframes k4{0%{opacity:0}33.3333%{opacity:1}66.6667%{opacity:0}100%{opacity:0}}
+@keyframes k5{0%{opacity:0}66.6667%{opacity:1}100%{opacity:0}}
+#final{display:none}
+@media (prefers-reduced-motion: reduce){#anim{display:none}#final{display:inline}}
+</style>
+<defs>
+<g id="r0">
+<text x="10" y="15" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, &quot;DejaVu Sans Mono&quot;, monospace" font-size="16" fill="#c8c8c8" textLength="30" lengthAdjust="spacingAndGlyphs" xml:space="preserve">aaa</text>
+</g>
+<g id="r1">
+<text x="10" y="15" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, &quot;DejaVu Sans Mono&quot;, monospace" font-size="16" fill="#c8c8c8" textLength="30" lengthAdjust="spacingAndGlyphs" xml:space="preserve">bbb</text>
+</g>
+<g id="r2">
+<rect x="10" y="0" width="30" height="20" fill="#50a000"/>
+<circle cx="32" cy="22" r="2" fill="#28323c"/>
+<text x="0" y="15" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, &quot;DejaVu Sans Mono&quot;, monospace" font-size="16" fill="#ff0000" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">x</text>
+<text x="10" y="15" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, &quot;DejaVu Sans Mono&quot;, monospace" font-size="16" fill="#c8c8c8" textLength="30" lengthAdjust="spacingAndGlyphs" xml:space="preserve">yyy</text>
+</g>
+</defs>
+<rect x="0" y="0" width="40" height="40" rx="8" fill="#0b0f14"/>
+<g id="anim">
+<g id="pb">
+<rect x="0" y="0" width="10" height="20" fill="#0050a0" style="animation:k0 3s steps(1,end) infinite;opacity:0"/>
+</g>
+<g id="states">
+<use href="#r0" xlink:href="#r0" style="animation:k3 3s steps(1,end) infinite;opacity:0"/>
+<use href="#r1" xlink:href="#r1" style="animation:k4 3s steps(1,end) infinite;opacity:0"/>
+<use href="#r2" xlink:href="#r2" style="animation:k5 3s steps(1,end) infinite;opacity:0"/>
+</g>
+<g id="pt">
+<text x="0" y="15" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, &quot;DejaVu Sans Mono&quot;, monospace" font-size="16" fill="#ffffff" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve" style="animation:k1 3s steps(1,end) infinite;opacity:0">K</text>
+<g style="animation:k2 3s steps(1,end) infinite;opacity:0"><circle cx="2" cy="22" r="2" fill="#0a141e"/> <circle cx="2" cy="27" r="2" fill="#0a141e"/> <circle cx="2" cy="32" r="2" fill="#0a141e"/> <circle cx="2" cy="37" r="2" fill="#0a141e"/> <circle cx="7" cy="22" r="2" fill="#0a141e"/> <circle cx="7" cy="27" r="2" fill="#0a141e"/> <circle cx="7" cy="32" r="2" fill="#0a141e"/> <circle cx="7" cy="37" r="2" fill="#0a141e"/></g>
+</g>
+</g>
+<g id="final">
+<rect x="0" y="0" width="40" height="40" rx="8" fill="#0b0f14"/>
+<rect x="10" y="0" width="30" height="20" fill="#50a000"/>
+<circle cx="32" cy="22" r="2" fill="#28323c"/>
+<text x="0" y="15" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, &quot;DejaVu Sans Mono&quot;, monospace" font-size="16" fill="#ff0000" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">x</text>
+<text x="10" y="15" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, &quot;DejaVu Sans Mono&quot;, monospace" font-size="16" fill="#c8c8c8" textLength="30" lengthAdjust="spacingAndGlyphs" xml:space="preserve">yyy</text>
+</g>
+</svg>
+"##;
+    assert_eq!(
+        doc, expected,
+        "the three-state timeline must assemble byte for byte"
+    );
+}
+
+/// A scene that recurs non-consecutively keeps ONE group and ONE `<use>`, but
+/// its rule must open over BOTH of its windows (frames 0..1 and 2..3 of 3).
+#[test]
+fn a_recurring_state_gets_one_rule_with_two_visible_windows() {
+    let a = frame(3, 1, text_row("aaa", 3));
+    let b = frame(3, 1, text_row("bbb", 3));
+    let doc = animated_doc(&[a.clone(), b, a], 30, 20, 3);
+    assert!(
+        doc.contains(
+            "@keyframes k0{0%{opacity:1}33.3333%{opacity:0}66.6667%{opacity:1}100%{opacity:0}}"
+        ),
+        "the reprise must be its own visible window:\n{doc}"
+    );
+    assert!(
+        doc.contains(
+            "@keyframes k1{0%{opacity:0}33.3333%{opacity:1}66.6667%{opacity:0}100%{opacity:0}}"
+        ),
+        "the middle state's window drifted:\n{doc}"
+    );
+    assert_eq!(
+        doc.matches("<use href=\"#r0\"").count(),
+        1,
+        "one <use> per scene id, however many windows:\n{doc}"
+    );
+    assert_eq!(doc.matches("<g id=\"r0\">").count(), 1, ":\n{doc}");
+    assert!(
+        doc.contains(
+            "<use href=\"#r0\" xlink:href=\"#r0\" style=\"animation:k0 1s steps(1,end) infinite;opacity:0\"/>"
+        ),
+        "exact <use> row with its animation style:\n{doc}"
+    );
+}
+
+/// One hold (no change over the whole timeline) renders the STATIC document:
+/// no `<style>`, no `<defs>`, no `<g id="anim">` — header, canvas, markup.
+#[test]
+fn a_single_hold_timeline_renders_the_static_document() {
+    let f = frame(3, 1, text_row("hi!", 3));
+    let doc = animated_doc(&[f.clone(), f], 30, 20, 5);
+    let expected = r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="30" height="20" viewBox="0 0 30 20">
+<rect x="0" y="0" width="30" height="20" rx="8" fill="#0b0f14"/>
+<text x="0" y="15" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, &quot;DejaVu Sans Mono&quot;, monospace" font-size="16" fill="#c8c8c8" textLength="30" lengthAdjust="spacingAndGlyphs" xml:space="preserve">hi!</text>
+</svg>
+"##;
+    assert_eq!(
+        doc, expected,
+        "a degenerate timeline must fall back to the static document"
+    );
+}
+
+/// End-to-end through the writer: a replay whose screen never changes walks
+/// into a single hold, so `write_animated` must persist the STATIC document.
+#[test]
+fn a_constant_replay_writes_the_static_document() {
+    let rec = Recording {
+        cols: 10,
+        rows: 2,
+        title: "t".into(),
+        events: vec![(0.0, "ab".into())],
+        captions: vec![],
+        focuses: vec![],
+        duration: 0.5,
+    };
+    let score = replay_score();
+    let dir = std::env::temp_dir().join(format!("demostage_svg_static_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("static.svg");
+    write_animated(&path, &rec, &score).unwrap();
+    let doc = std::fs::read_to_string(&path).unwrap();
+    let expected = r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="100" height="38" viewBox="0 0 100 38">
+<rect x="0" y="0" width="100" height="38" rx="8" fill="#0b0f14"/>
+<text x="0" y="14" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, &quot;DejaVu Sans Mono&quot;, monospace" font-size="16" fill="#c8c8c8" textLength="20" lengthAdjust="spacingAndGlyphs" xml:space="preserve">ab</text>
+</svg>
+"##;
+    assert_eq!(
+        doc, expected,
+        "a one-state replay must be written as the static document"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `write_animated` announces its state count and size on stderr. libtest
+/// captures stderr in-process with no way to read it back, so the test re-runs
+/// ITSELF in a child process with `--nocapture` and asserts the exact line.
+#[test]
+fn write_animated_announces_its_state_count_and_size_on_stderr() {
+    const CHILD: &str = "DEMOSTAGE_WRITE_ANIMATED_STDERR_CHILD";
+    let rec = replay_rec();
+    let score = replay_score();
+    let dir = std::env::temp_dir().join(format!("demostage_svg_stderr_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    if std::env::var_os(CHILD).is_some() {
+        write_animated(&dir.join("child.svg"), &rec, &score).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    let path = dir.join("parent.svg");
+    write_animated(&path, &rec, &score).unwrap();
+    let doc = std::fs::read_to_string(&path).unwrap();
+    let expected = format!(
+        "demo: animated svg: 2 states, {:.1} KB\n",
+        doc.len() as f64 / 1024.0
+    );
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("write_animated_announces_its_state_count_and_size_on_stderr")
+        .arg("--nocapture")
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        out.status.success(),
+        "child failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("1 passed"),
+        "the child must run exactly this one test:\n{stdout}"
+    );
+    assert_eq!(
+        stderr, expected,
+        "the status line must report the real state count and size"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Two browser panes revealing at the SAME instant: `<` (not `<=`) keeps the
+/// FIRST one, and every field of the message is exact.
+#[test]
+fn equal_reveal_times_refuse_the_first_browser_pane() {
+    let score: Score = toml::from_str(
+        r#"
+[demo]
+name = "t"
+[layout]
+width = 300
+height = 100
+  [[layout.panes]]
+  id = "c"
+  type = "terminal"
+  x = 0
+  y = 0
+  width = 100
+  height = 100
+  [[layout.panes]]
+  id = "first"
+  type = "browser"
+  x = 100
+  y = 0
+  width = 100
+  height = 100
+  url = "file:///first.pdf"
+  reveal_at = 4.0
+  [[layout.panes]]
+  id = "second"
+  type = "browser"
+  x = 200
+  y = 0
+  width = 100
+  height = 100
+  url = "file:///second.png"
+  reveal_at = 4.0
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        animated_refusal(&score).as_deref(),
+        Some(
+            "animated svg supports terminal-only demos; this score shows a PDF pane at 4.0s \
+             — use gif/mp4, or --at <s> for a poster"
+        ),
+        "ties must keep the FIRST pane; kind, article, time and guidance must all be exact"
+    );
+}
+
+/// `pane_kind_label` splits query strings off before sniffing the extension.
+#[test]
+fn a_browser_url_with_a_query_still_labels_by_extension() {
+    let score: Score = toml::from_str(
+        r#"
+[demo]
+name = "t"
+[layout]
+width = 200
+height = 100
+  [[layout.panes]]
+  id = "c"
+  type = "terminal"
+  x = 0
+  y = 0
+  width = 100
+  height = 100
+  [[layout.panes]]
+  id = "p"
+  type = "browser"
+  x = 100
+  y = 0
+  width = 100
+  height = 100
+  url = "file:///x.pdf?start=2"
+  reveal_at = 1.5
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        animated_refusal(&score).as_deref(),
+        Some(
+            "animated svg supports terminal-only demos; this score shows a PDF pane at 1.5s \
+             — use gif/mp4, or --at <s> for a poster"
+        ),
+        "the query string must not hide the .pdf extension"
+    );
+}
+
+/// The single-terminal fast lane needs EXACTLY one pane: a fullsize first
+/// pane must not smuggle a second pane past `panes.len() != 1`.
+#[test]
+fn a_fullsize_first_pane_still_refuses_when_the_layout_holds_two_panes() {
+    let score: Score = toml::from_str(
+        r#"
+[demo]
+name = "t"
+[layout]
+width = 200
+height = 100
+  [[layout.panes]]
+  id = "c"
+  type = "terminal"
+  x = 0
+  y = 0
+  width = 200
+  height = 100
+  [[layout.panes]]
+  id = "p"
+  type = "browser"
+  x = 0
+  y = 50
+  width = 200
+  height = 50
+  url = "file:///x.pdf"
+  reveal_at = 2.0
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        animated_refusal(&score).as_deref(),
+        Some(
+            "animated svg supports terminal-only demos; this score shows a PDF pane at 2.0s \
+             — use gif/mp4, or --at <s> for a poster"
+        ),
+        "the fast lane is exactly one pane; a fullsize first pane must not claim it"
+    );
 }

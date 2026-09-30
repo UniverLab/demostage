@@ -603,4 +603,146 @@ height = 100
         let r = resolve_export_resolution(&args, 1920, 1080).unwrap();
         assert_eq!(r, None);
     }
+
+    // --- run() gate mutants: missing input errors; staged svg-only without
+    // --at refuses with the animated refusal; each gate conjunct excuses it.
+
+    fn export_args(
+        input: std::path::PathBuf,
+        targets: Option<Vec<Target>>,
+        at: Option<f64>,
+    ) -> ExportArgs {
+        ExportArgs {
+            input,
+            targets: targets.map(crate::cli::TargetList),
+            resolution: None,
+            aspect: None,
+            quality: None,
+            speed: None,
+            force: true,
+            at,
+        }
+    }
+
+    fn staged_score_toml() -> &'static str {
+        r#"
+[demo]
+name = "staged"
+[layout]
+width = 1920
+height = 1080
+fps = 15
+  [[layout.panes]]
+  id = "main"
+  type = "terminal"
+  x = 0
+  y = 0
+  width = 960
+  height = 1080
+  [[layout.panes]]
+  id = "docs"
+  type = "browser"
+  x = 960
+  y = 0
+  width = 960
+  height = 1080
+"#
+    }
+
+    fn write_staged_rec(dir: &std::path::Path) -> std::path::PathBuf {
+        use crate::export::run::Recording;
+        let score: Score = toml::from_str(staged_score_toml()).unwrap();
+        assert!(
+            crate::export::stage::needs_stage(&score),
+            "fixture must need a stage"
+        );
+        let rec = Recording {
+            cols: 80,
+            rows: 24,
+            title: "t".into(),
+            events: vec![(0.0, "hi".into())],
+            captions: vec![],
+            focuses: vec![],
+            duration: 0.5,
+        };
+        let text = crate::export::recording::write(&rec, &score, false).unwrap();
+        let path = dir.join("staged.rec");
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    fn unique_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "demo-test-export-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn run_errors_on_missing_input() {
+        let dir = unique_dir("missing");
+        let args = export_args(dir.join("nope.rec"), None, None);
+        let err = run(args).unwrap_err().to_string();
+        assert!(
+            err.contains("nope.rec"),
+            "error must name the input, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_refuses_staged_svg_without_at() {
+        let dir = unique_dir("refuse");
+        let rec = write_staged_rec(&dir);
+        let args = export_args(rec, Some(vec![Target::Svg]), None);
+        let err = run(args).unwrap_err().to_string();
+        let score: Score = toml::from_str(staged_score_toml()).unwrap();
+        let refusal = crate::export::svg::animated_refusal(&score).unwrap();
+        assert_eq!(err, refusal, "staged svg-only without --at must refuse");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_passes_gate_with_at_set_for_staged_svg() {
+        // --at set: the gate's first conjunct is false, so no refusal. The
+        // render itself writes a poster svg; success or a non-refusal error
+        // both prove the gate passed.
+        let dir = unique_dir("at");
+        let rec = write_staged_rec(&dir);
+        let args = export_args(rec, Some(vec![Target::Svg]), Some(0.0));
+        match run(args) {
+            Ok(()) => {}
+            Err(e) => {
+                let score: Score = toml::from_str(staged_score_toml()).unwrap();
+                let refusal = crate::export::svg::animated_refusal(&score).unwrap();
+                assert_ne!(e.to_string(), refusal, "--at must skip the refusal");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_passes_gate_for_non_svg_targets_on_staged() {
+        // gif target on a staged score: second conjunct false → no refusal.
+        // gif render needs ffmpeg; a non-refusal outcome (ok or other error)
+        // proves the gate passed.
+        let dir = unique_dir("gif");
+        let rec = write_staged_rec(&dir);
+        let args = export_args(rec, Some(vec![Target::Gif]), None);
+        match run(args) {
+            Ok(()) => {}
+            Err(e) => {
+                let score: Score = toml::from_str(staged_score_toml()).unwrap();
+                let refusal = crate::export::svg::animated_refusal(&score).unwrap();
+                assert_ne!(e.to_string(), refusal, "gif must skip the svg refusal");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

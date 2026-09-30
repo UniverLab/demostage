@@ -159,6 +159,20 @@ fn capture_browser_scenes<'a>(
     Ok(captured)
 }
 
+/// Total media seconds for `n` frames at `fps`. Pure so the division is
+/// unit-testable without rendering a stage.
+fn stage_total(n: usize, fps: f64) -> f64 {
+    n as f64 / fps
+}
+
+/// Output frames a scene is actually on screen for: its reveal→hide window
+/// (or reveal→end), clamped at zero for stale windows, rounded to frames.
+/// Pure so the clamp and rounding are unit-testable.
+fn reveal_window_frames(hide_at: Option<f64>, total: f64, reveal_at: f64, fps: f64) -> usize {
+    let window = (hide_at.unwrap_or(total) - reveal_at).max(0.0);
+    (window * fps).round() as usize
+}
+
 /// A PDF pane exists to show its document, so it may need more time on screen
 /// than the recording gives it. When such a pane runs to the end of the demo,
 /// the demo waits for it: the terminal underneath holds its last frame while
@@ -342,7 +356,7 @@ pub fn render_stage(
     let mut term_src = raster::FrameSource::new(&term_rec, score)?;
     let n = term_src.n_frames();
     let fps = score.layout.fps.max(1) as f64;
-    let total = n as f64 / fps;
+    let total = stage_total(n, fps);
     let mut fallback_report = term_src.take_fallback_report();
 
     let mut captured = capture_browser_scenes(score, rec, total, fps, speed)?;
@@ -351,8 +365,7 @@ pub fn render_stage(
     // The window may have grown above; every scene maps progress over the window
     // it is actually given, so tell them the final one.
     for (_, scene, reveal_at, hide_at) in captured.scenes.iter_mut() {
-        let window = (hide_at.unwrap_or(total) - *reveal_at).max(0.0);
-        scene.set_window_frames((window * fps).round() as usize);
+        scene.set_window_frames(reveal_window_frames(*hide_at, total, *reveal_at, fps));
     }
 
     let params = CompositeParams {
@@ -1004,5 +1017,339 @@ pane = "b"
         assert_eq!(params.direction, ScrollDirection::Up);
         assert_eq!(params.velocity, Velocity::EaseInOut);
         assert_eq!(params.ignored_count, 1);
+    }
+
+    // --- mutant-killing tests: totals, windows, pdf extension, compositing,
+    // staged render ---
+
+    #[test]
+    fn stage_total_divides_frames_by_fps() {
+        assert_eq!(stage_total(150, 30.0), 5.0);
+        assert_eq!(stage_total(16, 15.0), 16.0 / 15.0);
+        assert_eq!(stage_total(0, 30.0), 0.0);
+    }
+
+    #[test]
+    fn reveal_window_frames_clamps_and_rounds() {
+        assert_eq!(reveal_window_frames(None, 5.0, 1.0, 10.0), 40);
+        assert_eq!(reveal_window_frames(Some(3.0), 5.0, 1.0, 10.0), 20);
+        // Stale window (hide before reveal) clamps to zero, not a huge cast.
+        assert_eq!(reveal_window_frames(Some(1.0), 5.0, 2.0, 10.0), 0);
+        assert_eq!(reveal_window_frames(Some(15.0), 21.4, 21.4, 10.0), 0);
+    }
+
+    /// N blank pages with computed xref offsets, valid by construction.
+    fn multipage_pdf_bytes(pages: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"%PDF-1.4\n");
+        let mut objs: Vec<String> = Vec::new();
+        objs.push("1 0 obj\n<</Type/Catalog/Pages 2 0 R>>\nendobj\n".to_string());
+        let kids: Vec<String> = (0..pages).map(|i| format!("{} 0 R", 3 + i)).collect();
+        objs.push(format!(
+            "2 0 obj\n<</Type/Pages/Kids[{}]/Count {pages}>>\nendobj\n",
+            kids.join(" ")
+        ));
+        for i in 0..pages {
+            objs.push(format!(
+                "{} 0 obj\n<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]>>\nendobj\n",
+                3 + i
+            ));
+        }
+        let mut offsets = Vec::new();
+        for o in &objs {
+            offsets.push(out.len());
+            out.extend_from_slice(o.as_bytes());
+        }
+        let xref_at = out.len();
+        let count = objs.len() + 1;
+        out.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
+        for off in offsets {
+            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!("trailer\n<</Size {count}/Root 1 0 R>>\nstartxref\n{xref_at}\n%%EOF\n")
+                .as_bytes(),
+        );
+        out
+    }
+
+    #[test]
+    fn extend_for_pdf_panes_leaves_content_agnostic_scenes_alone() {
+        let pane = browser_pane(None, None);
+        let scenes = vec![(
+            &pane,
+            browser::AnyScene::Keyframe(browser::Scene::from_keyframes(
+                10,
+                10,
+                vec![(0.0, vec![0u8; 400])],
+            )),
+            0.0,
+            None,
+        )];
+        // Keyframe scenes need nothing: (n, total) pass through byte-identical.
+        assert_eq!(extend_for_pdf_panes(&scenes, 150, 5.0, 30.0), (150, 5.0));
+    }
+
+    #[test]
+    fn extend_for_pdf_panes_holds_the_terminal_for_a_long_document() {
+        let dir = std::env::temp_dir().join(format!(
+            "demo-test-pdf-extend-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pdf = dir.join("long.pdf");
+        std::fs::write(&pdf, multipage_pdf_bytes(12)).unwrap();
+        let scene = crate::export::pdf::capture_scene(
+            &pdf,
+            800,
+            600,
+            30,
+            15.0,
+            Some(ScrollParams {
+                direction: ScrollDirection::Down,
+                velocity: Velocity::Constant,
+                ignored_count: 0,
+                seconds: 8.0,
+            }),
+            1.0,
+        )
+        .expect("crafted PDF must render");
+        let needed = scene.needed_seconds();
+        assert!(needed > 0.5, "fixture must need time, got {needed}");
+        let pane = browser_pane(None, None);
+        let scenes = vec![(&pane, browser::AnyScene::Pdf(scene), 0.0, None)];
+        let (n, total) = extend_for_pdf_panes(&scenes, 8, 0.5, 10.0);
+        assert!(n > 8, "frame count must grow, got {n}");
+        assert!(total > 0.5, "total must grow, got {total}");
+        assert!(
+            total >= needed - 1e-9,
+            "grown total {total} must cover needed {needed}"
+        );
+        assert_eq!(total, n as f64 / 10.0, "total must equal n/fps exactly");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn composite_score() -> Score {
+        toml::from_str(
+            r#"
+[demo]
+name = "comp"
+[layout]
+width = 200
+height = 100
+fps = 10
+  [[layout.panes]]
+  id = "main"
+  type = "terminal"
+  x = 0
+  y = 0
+  width = 200
+  height = 100
+"#,
+        )
+        .unwrap()
+    }
+
+    fn composite_rec() -> crate::export::run::Recording {
+        crate::export::run::Recording {
+            cols: 80,
+            rows: 24,
+            title: "t".into(),
+            events: vec![],
+            captions: vec![],
+            focuses: vec![],
+            duration: 0.5,
+        }
+    }
+
+    fn white_scene() -> browser::AnyScene {
+        browser::AnyScene::Keyframe(browser::Scene::from_keyframes(
+            100,
+            100,
+            vec![(0.0, vec![255u8; 100 * 100 * 4])],
+        ))
+    }
+
+    fn composite_canvases(
+        scenes: &mut BrowserScenes<'_>,
+        caption: &mut Option<raster::CaptionOverlay>,
+    ) -> Vec<Vec<u8>> {
+        let score = composite_score();
+        let rec = composite_rec();
+        let term_rec = rec.clone();
+        let mut term_src = raster::FrameSource::new(&term_rec, &score).unwrap();
+        let term_pane = score
+            .layout
+            .panes
+            .iter()
+            .find(|p| p.kind == PaneKind::Terminal)
+            .unwrap();
+        let params = CompositeParams {
+            canvas_w: 200,
+            canvas_h: 100,
+            background: [0, 0, 0],
+            fps: 10.0,
+            total: 2.0,
+            frames: 20,
+        };
+        let mut report = raster::FallbackReport::new();
+        let mut out = Vec::new();
+        composite_frames(
+            &mut term_src,
+            scenes,
+            term_pane,
+            &params,
+            caption,
+            &mut report,
+            &mut |f: &[u8]| {
+                out.push(f.to_vec());
+            },
+        );
+        out
+    }
+
+    fn canvas_pixel(c: &[u8], w: usize, x: usize, y: usize) -> [u8; 4] {
+        let p = (y * w + x) * 4;
+        [c[p], c[p + 1], c[p + 2], c[p + 3]]
+    }
+
+    /// A browser overlay revealed at 1.0 s is absent before frame 10 and
+    /// present after; hidden again at its hide time. Pixel (50, 50) sits
+    /// inside the 100×100 overlay at (0, 0).
+    #[test]
+    fn composite_frames_reveal_and_hide_browser_overlays() {
+        let pane = browser_pane(Some(1.0), None);
+        let mut scenes = BrowserScenes {
+            scenes: vec![(&pane, white_scene(), 1.0, None)],
+            _guards: vec![],
+            reports: vec![],
+        };
+        let frames = composite_canvases(&mut scenes, &mut None);
+        assert_eq!(frames.len(), 20, "every frame must be emitted");
+        assert_ne!(
+            canvas_pixel(&frames[5], 200, 50, 50),
+            [255, 255, 255, 255],
+            "frame 5 (t=0.5) predates the 1.0 s reveal"
+        );
+        assert_eq!(
+            canvas_pixel(&frames[15], 200, 50, 50),
+            [255, 255, 255, 255],
+            "frame 15 (t=1.5) must show the overlay"
+        );
+        // Boundary: exactly at reveal_at the overlay shows (`<`, not `<=`).
+        assert_eq!(
+            canvas_pixel(&frames[10], 200, 50, 50),
+            [255, 255, 255, 255],
+            "frame 10 (t=1.0) is the reveal moment"
+        );
+
+        let pane2 = browser_pane(Some(1.0), Some(1.5));
+        let mut scenes2 = BrowserScenes {
+            scenes: vec![(&pane2, white_scene(), 1.0, Some(1.5))],
+            _guards: vec![],
+            reports: vec![],
+        };
+        let frames2 = composite_canvases(&mut scenes2, &mut None);
+        assert_ne!(
+            canvas_pixel(&frames2[15], 200, 50, 50),
+            [255, 255, 255, 255],
+            "frame 15 (t=1.5) is the hide moment (`>=` hides)"
+        );
+        assert_eq!(
+            canvas_pixel(&frames2[14], 200, 50, 50),
+            [255, 255, 255, 255],
+            "frame 14 (t=1.4) still shows"
+        );
+    }
+
+    /// Two captions at different times render different bytes; the caption
+    /// clock is the frame clock (`i/fps`), not a product or remainder.
+    #[test]
+    fn composite_frames_caption_clock_follows_frame_time() {
+        let pane = browser_pane(None, None);
+        let mut scenes = BrowserScenes {
+            scenes: vec![],
+            _guards: vec![],
+            reports: vec![],
+        };
+        let _ = &pane;
+        let mut captioned = Some(
+            raster::CaptionOverlay::new(
+                vec![(0.5, "A".to_string()), (1.5, "BB".to_string())],
+                20.0,
+                crate::fonts::DEFAULT_FONT,
+                crate::fonts::load_emoji(),
+                crate::fonts::load_last_resort(),
+            )
+            .unwrap(),
+        );
+        let with_caption = composite_canvases(&mut scenes, &mut captioned);
+        let mut scenes2 = BrowserScenes {
+            scenes: vec![],
+            _guards: vec![],
+            reports: vec![],
+        };
+        let plain = composite_canvases(&mut scenes2, &mut None);
+        assert_ne!(
+            with_caption[5], plain[5],
+            "frame 5 (t=0.5) must carry the first caption"
+        );
+        assert_eq!(
+            plain[5], plain[15],
+            "no caption: frames differ only by clock"
+        );
+        assert_ne!(
+            with_caption[5], with_caption[15],
+            "different captions at 0.5 s vs 1.5 s must render differently"
+        );
+    }
+
+    #[test]
+    fn render_stage_terminal_only_emits_every_frame() {
+        let score = composite_score();
+        let rec = composite_rec();
+        let expect = raster::FrameSource::new(&rec, &score).unwrap().n_frames();
+        assert!(expect > 0);
+        let mut count = 0usize;
+        let (report, browser_reports) =
+            render_stage(&rec, &score, 1.0, &mut |_: &[u8]| count += 1).unwrap();
+        assert_eq!(count, expect, "every terminal frame must be emitted");
+        assert!(browser_reports.is_empty());
+        assert!(report.is_empty());
+    }
+
+    #[test]
+    fn render_stage_without_terminal_pane_is_an_error() {
+        let score: Score = toml::from_str(
+            r#"
+[demo]
+name = "nobrowser-term"
+[layout]
+width = 200
+height = 100
+  [[layout.panes]]
+  id = "b"
+  type = "browser"
+  x = 0
+  y = 0
+  width = 200
+  height = 100
+  url = "https://x"
+"#,
+        )
+        .unwrap();
+        let rec = composite_rec();
+        let err = match render_stage(&rec, &score, 1.0, &mut |_: &[u8]| {}) {
+            Ok(_) => panic!("render_stage without a terminal pane must fail"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("terminal pane"),
+            "must demand a terminal pane, got: {err}"
+        );
     }
 }

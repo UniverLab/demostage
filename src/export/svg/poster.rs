@@ -222,3 +222,399 @@ pub(crate) fn base64(data: &[u8]) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::export::raster::TextCell;
+
+    /// Poster geometry: 10×40 cells, 16px type, the standard canvas colour.
+    fn frame(cols: usize, rows: usize, cells: Vec<TextCell>) -> TextFrame {
+        TextFrame {
+            cols,
+            rows,
+            cell_w: 10,
+            cell_h: 40,
+            px: 16.0,
+            font_family: "IBM Plex Mono".into(),
+            default_bg: [11, 15, 20],
+            cells,
+        }
+    }
+
+    fn cell(ch: char, fg: [u8; 3]) -> TextCell {
+        TextCell {
+            ch,
+            fg,
+            bg: [11, 15, 20],
+            bold: false,
+        }
+    }
+
+    fn styled(ch: char, fg: [u8; 3], bg: [u8; 3], bold: bool) -> TextCell {
+        TextCell { ch, fg, bg, bold }
+    }
+
+    /// A unique scratch directory per test, removed on drop.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "demostage_poster_{}_{}",
+                tag,
+                std::process::id()
+            ));
+            let _ = std::fs::create_dir_all(&dir);
+            Scratch(dir)
+        }
+
+        fn file(&self, name: &str) -> std::path::PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The 4×2 grid: "a" over bold "cd", with "b" on a coloured background.
+    fn poster_grid() -> TextFrame {
+        frame(
+            4,
+            2,
+            vec![
+                cell('a', [255, 0, 0]),
+                styled('b', [255, 0, 0], [0, 80, 160], false),
+                cell(' ', [255, 0, 0]),
+                cell(' ', [255, 0, 0]),
+                styled('c', [0, 255, 0], [11, 15, 20], true),
+                styled('d', [0, 255, 0], [11, 15, 20], true),
+                cell(' ', [0, 255, 0]),
+                cell(' ', [0, 255, 0]),
+            ],
+        )
+    }
+
+    /// The exact `<svg>` for [`poster_grid`] at 40×80.
+    fn poster_grid_expected() -> String {
+        concat!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" ",
+            "width=\"40\" height=\"80\" viewBox=\"0 0 40 80\">\n",
+            "<rect x=\"0\" y=\"0\" width=\"40\" height=\"80\" rx=\"8\" fill=\"#0b0f14\"/>\n",
+            "<rect x=\"10\" y=\"0\" width=\"10\" height=\"40\" fill=\"#0050a0\"/>\n",
+            "<text x=\"0\" y=\"25\" font-family=\"'IBM Plex Mono', monospace\" font-size=\"16\" ",
+            "fill=\"#ff0000\" textLength=\"10\" lengthAdjust=\"spacing\" xml:space=\"preserve\">a</text>\n",
+            "<text x=\"10\" y=\"25\" font-family=\"'IBM Plex Mono', monospace\" font-size=\"16\" ",
+            "fill=\"#ff0000\" textLength=\"10\" lengthAdjust=\"spacing\" xml:space=\"preserve\">b</text>\n",
+            "<text x=\"0\" y=\"65\" font-family=\"'IBM Plex Mono', monospace\" font-size=\"16\" ",
+            "font-weight=\"bold\" fill=\"#00ff00\" textLength=\"20\" lengthAdjust=\"spacing\" ",
+            "xml:space=\"preserve\">cd</text>\n",
+            "</svg>\n",
+        )
+        .to_string()
+    }
+
+    #[test]
+    fn kept_captures_both_frame_shapes() {
+        let tf = frame(2, 1, vec![cell('q', [7, 8, 9]), cell('r', [7, 8, 9])]);
+        match Kept::capture(&PosterFrame::Cells(&tf)) {
+            Kept::Cells(copied) => {
+                assert_eq!(copied.cols, 2);
+                assert_eq!(copied.cells, tf.cells);
+            }
+            Kept::Rgba(_) => panic!("the cell frame must be copied as cells"),
+        }
+
+        let rgba = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+        match Kept::capture(&PosterFrame::Rgba(&rgba)) {
+            Kept::Rgba(copied) => assert_eq!(copied, rgba),
+            Kept::Cells(_) => panic!("the rgba frame must be copied as rgba"),
+        }
+    }
+
+    #[test]
+    fn encode_keeps_the_frame_whose_index_matches_keep() {
+        let scratch = Scratch::new("keep0");
+        let path = scratch.file("poster.svg");
+        let a = frame(1, 1, vec![cell('a', [200, 200, 200])]);
+        let b = frame(1, 1, vec![cell('b', [200, 200, 200])]);
+        encode(&path, 10, 40, 0, |emit| {
+            emit(&PosterFrame::Cells(&a));
+            emit(&PosterFrame::Cells(&b));
+            Ok(())
+        })
+        .unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            written,
+            poster_document(&a, 10, 40),
+            "frame #0 must be the one kept"
+        );
+        assert!(written.contains(">a</text>"), "wrong frame:\n{written}");
+        assert!(!written.contains(">b</text>"), "wrong frame:\n{written}");
+    }
+
+    #[test]
+    fn keep_past_the_end_falls_back_to_the_last_emitted_frame() {
+        let scratch = Scratch::new("keeplast");
+        let path = scratch.file("poster.svg");
+        let a = frame(1, 1, vec![cell('a', [200, 200, 200])]);
+        let b = frame(1, 1, vec![cell('b', [200, 200, 200])]);
+        encode(&path, 10, 40, 99, |emit| {
+            emit(&PosterFrame::Cells(&a));
+            emit(&PosterFrame::Cells(&b));
+            Ok(())
+        })
+        .unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            written,
+            poster_document(&b, 10, 40),
+            "the last emitted frame must be the fallback"
+        );
+    }
+
+    #[test]
+    fn an_encoder_with_no_frames_writes_nothing_and_errors() {
+        let scratch = Scratch::new("empty");
+        let path = scratch.file("poster.svg");
+        let err = encode(&path, 10, 40, 0, |_: &mut dyn FnMut(&PosterFrame<'_>)| {
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("no frames"), "unhelpful: {err}");
+        assert!(!path.exists(), "nothing must be written on failure");
+    }
+
+    #[test]
+    fn encode_embeds_an_rgba_frame_as_a_png_data_uri() {
+        let scratch = Scratch::new("rgba");
+        let path = scratch.file("poster.svg");
+        let rgba = vec![128u8; 2 * 2 * 4];
+        encode(&path, 2, 2, 0, |emit| {
+            emit(&PosterFrame::Rgba(&rgba));
+            Ok(())
+        })
+        .unwrap();
+        let doc = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            doc.matches("<image").count(),
+            1,
+            "exactly one embedded frame:\n{doc}"
+        );
+        // `iVBORw0KGgo` is base64 of the 8-byte PNG signature: a real PNG.
+        assert!(
+            doc.contains("href=\"data:image/png;base64,iVBORw0KGgo"),
+            "not a PNG data URI:\n{doc}"
+        );
+        assert!(
+            doc.contains("xlink:href=\"data:image/png;base64,"),
+            "older renderers need the xlink spelling:\n{doc}"
+        );
+        assert!(!doc.contains("<text"), "no fake vector text");
+    }
+
+    #[test]
+    fn frame_index_selects_by_seconds_and_clamps_both_ends() {
+        // The arithmetic: (t.max(0.0) × fps.max(1)).floor(), min(last).
+        assert_eq!(frame_index(None, 15, 10), 9, "no time = last frame");
+        assert_eq!(frame_index(None, 15, 1), 0, "a single frame is the last");
+        assert_eq!(frame_index(Some(0.0), 15, 10), 0);
+        // 0.2 × 15 = 3 exactly.
+        assert_eq!(frame_index(Some(0.2), 15, 10), 3);
+        // Past the end clamps to n_frames - 1, never beyond.
+        assert_eq!(frame_index(Some(99.0), 15, 10), 9);
+        assert_eq!(frame_index(Some(0.61), 15, 10), 9);
+        // Negative seconds clamp to frame 0 rather than wrapping.
+        assert_eq!(frame_index(Some(-1.0), 15, 10), 0);
+        // fps 0 is raised to 1: 0.6s × 1fps = 0.
+        assert_eq!(frame_index(Some(0.6), 0, 10), 0);
+    }
+
+    #[test]
+    fn a_braille_row_paints_circles_and_the_text_row_ignores_it() {
+        let tf = frame(
+            2,
+            1,
+            vec![
+                cell('x', [255, 255, 255]),
+                TextCell {
+                    ch: '⣿',
+                    fg: [1, 2, 3],
+                    bg: [11, 15, 20],
+                    bold: false,
+                },
+            ],
+        );
+        // Same hand-computed layout as paint::braille_dots at row 0, col 1,
+        // cell 10×40: cx 12/17, cy 5/15/25/35, r = 2 — one line per dot cell.
+        let expected_dots = "<circle cx=\"12\" cy=\"5\" r=\"2\" fill=\"#010203\"/> \
+         <circle cx=\"12\" cy=\"15\" r=\"2\" fill=\"#010203\"/> \
+         <circle cx=\"12\" cy=\"25\" r=\"2\" fill=\"#010203\"/> \
+         <circle cx=\"12\" cy=\"35\" r=\"2\" fill=\"#010203\"/> \
+         <circle cx=\"17\" cy=\"5\" r=\"2\" fill=\"#010203\"/> \
+         <circle cx=\"17\" cy=\"15\" r=\"2\" fill=\"#010203\"/> \
+         <circle cx=\"17\" cy=\"25\" r=\"2\" fill=\"#010203\"/> \
+         <circle cx=\"17\" cy=\"35\" r=\"2\" fill=\"#010203\"/>\n";
+        assert_eq!(paint_braille_row(&tf, 0), expected_dots);
+        // A row past the grid is empty, not an error.
+        assert_eq!(paint_braille_row(&tf, 5), "");
+
+        // A row with no braille at all (text + blank braille) paints nothing.
+        let plain = frame(
+            2,
+            1,
+            vec![
+                cell('x', [255, 255, 255]),
+                TextCell {
+                    ch: '\u{2800}',
+                    fg: [255, 255, 255],
+                    bg: [11, 15, 20],
+                    bold: false,
+                },
+            ],
+        );
+        assert_eq!(paint_braille_row(&plain, 0), "");
+    }
+
+    #[test]
+    fn a_text_row_emits_one_text_line_per_run() {
+        let tf = frame(
+            2,
+            1,
+            vec![
+                cell('x', [255, 255, 255]),
+                TextCell {
+                    ch: '⣿',
+                    fg: [1, 2, 3],
+                    bg: [11, 15, 20],
+                    bold: false,
+                },
+            ],
+        );
+        assert_eq!(
+            paint_text_row(&tf, 0),
+            "<text x=\"0\" y=\"25\" font-family=\"'IBM Plex Mono', monospace\" \
+             font-size=\"16\" fill=\"#ffffff\" textLength=\"10\" \
+             lengthAdjust=\"spacing\" xml:space=\"preserve\">x</text>\n"
+        );
+        assert_eq!(paint_text_row(&tf, 5), "", "an empty row emits nothing");
+    }
+
+    #[test]
+    fn poster_document_is_the_exact_poster() {
+        let doc = poster_document(&poster_grid(), 40, 80);
+        assert_eq!(doc, poster_grid_expected());
+        // Reproducible: same frame in, same bytes out.
+        assert_eq!(
+            poster_document(&poster_grid(), 40, 80),
+            poster_grid_expected(),
+            "must be byte-stable"
+        );
+    }
+
+    #[test]
+    fn raster_document_embeds_the_png_the_crate_encodes() {
+        let rgba = vec![128u8; 2 * 2 * 4];
+        let payload = base64(&png_bytes(&rgba, 2, 2).unwrap());
+        let expected = format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" \
+             width=\"2\" height=\"2\" viewBox=\"0 0 2 2\">\n\
+             <image x=\"0\" y=\"0\" width=\"2\" height=\"2\" rx=\"8\" \
+             href=\"data:image/png;base64,{payload}\" xlink:href=\"data:image/png;base64,{payload}\"/>\n\
+             </svg>\n"
+        );
+        assert_eq!(raster_document(&rgba, 2, 2).unwrap(), expected);
+        // The payload itself is a PNG, not a stub.
+        assert!(
+            payload.starts_with("iVBORw0KGgo"),
+            "not PNG bytes: {payload}"
+        );
+    }
+
+    #[test]
+    fn png_bytes_emits_the_png_signature_and_full_image() {
+        let bytes = png_bytes(&[128u8; 2 * 2 * 4], 2, 2).unwrap();
+        assert!(
+            bytes.len() > 8,
+            "a 2×2 RGBA PNG is much longer than {} bytes",
+            bytes.len()
+        );
+        assert_eq!(
+            &bytes[..8],
+            &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
+            "PNG signature missing"
+        );
+    }
+
+    #[test]
+    fn base64_matches_the_rfc_4648_vectors() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foob"), "Zm9vYg==");
+        assert_eq!(base64(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+    }
+
+    /// The score the replay snapshots render: a 10×2 terminal, 10 fps.
+    fn replay_score() -> Score {
+        toml::from_str(
+            r#"
+[demo]
+name = "t"
+[layout]
+width = 100
+height = 40
+fps = 10
+  [[layout.panes]]
+  id = "c"
+  type = "terminal"
+  x = 0
+  y = 0
+  width = 100
+  height = 40
+"#,
+        )
+        .unwrap()
+    }
+
+    /// Two frames of output: `ab`, then `cd` on the second row.
+    fn replay_rec() -> Recording {
+        Recording {
+            cols: 10,
+            rows: 2,
+            title: "t".into(),
+            events: vec![(0.0, "ab".into()), (0.3, "\r\ncd".into())],
+            captions: vec![],
+            focuses: vec![],
+            duration: 0.5,
+        }
+    }
+
+    #[test]
+    fn write_svg_renders_the_selected_frame_to_the_byte() {
+        let scratch = Scratch::new("write_svg");
+        let path = scratch.file("poster.svg");
+        // No `--at`: the LAST frame of the replay, both rows on screen.
+        write_svg(&path, &replay_rec(), &replay_score(), None).unwrap();
+        let doc = std::fs::read_to_string(&path).unwrap();
+        let expected = concat!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" ",
+            "width=\"100\" height=\"38\" viewBox=\"0 0 100 38\">\n",
+            "<rect x=\"0\" y=\"0\" width=\"100\" height=\"38\" rx=\"8\" fill=\"#0b0f14\"/>\n",
+            "<text x=\"0\" y=\"14\" font-family=\"'DejaVu Sans Mono', monospace\" font-size=\"16\" ",
+            "fill=\"#c8c8c8\" textLength=\"20\" lengthAdjust=\"spacing\" ",
+            "xml:space=\"preserve\">ab</text>\n",
+            "<text x=\"0\" y=\"33\" font-family=\"'DejaVu Sans Mono', monospace\" font-size=\"16\" ",
+            "fill=\"#c8c8c8\" textLength=\"20\" lengthAdjust=\"spacing\" ",
+            "xml:space=\"preserve\">cd</text>\n",
+            "</svg>\n",
+        );
+        assert_eq!(doc, expected, "deterministic poster drifted");
+    }
+}

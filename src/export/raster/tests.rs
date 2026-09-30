@@ -1139,7 +1139,12 @@ fn next_text_frame_walks_the_same_states_as_seek() {
     let mut walked = FrameSource::new(&rec, &score).unwrap();
     let n = walked.n_frames();
     let mut states = Vec::new();
-    while let Some(tf) = walked.next_text_frame() {
+    // Bounded by the known frame count: the walk ends on its own whatever the
+    // per-frame result is.
+    for _ in 0..n {
+        let Some(tf) = walked.next_text_frame() else {
+            break;
+        };
         states.push(tf.cells.clone());
     }
     assert_eq!(states.len(), n, "the walk must cover every frame");
@@ -1204,4 +1209,664 @@ fn text_frame_resolves_colors_like_the_raster() {
     assert_eq!(z.bg, resolve(Color::Idx(196), tf.default_bg));
     assert_eq!(z.fg, resolve(Color::Idx(21), DEFAULT_FG));
     assert_eq!(z.bg, xterm256(196), "the vector path must not drift");
+}
+
+// ── exact-coverage tests (mutant killers) ─────────────────────────────────
+//
+// Every test below asserts the *whole* coverage buffer or RGBA frame computed
+// from the original arithmetic, so an operator swap anywhere in the covered
+// code changes the output and fails the assertion.
+
+/// A `w`×`h` coverage buffer with exactly the pixels listed in `inked` at 255.
+fn exact_cov(w: usize, h: usize, inked: &[usize]) -> Vec<u8> {
+    let mut v = vec![0u8; w * h];
+    for &i in inked {
+        v[i] = 255;
+    }
+    v
+}
+
+#[test]
+fn braille_single_dots_ink_exact_pixels_8x8() {
+    // At 8×8 each sub-cell is 4×2 and r = max(1, min(4, 2) * 0.42) = 1.0, so a
+    // dot centred at (cx, cy) inks exactly the 2×2 pixel box
+    // x ∈ [cx-1, cx+1), y ∈ [cy-1, cy+1) — every candidate pixel satisfies
+    // dx² + dy² = 0.25 + 0.25 ≤ 1. Sub-cell centres: col 0 → cx = 2, col 1 →
+    // cx = 6; row r → cy = 1 + 2r. Every one of the eight dot positions must
+    // land in its own sub-cell and nowhere else.
+    let dots: [(char, [usize; 4]); 8] = [
+        ('\u{2801}', [1, 2, 9, 10]),    // (col 0, row 0)
+        ('\u{2802}', [17, 18, 25, 26]), // (0, 1)
+        ('\u{2804}', [33, 34, 41, 42]), // (0, 2)
+        ('\u{2840}', [49, 50, 57, 58]), // (0, 3)
+        ('\u{2808}', [5, 6, 13, 14]),   // (1, 0)
+        ('\u{2810}', [21, 22, 29, 30]), // (1, 1)
+        ('\u{2820}', [37, 38, 45, 46]), // (1, 2)
+        ('\u{2880}', [53, 54, 61, 62]), // (1, 3)
+    ];
+    for (ch, idx) in dots {
+        assert_eq!(
+            braille_cell(ch, 8, 8).unwrap(),
+            exact_cov(8, 8, &idx),
+            "dot pattern {ch} must ink exactly its four sub-cell pixels"
+        );
+    }
+}
+
+#[test]
+fn braille_disc_geometry_half_int_centres_10x4() {
+    // w=10, h=4 → sub_w = 5, sub_h = 1, r = max(1, 1 * 0.42) = 1.0, and dot
+    // (0,0) is centred at (2.5, 0.5) — a half-integer centre, so the candidate
+    // box x ∈ {1,2,3} (dx = -1, 0, 1), y ∈ {0,1} (dy = 0, 1) contains pixels
+    // at distance √2 > 1 that the *squared* radius test must reject:
+    // inked = {(1,0), (2,0), (3,0), (2,1)} → indices 1, 2, 3, 12.
+    assert_eq!(
+        braille_cell('\u{2801}', 10, 4).unwrap(),
+        exact_cov(10, 4, &[1, 2, 3, 12])
+    );
+    // The blank pattern stays blank at this geometry too.
+    assert_eq!(braille_cell('\u{2800}', 10, 4).unwrap(), vec![0u8; 40]);
+}
+
+#[test]
+fn block_cell_upper_half_exact_boundary() {
+    // ▀ upper half: y < h/2 — at h = 4 exactly rows 0-1; row h/2 must stay empty.
+    let mut want = vec![0u8; 16];
+    for y in 0..2 {
+        for x in 0..4 {
+            want[y * 4 + x] = 255;
+        }
+    }
+    assert_eq!(block_cell('\u{2580}', 4, 4).unwrap(), want);
+}
+
+#[test]
+fn block_cell_lower_half_exact_at_odd_height() {
+    // ▄ lower half: y >= h/2. At odd h = 5 that is rows 2,3,4 — one row more
+    // than the lower-eighths fallback (fill = 5*4/8 = 2 → y >= 3) would give.
+    let mut want = vec![0u8; 20];
+    for y in 2..5 {
+        for x in 0..4 {
+            want[y * 4 + x] = 255;
+        }
+    }
+    assert_eq!(block_cell('\u{2584}', 4, 5).unwrap(), want);
+}
+
+#[test]
+fn block_cell_upper_one_eighth_exact() {
+    // ▔ upper one-eighth: y < h/8 — at h = 8 exactly row 0, not rows 0-1.
+    let mut want = vec![0u8; 64];
+    want[..8].fill(255);
+    assert_eq!(block_cell('\u{2594}', 8, 8).unwrap(), want);
+}
+
+#[test]
+fn block_cell_right_one_eighth_exact() {
+    // ▕ right one-eighth: x >= w - w/8 — at w = 16 exactly cols 14-15.
+    let mut want = vec![0u8; 16 * 8];
+    for y in 0..8 {
+        for x in 14..16 {
+            want[y * 16 + x] = 255;
+        }
+    }
+    assert_eq!(block_cell('\u{2595}', 16, 8).unwrap(), want);
+}
+
+#[test]
+fn block_cell_lower_eighths_fill_exact_rows() {
+    // ▂ (k=2): fill = 8*2/8 = 2 → rows 6-7. ▃ (k=3): fill = 8*3/8 = 3 →
+    // rows 5-7. Any change to the fill arithmetic shifts these rows.
+    let mut want2 = vec![0u8; 64];
+    let mut want3 = vec![0u8; 64];
+    for y in 6..8 {
+        for x in 0..8 {
+            want2[y * 8 + x] = 255;
+        }
+    }
+    for y in 5..8 {
+        for x in 0..8 {
+            want3[y * 8 + x] = 255;
+        }
+    }
+    assert_eq!(block_cell('\u{2582}', 8, 8).unwrap(), want2);
+    assert_eq!(block_cell('\u{2583}', 8, 8).unwrap(), want3);
+}
+
+#[test]
+fn block_cell_left_one_eighth_exact() {
+    // ▏ left one-eighth: fill = 8 * (0x2590 - 0x258F) / 8 = 1 → exactly col 0.
+    let mut want = vec![0u8; 64];
+    for y in 0..8 {
+        want[y * 8] = 255;
+    }
+    assert_eq!(block_cell('\u{258F}', 8, 8).unwrap(), want);
+}
+
+#[test]
+fn block_cell_quadrants_exact_regions() {
+    // ▘ (top-left): ink where x < w/2 && y < h/2 → rows 0-1, cols 0-1.
+    // ▗ (bottom-right): ink where x >= w/2 && y >= h/2 → rows 2-3, cols 2-3.
+    let mut want_tl = vec![0u8; 16];
+    let mut want_br = vec![0u8; 16];
+    for y in 0..2 {
+        for x in 0..2 {
+            want_tl[y * 4 + x] = 255;
+        }
+    }
+    for y in 2..4 {
+        for x in 2..4 {
+            want_br[y * 4 + x] = 255;
+        }
+    }
+    assert_eq!(block_cell('\u{2598}', 4, 4).unwrap(), want_tl);
+    assert_eq!(block_cell('\u{2597}', 4, 4).unwrap(), want_br);
+}
+
+#[test]
+fn box_cell_vertical_bar_exact() {
+    // │ at 12×14: cx = 6, cy = 7, vt = 12/6 = 2, ht = 14/10 = 1,
+    // xl = 4, xr = 9, yt = 6, yb = 9. Up fills rows 0-8, down rows 6-13,
+    // both in cols 4..9 → the full-height stripe cols 4-8.
+    let mut want = vec![0u8; 12 * 14];
+    for y in 0..14 {
+        for x in 4..9 {
+            want[y * 12 + x] = 255;
+        }
+    }
+    assert_eq!(box_cell('\u{2502}', 12, 14).unwrap(), want);
+}
+
+#[test]
+fn box_cell_horizontal_bar_exact() {
+    // ─ at 12×14: left fills rows yt..yb = 6..9 over cols 0..xr = 0..9, right
+    // fills the same rows over cols xl..w = 4..12 → rows 6-8, full width.
+    let mut want = vec![0u8; 12 * 14];
+    for y in 6..9 {
+        for x in 0..12 {
+            want[y * 12 + x] = 255;
+        }
+    }
+    assert_eq!(box_cell('\u{2500}', 12, 14).unwrap(), want);
+}
+
+/// Shared frame for the two render_cells pixel-exact tests: a 2×2 grid of
+/// cells painted onto a black canvas.
+fn paint_grid(
+    cell: char,
+    sgr_prefix: &str,
+    cell_w: usize,
+    cell_h: usize,
+    ascent: f32,
+    glyphs: &mut HashMap<char, (fontdue::Metrics, Vec<u8>)>,
+) -> Vec<u8> {
+    let mut parser = vt100::Parser::new(2, 2, 0);
+    parser.process(format!("{sgr_prefix}\x1b[2;2H{cell}").as_bytes());
+    let font = fonts::load(fonts::DEFAULT_FONT);
+    let emoji = fonts::load_emoji();
+    let last_resort = fonts::load_last_resort();
+    let fset = FontSet {
+        primary: &font,
+        emoji: &emoji,
+        last_resort: &last_resort,
+        px: 16.0,
+    };
+    let grid = GridLayout {
+        cols: 2,
+        rows: 2,
+        cell_w,
+        cell_h,
+        ascent,
+        default_bg: [0, 0, 0],
+    };
+    let mut report = FallbackReport::new();
+    render_cells(&parser, glyphs, &fset, &grid, &mut report)
+}
+
+/// An all-black `w`×`h` RGBA frame whose pixels listed in `lit` carry the
+/// given luminance (RGB = luminance on all three channels, alpha 255).
+fn black_frame_with(w: usize, h: usize, lit: &[(usize, usize, u8)]) -> Vec<u8> {
+    let mut want = vec![0u8; w * h * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let p = (y * w + x) * 4;
+            want[p + 3] = 255;
+        }
+    }
+    for &(y, x, lum) in lit {
+        let p = (y * w + x) * 4;
+        want[p] = lum;
+        want[p + 1] = lum;
+        want[p + 2] = lum;
+    }
+    want
+}
+
+#[test]
+fn render_cells_fills_bg_and_paints_block_exactly() {
+    // 2×2 grid of 4×4 cells on a black canvas; cell (1,1) holds ▘ (top-left
+    // quadrant) in the default fg. Its top-left 2×2 must come out exactly in
+    // DEFAULT_FG over the black background — this observes both the background
+    // fill (cell origin/stride arithmetic) and the solid-cell painter
+    // (coverage indexing, alpha test, pixel offset).
+    let fg = DEFAULT_FG;
+    let lum = (fg[0] as u32 + fg[1] as u32 + fg[2] as u32) / 3;
+    assert_eq!(fg, [200, 200, 200], "premise: DEFAULT_FG is uniform grey");
+    let mut glyphs: HashMap<char, (fontdue::Metrics, Vec<u8>)> = HashMap::new();
+    let img = paint_grid('\u{2598}', "", 4, 4, 3.0, &mut glyphs);
+
+    // Rows 4-5, cols 4-5 of the canvas = the top-left quadrant of cell (1,1).
+    let mut lit = Vec::new();
+    for y in 4..6 {
+        for x in 4..6 {
+            lit.push((y, x, lum as u8));
+        }
+    }
+    assert_eq!(img, black_frame_with(8, 8, &lit));
+    // The fg really is the lit luminance (a=255 blends src through exactly).
+    assert_eq!(fg, [lum as u8, lum as u8, lum as u8]);
+}
+
+#[test]
+fn render_cells_places_cached_glyph_exactly() {
+    // 2×2 grid, cells 6×4, ascent 2.0, fg forced to white via SGR 38;5;15.
+    // Cell (1,1) holds 'A' served from a hand-made 2×2 cache entry with
+    // ymin = -1, so paint_glyph_cell computes
+    //   ox   = 6 + (6 - 2) / 2 = 8
+    //   top  = 4 + round(2.0) - (2 + (-1)) = 5
+    // and GlyphBlit lands coverage [255, 100, 50, 0] on (5,8), (5,9), (6,8),
+    // (6,9). White over black blends a through exactly, so pixel = coverage.
+    let cov = vec![255u8, 100, 50, 0];
+    let m = fontdue::Metrics {
+        xmin: 0,
+        ymin: -1,
+        width: 2,
+        height: 2,
+        advance_width: 2.0,
+        advance_height: 0.0,
+        bounds: fontdue::OutlineBounds {
+            xmin: 0.0,
+            ymin: -1.0,
+            width: 2.0,
+            height: 2.0,
+        },
+    };
+    let mut glyphs: HashMap<char, (fontdue::Metrics, Vec<u8>)> = HashMap::new();
+    glyphs.insert('A', (m, cov));
+
+    let img = paint_grid('A', "\x1b[38;5;15m", 6, 4, 2.0, &mut glyphs);
+
+    let want = black_frame_with(12, 8, &[(5, 8, 255), (5, 9, 100), (6, 8, 50)]);
+    assert_eq!(img, want);
+}
+
+#[test]
+fn blend_pixel_exact_channel_arithmetic() {
+    use super::cells::blend_pixel;
+    // dst = (10,20,30), fg = (200,100,50), a = 100:
+    //   k=0: (200*100 + 10*155) / 255 = 21550/255 = 84
+    //   k=1: (100*100 + 20*155) / 255 = 13100/255 = 51
+    //   k=2: ( 50*100 + 30*155) / 255 =  9650/255 = 37
+    let mut img = [10u8, 20, 30, 255, 40, 50, 60, 255];
+    blend_pixel(&mut img, 0, [200, 100, 50], 100);
+    assert_eq!(img, [84, 51, 37, 255, 40, 50, 60, 255]);
+    // a = 0 leaves dst untouched; the alpha byte is never written.
+    blend_pixel(&mut img, 4, [1, 2, 3], 0);
+    assert_eq!(img, [84, 51, 37, 255, 40, 50, 60, 255]);
+    // a = 255 passes fg through exactly.
+    blend_pixel(&mut img, 4, [7, 8, 9], 255);
+    assert_eq!(img, [84, 51, 37, 255, 7, 8, 9, 255]);
+}
+
+#[test]
+fn resolve_index_16_is_the_xterm256_boundary() {
+    // Idx(15) is the last ANSI palette entry; Idx(16) must fall through to
+    // xterm256 (which is [0,0,0]) — never index ANSI16[16].
+    assert_eq!(resolve(Color::Idx(15), DEFAULT_FG), ANSI16[15]);
+    assert_eq!(resolve(Color::Idx(15), DEFAULT_FG), [255, 255, 255]);
+    assert_eq!(resolve(Color::Idx(16), DEFAULT_FG), xterm256(16));
+    assert_eq!(resolve(Color::Idx(16), DEFAULT_FG), [0, 0, 0]);
+}
+
+#[test]
+fn glyph_blit_writes_exact_coverage_pixels() {
+    let (w, h) = (8usize, 8usize);
+    let mut img = vec![0u8; w * h * 4];
+    let m = fontdue::Metrics {
+        xmin: 0,
+        ymin: 0,
+        width: 3,
+        height: 3,
+        advance_width: 3.0,
+        advance_height: 0.0,
+        bounds: fontdue::OutlineBounds {
+            xmin: 0.0,
+            ymin: 0.0,
+            width: 3.0,
+            height: 3.0,
+        },
+    };
+    // Non-uniform coverage; drawn from ox = 0 so column 0 is exercised.
+    // White on a zeroed buffer blends a through exactly (255*a/255 = a).
+    let cov = vec![255u8, 10, 20, 30, 0, 50, 60, 70, 80];
+    GlyphBlit {
+        m: &m,
+        cov: &cov,
+        ox: 0,
+        top: 0,
+        fg: [255, 255, 255],
+    }
+    .draw(&mut img, w, h);
+
+    let mut want = vec![0u8; w * h * 4];
+    for gy in 0..3 {
+        for gx in 0..3 {
+            let a = cov[gy * 3 + gx];
+            let p = (gy * w + gx) * 4;
+            want[p] = a;
+            want[p + 1] = a;
+            want[p + 2] = a;
+        }
+    }
+    assert_eq!(img, want);
+}
+
+#[test]
+fn glyph_blit_clips_bottom_and_right_exactly() {
+    let (w, h) = (8usize, 8usize);
+    let mut img = vec![0u8; w * h * 4];
+    let m = fontdue::Metrics {
+        xmin: 0,
+        ymin: 0,
+        width: 4,
+        height: 4,
+        advance_width: 4.0,
+        advance_height: 0.0,
+        bounds: fontdue::OutlineBounds {
+            xmin: 0.0,
+            ymin: 0.0,
+            width: 4.0,
+            height: 4.0,
+        },
+    };
+    // Placed at (6,6): glyph rows 8-9 are below the canvas and columns 8-9
+    // are past the right edge — both must be skipped, not wrapped or written.
+    let cov: Vec<u8> = (1..=16).collect();
+    GlyphBlit {
+        m: &m,
+        cov: &cov,
+        ox: 6,
+        top: 6,
+        fg: [255, 255, 255],
+    }
+    .draw(&mut img, w, h);
+
+    // Only the visible 2×2 corner: (6,6)=1, (6,7)=2, (7,6)=5, (7,7)=6.
+    // GlyphBlit never writes the alpha byte, so it stays 0 in this raw buffer.
+    let mut want = vec![0u8; w * h * 4];
+    for (y, x, a) in [(6, 6, 1u8), (6, 7, 2), (7, 6, 5), (7, 7, 6)] {
+        let p = (y * w + x) * 4;
+        want[p] = a;
+        want[p + 1] = a;
+        want[p + 2] = a;
+    }
+    assert_eq!(img, want);
+}
+
+/// Braille-block codepoints are rendered natively, never recorded as
+/// fallbacks: the boundary pair on each side pins `<`/`<=` and `>`/`>=`.
+#[test]
+fn fallback_report_skips_exactly_the_braille_block() {
+    let mut report = FallbackReport::new();
+    assert!(report.is_empty());
+    report.record_fallback('\u{27FF}', "emoji");
+    report.record_fallback('\u{2900}', "emoji");
+    assert!(!report.is_empty(), "outside the block must record");
+    let mut bounds = FallbackReport::new();
+    bounds.record_fallback('\u{2800}', "emoji");
+    bounds.record_fallback('\u{28FF}', "emoji");
+    bounds.record_unresolved('\u{2800}');
+    bounds.record_unresolved('\u{28FF}');
+    assert!(
+        bounds.is_empty(),
+        "braille boundaries must never record, got {:?}",
+        bounds.format("t")
+    );
+}
+
+/// take_fallback_report moves the recorded entries out and leaves an empty
+/// report behind (`Default::default()` instead would drop them silently).
+#[test]
+fn take_fallback_report_moves_entries_out() {
+    let rec = Recording {
+        cols: 16,
+        rows: 2,
+        title: "t".into(),
+        events: vec![(0.0, "a\u{1F600}b".into())],
+        captions: vec![],
+        focuses: vec![],
+        duration: 0.1,
+    };
+    let score: Score = toml::from_str(
+        r#"
+[demo]
+name = "t"
+[layout]
+width = 160
+height = 40
+fps = 10
+  [[layout.panes]]
+  id = "c"
+  type = "terminal"
+  x = 0
+  y = 0
+  width = 160
+  height = 40
+"#,
+    )
+    .unwrap();
+    let mut source = FrameSource::new(&rec, &score).unwrap();
+    let _ = source.next_frame();
+    let report = source.take_fallback_report();
+    assert!(!report.is_empty(), "the \u{e9} fallback must be reported");
+    assert!(
+        source.take_fallback_report().is_empty(),
+        "second take is empty"
+    );
+}
+
+/// Frame times are `frame * dt`, not sums or quotients: at 10 fps the first
+/// frames read exactly 0.0, 0.1, 0.2.
+#[test]
+fn advance_steps_frame_times_by_dt() {
+    let rec = Recording {
+        cols: 16,
+        rows: 2,
+        title: "t".into(),
+        events: vec![],
+        captions: vec![],
+        focuses: vec![],
+        duration: 1.0,
+    };
+    let score: Score = toml::from_str(
+        r#"
+[demo]
+name = "t"
+[layout]
+width = 160
+height = 40
+fps = 10
+  [[layout.panes]]
+  id = "c"
+  type = "terminal"
+  x = 0
+  y = 0
+  width = 160
+  height = 40
+"#,
+    )
+    .unwrap();
+    let mut source = FrameSource::new(&rec, &score).unwrap();
+    assert_eq!(source.advance(), Some(0.0));
+    let second = source.advance().unwrap();
+    assert!(
+        (second - 0.1).abs() < 1e-9,
+        "second frame must be 0.1, got {second}"
+    );
+    let third = source.advance().unwrap();
+    assert!(
+        (third - 0.2).abs() < 1e-9,
+        "third frame must be 0.2, got {third}"
+    );
+}
+
+/// The empty-glyph predicate: either dimension zero skips (`||`, not
+/// `&&`), both nonzero paints.
+#[test]
+fn is_empty_glyph_skips_any_zero_dimension() {
+    use super::cells::is_empty_glyph;
+    let glyph = |w: usize, h: usize| fontdue::Metrics {
+        xmin: 0,
+        ymin: 0,
+        width: w,
+        height: h,
+        advance_width: 0.0,
+        advance_height: 0.0,
+        bounds: fontdue::OutlineBounds {
+            xmin: 0.0,
+            ymin: 0.0,
+            width: w as f32,
+            height: h as f32,
+        },
+    };
+    assert!(is_empty_glyph(&glyph(0, 0)));
+    assert!(is_empty_glyph(&glyph(0, 5)));
+    assert!(is_empty_glyph(&glyph(5, 0)));
+    assert!(!is_empty_glyph(&glyph(5, 5)));
+    assert!(!is_empty_glyph(&glyph(1, 1)));
+}
+
+/// Indices below 16 resolve to the ANSI16 palette through xterm256.
+#[test]
+fn low_indices_resolve_through_the_ansi_palette() {
+    for i in 0..16u8 {
+        assert_eq!(resolve(Color::Idx(i), DEFAULT_FG), ANSI16[i as usize]);
+    }
+    assert_eq!(resolve(Color::Idx(16), DEFAULT_FG), xterm256(16));
+}
+
+/// Render one cell of `ch` on a 1x1 grid with the given background, for
+/// background-channel and zero-metric tests.
+fn paint_one_cell(
+    ch: char,
+    bg: [u8; 3],
+    glyphs: &mut HashMap<char, (fontdue::Metrics, Vec<u8>)>,
+) -> Vec<u8> {
+    let mut parser = vt100::Parser::new(1, 1, 0);
+    parser.process(ch.to_string().as_bytes());
+    let font = fonts::load(fonts::DEFAULT_FONT);
+    let emoji = fonts::load_emoji();
+    let last_resort = fonts::load_last_resort();
+    let fset = FontSet {
+        primary: &font,
+        emoji: &emoji,
+        last_resort: &last_resort,
+        px: 16.0,
+    };
+    let grid = GridLayout {
+        cols: 1,
+        rows: 1,
+        cell_w: 6,
+        cell_h: 6,
+        ascent: 2.0,
+        default_bg: bg,
+    };
+    let mut report = FallbackReport::new();
+    render_cells(&parser, glyphs, &fset, &grid, &mut report)
+}
+
+/// A non-black background paints all three channels exactly: `bg[1]`/`bg[2]`
+/// mutants (wrong channel or zero) die on the exact pixel.
+#[test]
+fn render_cells_paints_non_black_background_exactly() {
+    let mut glyphs = HashMap::new();
+    let img = paint_one_cell(' ', [10, 20, 30], &mut glyphs);
+    assert_eq!(img.len(), 6 * 6 * 4);
+    // Blank cell: every pixel is exactly the background, alpha 255.
+    for y in 0..6 {
+        for x in 0..6 {
+            let p = (y * 6 + x) * 4;
+            assert_eq!(
+                [img[p], img[p + 1], img[p + 2], img[p + 3]],
+                [10, 20, 30, 255]
+            );
+        }
+    }
+}
+
+/// Zero-metric glyphs are skipped, never drawn: `||`->`&&` would draw the
+/// zero-width one and index its empty coverage out of bounds.
+#[test]
+fn render_cells_skips_zero_metric_glyphs() {
+    let mut glyphs = HashMap::new();
+    // Zero width, nonzero height: must be skipped, cell stays background.
+    glyphs.insert(
+        'A',
+        (
+            fontdue::Metrics {
+                xmin: 0,
+                ymin: 0,
+                width: 0,
+                height: 5,
+                advance_width: 0.0,
+                advance_height: 0.0,
+                bounds: fontdue::OutlineBounds {
+                    xmin: 0.0,
+                    ymin: 0.0,
+                    width: 0.0,
+                    height: 5.0,
+                },
+            },
+            Vec::new(),
+        ),
+    );
+    let img = paint_one_cell('A', [7, 8, 9], &mut glyphs);
+    for y in 0..6 {
+        for x in 0..6 {
+            let p = (y * 6 + x) * 4;
+            assert_eq!([img[p], img[p + 1], img[p + 2], img[p + 3]], [7, 8, 9, 255]);
+        }
+    }
+    // Zero height, nonzero width: same treatment.
+    let mut glyphs2 = HashMap::new();
+    glyphs2.insert(
+        'B',
+        (
+            fontdue::Metrics {
+                xmin: 0,
+                ymin: 0,
+                width: 5,
+                height: 0,
+                advance_width: 0.0,
+                advance_height: 0.0,
+                bounds: fontdue::OutlineBounds {
+                    xmin: 0.0,
+                    ymin: 0.0,
+                    width: 5.0,
+                    height: 0.0,
+                },
+            },
+            Vec::new(),
+        ),
+    );
+    let img2 = paint_one_cell('B', [7, 8, 9], &mut glyphs2);
+    for y in 0..6 {
+        for x in 0..6 {
+            let p = (y * 6 + x) * 4;
+            assert_eq!(
+                [img2[p], img2[p + 1], img2[p + 2], img2[p + 3]],
+                [7, 8, 9, 255]
+            );
+        }
+    }
 }

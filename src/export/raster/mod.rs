@@ -280,13 +280,25 @@ impl<'a> FrameSource<'a> {
             return None;
         }
         let t = self.frame as f64 * self.dt;
-        while self.ev_idx < self.rec.events.len() && self.rec.events[self.ev_idx].0 <= t {
-            self.parser
-                .process(self.rec.events[self.ev_idx].1.as_bytes());
-            self.ev_idx += 1;
-        }
+        self.feed_events_upto(t);
         self.frame += 1;
         Some(t)
+    }
+
+    /// Feed every recorded event at or before `t` into the parser, in order.
+    /// The count of events to feed is taken from the remaining slice in one
+    /// pass first, so feeding itself never has to re-check the timeline.
+    fn feed_events_upto(&mut self, t: f64) {
+        let start = self.ev_idx;
+        let take = self.rec.events[start..]
+            .iter()
+            .take_while(|e| e.0 <= t)
+            .count();
+        let end = start + take;
+        for ev in &self.rec.events[start..end] {
+            self.parser.process(ev.1.as_bytes());
+        }
+        self.ev_idx = end;
     }
 
     /// Render the next frame, or `None` once exhausted.
@@ -356,11 +368,7 @@ impl<'a> FrameSource<'a> {
             self.frame
         );
         let t = at as f64 * self.dt;
-        while self.ev_idx < self.rec.events.len() && self.rec.events[self.ev_idx].0 <= t {
-            self.parser
-                .process(self.rec.events[self.ev_idx].1.as_bytes());
-            self.ev_idx += 1;
-        }
+        self.feed_events_upto(t);
         self.frame = at;
     }
 
@@ -409,8 +417,13 @@ pub fn render_frames(
     mut on_frame: impl FnMut(&[u8]),
 ) -> Result<(Plan, FallbackReport)> {
     let mut source = FrameSource::new(rec, score)?;
-    while let Some(frame) = source.next_frame() {
-        on_frame(&frame);
+    // Bounded: the source yields exactly `n_frames` frames, so walk them by
+    // count — the walk ends on its own whatever the per-frame result is.
+    let n = source.n_frames();
+    for _ in 0..n {
+        if let Some(frame) = source.next_frame() {
+            on_frame(&frame);
+        }
     }
     let report = source.take_fallback_report();
     Ok((plan(rec, score), report))

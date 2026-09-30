@@ -1029,4 +1029,399 @@ mod tests {
         );
         let _ = std::fs::remove_file(cpath);
     }
+
+    // --- mutant-killing tests: every operator/branch in the diff must matter.
+
+    fn blank_meta() -> RawMeta {
+        RawMeta {
+            shell: String::new(),
+            cols: 80,
+            rows: 24,
+            idle_timeout_ms: 0,
+            resolution: None,
+            fps: None,
+            stage: None,
+            mute_spans: Vec::new(),
+        }
+    }
+
+    fn capture_args_in(dir: &std::path::Path, no_score: bool) -> CaptureArgs {
+        CaptureArgs {
+            rec: dir.join("demo.rec"),
+            idle_timeout_ms: 0,
+            shell: None,
+            into: None,
+            no_normalize: false,
+            debug: false,
+            output: None,
+            normalized_output: dir.join("demo.toml"),
+            no_score,
+            prompt: None,
+            keep_prompt: true,
+            font: None,
+            aspect: None,
+            quality: None,
+            fps: None,
+            resolution: None,
+            here: true,
+        }
+    }
+
+    /// finish_recording stamps drained reveals with the max OUTPUT time, not
+    /// zero and not the max over every event kind. Deleting the
+    /// `RawEvent::Output` arm would fall back to 0.
+    #[test]
+    fn finish_recording_drain_uses_max_output_time() {
+        let state = CaptureState::new();
+        state.events.lock().unwrap().push(RawEvent::Output {
+            t_ms: 100,
+            data: "early".into(),
+        });
+        state.events.lock().unwrap().push(RawEvent::Output {
+            t_ms: 2010,
+            data: "late".into(),
+        });
+        let t0 = Instant::now();
+        let out = finish_recording(&state, blank_meta(), t0);
+        // No pending queues, so events pass through unchanged.
+        assert_eq!(out.events.len(), 2);
+    }
+
+    /// finish_recording with a pending --after reveal stamps it with the
+    /// Output max (2010), proving the Output arm is read. Without that arm
+    /// the stamp would be 0.
+    #[test]
+    fn finish_recording_after_drain_stamped_with_output_max() {
+        let state = CaptureState::new();
+        state.events.lock().unwrap().push(RawEvent::Output {
+            t_ms: 2010,
+            data: "late".into(),
+        });
+        state.after_opens.lock().unwrap().push(Reveal {
+            panes: vec![RevealPane::terminal()],
+            orientation: Orientation::Horizontal,
+            hold_ms: None,
+            scroll: false,
+        });
+        let out = finish_recording(&state, blank_meta(), Instant::now());
+        assert_eq!(out.events.len(), 2, "drained reveal must be appended");
+        match &out.events[1] {
+            RawEvent::Reveal { t_ms, .. } => assert_eq!(
+                *t_ms, 2010,
+                "drain stamp must be the max Output time, not 0"
+            ),
+            other => panic!("expected Reveal, got {other:?}"),
+        }
+    }
+
+    /// write_score returns Some(exact normalized_output path) and writes the
+    /// file. `Ok(None)` and `Ok(Some(default))` mutants both die here.
+    #[test]
+    fn write_score_returns_some_exact_path_and_writes_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "demo-test-write-score-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let args = capture_args_in(&dir, false);
+        let raw = RawMacro {
+            meta: blank_meta(),
+            events: vec![],
+        };
+        let got = write_score(&args, &raw, "demo", false, "", "DejaVu Sans Mono", vec![]).unwrap();
+        assert_eq!(
+            got,
+            Some(dir.join("demo.toml")),
+            "must return the exact score path"
+        );
+        assert!(
+            dir.join("demo.toml").exists(),
+            "score file must actually be written"
+        );
+        assert!(
+            dir.join("demo.rec").exists(),
+            "faithful recording must be written"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// write_score with --no-score returns None and still writes the
+    /// recording. Kills `delete ! in write_score` at the no_score gate.
+    #[test]
+    fn write_score_no_score_returns_none_but_writes_recording() {
+        let dir = std::env::temp_dir().join(format!(
+            "demo-test-no-score-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let args = capture_args_in(&dir, true);
+        let raw = RawMacro {
+            meta: blank_meta(),
+            events: vec![],
+        };
+        let got = write_score(&args, &raw, "demo", false, "", "DejaVu Sans Mono", vec![]).unwrap();
+        assert_eq!(got, None, "--no-score must return None");
+        assert!(dir.join("demo.rec").exists(), "recording still written");
+        assert!(
+            !dir.join("demo.toml").exists(),
+            "no score file with --no-score"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An empty pane id falls back to "main"; a real id is kept. Deleting the
+    /// `!` in the emptiness filter would keep "" and drop "web".
+    #[test]
+    fn parse_reveal_empty_id_falls_back_to_main() {
+        let v = serde_json::json!({"cmd": "reveal", "panes": [{"id": ""}]});
+        let r = parse_reveal(&v).unwrap();
+        assert_eq!(r.panes[0].id, "main", "empty id must fall back to main");
+        let v2 = serde_json::json!({"cmd": "reveal", "panes": [{"id": "web"}]});
+        let r2 = parse_reveal(&v2).unwrap();
+        assert_eq!(r2.panes[0].id, "web", "non-empty id must be kept");
+    }
+
+    /// `reveal_begin` arms muting; `stop` disarms and returns the stop reason.
+    /// Deleting either match arm breaks this.
+    #[test]
+    fn read_control_reveal_begin_arms_muting_and_stop_returns_reason() {
+        let f = make_read_control_fixtures();
+        let mut read = 0u64;
+        std::fs::write(&f.cpath, "{\"cmd\":\"reveal_begin\"}\n").unwrap();
+        let stop = read_control(&f.cpath, &mut read, &f.io());
+        assert!(stop.is_none());
+        assert!(
+            f.muting.load(Ordering::SeqCst),
+            "reveal_begin must arm muting"
+        );
+        assert!(
+            f.mute_start.lock().unwrap().is_some(),
+            "reveal_begin must backdate a mute start"
+        );
+        std::fs::write(&f.cpath, "{\"cmd\":\"stop\"}\n").unwrap();
+        // Reset offset so the new line is read.
+        let mut read2 =
+            std::fs::metadata(&f.cpath).unwrap().len() - "{\"cmd\":\"stop\"}\n".len() as u64;
+        let stop2 = read_control(&f.cpath, &mut read2, &f.io());
+        assert_eq!(stop2, Some("demo stop"));
+        assert!(!f.muting.load(Ordering::SeqCst), "stop must disarm muting");
+        let _ = std::fs::remove_file(&f.cpath);
+    }
+
+    /// A reveal with `"when": ""` is immediate, not armed. Deleting the `!`
+    /// in the emptiness filter would arm it as a pending cue instead.
+    #[test]
+    fn read_control_empty_when_is_immediate_not_armed() {
+        let f = make_read_control_fixtures();
+        let mut read = 0u64;
+        let cmd = serde_json::json!({
+            "cmd": "reveal",
+            "panes": [{"id": "main"}],
+            "when": "",
+        });
+        std::fs::write(&f.cpath, serde_json::to_string(&cmd).unwrap()).unwrap();
+        let _ = read_control(&f.cpath, &mut read, &f.io());
+        assert_eq!(
+            f.events.lock().unwrap().len(),
+            1,
+            "empty when => immediate reveal"
+        );
+        assert!(
+            f.pending.lock().unwrap().is_empty(),
+            "nothing must be armed"
+        );
+        let _ = std::fs::remove_file(&f.cpath);
+    }
+
+    /// A reveal with a real `when` is armed, not immediate. Proves the same
+    /// filter from the other side (`&&`/`||` mutants).
+    #[test]
+    fn read_control_nonempty_when_is_armed_not_immediate() {
+        let f = make_read_control_fixtures();
+        let mut read = 0u64;
+        let cmd = serde_json::json!({
+            "cmd": "reveal",
+            "panes": [{"id": "main"}],
+            "when": "build ok",
+        });
+        std::fs::write(&f.cpath, serde_json::to_string(&cmd).unwrap()).unwrap();
+        let _ = read_control(&f.cpath, &mut read, &f.io());
+        assert!(f.events.lock().unwrap().is_empty());
+        assert_eq!(f.pending.lock().unwrap().len(), 1);
+        let _ = std::fs::remove_file(&f.cpath);
+    }
+
+    /// Sources from a pre-existing score file survive normalization: empty
+    /// existing sources leave the normalized ones alone, non-empty ones win.
+    /// Kills `delete !` / `&&`→`||` at both preservation gates.
+    #[test]
+    fn write_score_preserves_sources_from_existing_file() {
+        use crate::model::{Source, SourceKind};
+        let dir = std::env::temp_dir().join(format!(
+            "demo-test-preserve-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let existing_sources = vec![Source {
+            id: "docs".into(),
+            kind: SourceKind::Browser,
+            url: Some("https://x.example".into()),
+            theme: None,
+        }];
+        // Seed an existing score carrying sources.
+        let args = capture_args_in(&dir, false);
+        let raw = RawMacro {
+            meta: blank_meta(),
+            events: vec![],
+        };
+        let first = write_score(&args, &raw, "demo", false, "", "DejaVu Sans Mono", vec![])
+            .unwrap()
+            .unwrap();
+        let mut seeded = Score::load(&first).unwrap();
+        seeded.sources = existing_sources.clone();
+        seeded.save(&first).unwrap();
+        // Second run: normalized sources are empty, existing win.
+        let got = write_score(&args, &raw, "demo", false, "", "DejaVu Sans Mono", vec![])
+            .unwrap()
+            .unwrap();
+        let saved = Score::load(&got).unwrap();
+        assert_eq!(saved.sources, existing_sources, "existing sources must win");
+        // Empty existing sources: the normalized ones stand (here: none).
+        seeded.sources = Vec::new();
+        seeded.save(&first).unwrap();
+        let got2 = write_score(&args, &raw, "demo", false, "", "DejaVu Sans Mono", vec![])
+            .unwrap()
+            .unwrap();
+        let saved2 = Score::load(&got2).unwrap();
+        assert!(saved2.sources.is_empty(), "empty existing must not inject");
+        // Explicit sources land when no file exists yet.
+        let _ = std::fs::remove_file(&first);
+        let fresh_sources = vec![Source {
+            id: "term-src".into(),
+            kind: SourceKind::Terminal,
+            url: None,
+            theme: None,
+        }];
+        let got3 = write_score(
+            &args,
+            &raw,
+            "demo",
+            false,
+            "",
+            "DejaVu Sans Mono",
+            fresh_sources.clone(),
+        )
+        .unwrap()
+        .unwrap();
+        let saved3 = Score::load(&got3).unwrap();
+        assert_eq!(saved3.sources, fresh_sources, "explicit sources must land");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With `--into`, a stage score that already carries sources keeps them:
+    /// explicit sources must not overwrite a non-empty score. `&&`->`||`
+    /// would overwrite and die here.
+    #[test]
+    fn write_score_into_keeps_stage_sources_over_explicit_ones() {
+        use crate::model::{Source, SourceKind};
+        let dir = std::env::temp_dir().join(format!(
+            "demo-test-into-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stage_sources = vec![Source {
+            id: "stage-docs".into(),
+            kind: SourceKind::Browser,
+            url: Some("https://stage.example".into()),
+            theme: None,
+        }];
+        let stage_path = dir.join("stage.toml");
+        let mut stage: Score = toml::from_str(
+            r#"
+[demo]
+name = "stage"
+[layout]
+width = 100
+height = 100
+  [[layout.panes]]
+  id = "c"
+  type = "terminal"
+  x = 0
+  y = 0
+  width = 100
+  height = 100
+"#,
+        )
+        .unwrap();
+        stage.sources = stage_sources.clone();
+        stage.save(&stage_path).unwrap();
+        let mut args = capture_args_in(&dir, false);
+        args.into = Some(stage_path);
+        let raw = RawMacro {
+            meta: blank_meta(),
+            events: vec![],
+        };
+        let explicit = vec![Source {
+            id: "other".into(),
+            kind: SourceKind::Terminal,
+            url: None,
+            theme: None,
+        }];
+        let got = write_score(&args, &raw, "demo", false, "", "DejaVu Sans Mono", explicit)
+            .unwrap()
+            .unwrap();
+        let saved = Score::load(&got).unwrap();
+        assert_eq!(saved.sources, stage_sources, "stage sources must win");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// write_faithful_cast writes a non-empty recording; the score name is
+    /// used when given and "demo" otherwise. `Ok(())`-without-write dies.
+    #[test]
+    fn write_faithful_cast_writes_named_recording() {
+        let dir = std::env::temp_dir().join(format!(
+            "demo-test-faithful-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = RawMacro {
+            meta: blank_meta(),
+            events: vec![RawEvent::Output {
+                t_ms: 10,
+                data: "hi".into(),
+            }],
+        };
+        let path = dir.join("sub").join("out.rec");
+        write_faithful_cast(&raw, None, &path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(!bytes.is_empty(), "cast file must have content");
+        // Bare filename (empty parent) must also work, not error.
+        let _cwd_guard = super::super::CWD_LOCK.lock().unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        write_faithful_cast(&raw, None, std::path::Path::new("bare.rec")).unwrap();
+        assert!(dir.join("bare.rec").exists());
+        std::env::set_current_dir(cwd).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

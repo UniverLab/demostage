@@ -122,12 +122,18 @@ struct StepRunner<'a> {
 fn press_key_step(key: &str, pty: &mut CapturePty, events: &mut Vec<(f64, String)>, t0: Instant) {
     let _ = pty.writer.write_all(&key_to_bytes(key));
     let _ = pty.writer.flush();
-    let delay = if key == "esc" || key == "escape" {
+    let delay = key_delay(key);
+    sleep_collecting(delay, events, &pty.rx, t0);
+}
+
+/// Settle delay after a keypress: TUIs need extra time for ESC. Pure so the
+/// exact choice of arms is unit-testable without a live PTY.
+fn key_delay(key: &str) -> u64 {
+    if key == "esc" || key == "escape" {
         200
     } else {
         60
-    };
-    sleep_collecting(delay, events, &pty.rx, t0);
+    }
 }
 
 /// Apply one timeline step, appending to the runner's captures.
@@ -239,8 +245,9 @@ fn drive_timeline(
     sleep_collecting(120, &mut runner.events, &runner.pty.rx, t0);
 
     let total_steps = score.timeline.len();
-    for (step_idx, step) in score.timeline.iter().enumerate() {
-        progress_bar("recording", step_idx + 1, total_steps);
+    let mut progress = Progress::new("recording", total_steps);
+    for step in score.timeline.iter() {
+        progress.tick();
         if !apply_step(step, &mut runner) {
             break;
         }
@@ -535,6 +542,27 @@ pub fn progress_bar(label: &str, current: usize, total: usize) {
     let filled = (pct * WIDTH) / 100;
     let bar: String = "█".repeat(filled) + &"░".repeat(WIDTH - filled);
     eprint!("\r  {label} [{bar}] {pct:>3}%");
+}
+
+/// A per-frame progress counter for render loops: counts emitted frames and
+/// redraws the bar, so the `+ 1` step is unit-testable without rendering.
+pub(crate) struct Progress {
+    n: usize,
+    total: usize,
+    label: &'static str,
+}
+
+impl Progress {
+    pub(crate) fn new(label: &'static str, total: usize) -> Self {
+        Progress { n: 0, total, label }
+    }
+
+    /// Record one more emitted frame: redraws the bar and returns the new count.
+    pub(crate) fn tick(&mut self) -> usize {
+        self.n += 1;
+        progress_bar(self.label, self.n, self.total);
+        self.n
+    }
 }
 
 /// Clear the progress bar line.
@@ -899,6 +927,17 @@ mod tests {
         progress_bar("test", 0, 0);
     }
 
+    /// Progress counts every tick exactly: `+=`→`*=` sticks at 0, `+=`→`-=`
+    /// panics, both die on the exact sequence.
+    #[test]
+    fn progress_tick_counts_each_frame() {
+        let mut p = Progress::new("test", 3);
+        assert_eq!(p.tick(), 1);
+        assert_eq!(p.tick(), 2);
+        assert_eq!(p.tick(), 3);
+        assert_eq!(p.tick(), 4, "ticks keep counting past the total");
+    }
+
     #[test]
     fn collect_secrets_without_secret_steps_prompts_nothing() {
         // No `secret` steps → the inquire password prompts are never built,
@@ -1093,5 +1132,144 @@ duration_ms = 200
             "teardown hung: took {elapsed:?}"
         );
         assert_eq!(rec.cols, 80);
+    }
+
+    // --- mutant-killing tests: key delay arms, step dispatch, timeline stop,
+    // screen-parser init ---
+
+    /// ESC gets the long TUI settle; every other key gets the short one.
+    /// `==`→`!=` and `||`→`&&` both misroute "esc"/"escape"/"a" here.
+    #[test]
+    fn key_delay_gives_esc_extra_settle_time() {
+        assert_eq!(key_delay("esc"), 200);
+        assert_eq!(key_delay("escape"), 200);
+        assert_eq!(key_delay("a"), 60);
+        assert_eq!(key_delay("enter"), 60);
+        assert_eq!(key_delay("up"), 60);
+        assert_eq!(key_delay("ESC"), 60, "matching is case-sensitive");
+    }
+
+    fn live_score(timeline: &str) -> Score {
+        toml::from_str(&format!(
+            r#"
+[demo]
+name = "live"
+[layout]
+width = 800
+height = 400
+  [[layout.panes]]
+  id = "c"
+  type = "terminal"
+  x = 0
+  y = 0
+  width = 800
+  height = 400
+{timeline}"#,
+        ))
+        .unwrap()
+    }
+
+    fn live_runner<'a>(
+        pty: &'a mut CapturePty,
+        secrets: &'a std::collections::HashMap<String, String>,
+        typing: crate::model::Typing,
+        rng: Rng,
+        events: Vec<(f64, String)>,
+        t0: Instant,
+    ) -> StepRunner<'a> {
+        let (rows, cols) = (pty.rows, pty.cols);
+        StepRunner {
+            pty,
+            secrets,
+            typing,
+            rng,
+            events,
+            captions: Vec::new(),
+            focuses: Vec::new(),
+            screen: ScreenWait {
+                parser: None,
+                fed: 0,
+                rows,
+                cols,
+            },
+            t0,
+        }
+    }
+
+    /// apply_step dispatches Focus/Caption/Terminate: the first two record and
+    /// continue, Terminate stops. `->false`/`->true` mutants die on the return.
+    #[test]
+    fn apply_step_dispatches_focus_caption_and_terminate() {
+        let score = live_score("");
+        let mut pty = CapturePty::new(&score, &score.layout.panes[0]).unwrap();
+        let secrets = std::collections::HashMap::new();
+        let t0 = Instant::now();
+        let mut runner = live_runner(
+            &mut pty,
+            &secrets,
+            crate::model::Typing::default(),
+            Rng::new(0),
+            Vec::new(),
+            t0,
+        );
+        assert!(apply_step(
+            &Step::Focus {
+                pane: Some("docs".into())
+            },
+            &mut runner
+        ));
+        assert_eq!(
+            runner.focuses,
+            vec![(runner.focuses[0].0, "docs".to_string())]
+        );
+        assert!(apply_step(
+            &Step::Caption { text: "hi".into() },
+            &mut runner
+        ));
+        assert_eq!(runner.captions.len(), 1);
+        assert_eq!(runner.captions[0].1, "hi");
+        assert!(!apply_step(&Step::Terminate, &mut runner));
+    }
+
+    /// drive_timeline stops at Terminate: later steps never run, and the run
+    /// still produces its captures (not a default). Kills `->Default` and the
+    /// `!` on the stop gate.
+    #[test]
+    fn drive_timeline_stops_at_terminate() {
+        let score = live_score(
+            r#"
+[[timeline]]
+action = "focus"
+pane = "first"
+[[timeline]]
+action = "terminate"
+[[timeline]]
+action = "focus"
+pane = "never"
+"#,
+        );
+        let mut pty = CapturePty::new(&score, &score.layout.panes[0]).unwrap();
+        let secrets = std::collections::HashMap::new();
+        let caps = drive_timeline(&score, &mut pty, &secrets, Instant::now());
+        let panes: Vec<&str> = caps.focuses.iter().map(|(_, p)| p.as_str()).collect();
+        assert_eq!(panes, vec!["first"], "steps after Terminate must not run");
+    }
+
+    /// wait_for_screen with the pattern already in events returns with the
+    /// parser initialized and fed — without touching the channel. `with ()`
+    /// leaves the parser None and dies here.
+    #[test]
+    fn wait_for_screen_initializes_parser_from_prior_events() {
+        let mut events = vec![(0.0, "hello world".to_string())];
+        let (_tx, rx) = std::sync::mpsc::channel::<(Instant, Vec<u8>)>();
+        let mut screen = ScreenWait {
+            parser: None,
+            fed: 0,
+            rows: 24,
+            cols: 80,
+        };
+        wait_for_screen("hello", &mut events, &rx, Instant::now(), &mut screen, 500);
+        assert!(screen.parser.is_some(), "parser must be initialized");
+        assert_eq!(screen.fed, events.len());
     }
 }

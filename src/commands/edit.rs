@@ -147,10 +147,16 @@ fn apply_action(score: &mut Score, indices: &[usize]) -> Result<Option<usize>> {
 /// step. Returns the new cursor position.
 fn insert_step(score: &mut Score, indices: &[usize]) -> Result<usize> {
     let new_step = ask_insert_step()?;
-    let insert_at = indices[0] + 1;
+    let insert_at = insert_position(indices);
     score.timeline.insert(insert_at, new_step);
     println!("  ✓ inserted after step {}\n", indices[0] + 1);
     Ok(insert_at)
+}
+
+/// Pure insertion index for [`insert_step`], so the `+ 1` is testable
+/// without a TTY.
+fn insert_position(indices: &[usize]) -> usize {
+    indices[0] + 1
 }
 
 /// Replace the key of every selected `keypress` step with the key the user
@@ -963,5 +969,53 @@ mod tests {
         do_split(&mut timeline, 0, ",", false, "a,b,c").unwrap();
         // "a,b,c" split by "," → ["a,", "b,", "c"] → 3 steps
         assert!(timeline.len() >= 3);
+    }
+
+    /// delete_steps removes exactly the selected indices, back to front, so
+    /// earlier indices stay valid. `Ok(())`-without-removal dies here.
+    #[test]
+    fn delete_steps_removes_exactly_the_selected() {
+        let mut score: Score = toml::from_str(
+            r#"
+[demo]
+name = "t"
+[layout]
+width = 100
+height = 100
+  [[layout.panes]]
+  id = "c"
+  type = "terminal"
+  x = 0
+  y = 0
+  width = 100
+  height = 100
+[[timeline]]
+action = "type"
+text = "a"
+[[timeline]]
+action = "type"
+text = "b"
+[[timeline]]
+action = "type"
+text = "c"
+"#,
+        )
+        .unwrap();
+        assert_eq!(score.timeline.len(), 3);
+        delete_steps(&mut score, &[0, 2]).unwrap();
+        assert_eq!(score.timeline.len(), 1, "two of three steps must go");
+        match &score.timeline[0] {
+            Step::Type { text, .. } => assert_eq!(text, "b", "middle step survives"),
+            other => panic!("expected Type, got {other:?}"),
+        }
+    }
+
+    /// Pure splice used by insert_step, so the `indices[0] + 1` position is
+    /// pinned without a TTY: `+`→`*` inserts at 0, `+`→`-` at the cursor.
+    #[test]
+    fn splice_position_is_right_after_the_cursor() {
+        assert_eq!(insert_position(&[0]), 1);
+        assert_eq!(insert_position(&[2]), 3);
+        assert_eq!(insert_position(&[5]), 6);
     }
 }

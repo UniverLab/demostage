@@ -77,6 +77,13 @@ const AFTER_QUIET_MS: u64 = 800;
 /// by this much so the wizard's first lines (already printed) are still removed.
 const OPEN_BEGIN_BACKDATE_MS: u64 = 800;
 
+/// Serializes tests that change the process working directory (creating a
+/// control file / bare recording by relative name). Cargo runs tests as
+/// threads in one process, so two chdir tests overlapping would land in
+/// each other's directory.
+#[cfg(test)]
+pub(super) static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn ms(t0: Instant) -> u64 {
     t0.elapsed().as_millis() as u64
 }
@@ -240,5 +247,19 @@ mod tests {
         let content = std::fs::read_to_string(&log_path).unwrap();
         assert!(content.contains("0B"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ms() returns elapsed milliseconds, not 1 and not micros: 1.5s ago
+    /// reads ~1500. Kills `replace ms with 1`.
+    #[test]
+    fn ms_returns_elapsed_millis() {
+        let t0 = Instant::now() - std::time::Duration::from_millis(1500);
+        let got = ms(t0);
+        assert!(
+            (1400..1700).contains(&got),
+            "ms must be ~1500 for a 1.5s-old t0, got {got}"
+        );
+        // Monotonic: a later call reads >= an earlier one.
+        assert!(ms(t0) >= got);
     }
 }

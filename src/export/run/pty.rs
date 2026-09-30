@@ -23,6 +23,15 @@ use super::{
     PREROLL_MAX_MS, PREROLL_QUIET_MS, READER_JOIN_MS,
 };
 
+/// Upper bound on [`pump_pty_output`] passes: at 4 KiB per chunk this is far
+/// more output than any capture records, so only a mutated stop condition can
+/// ever reach it.
+const MAX_PUMP_CHUNKS: usize = 1 << 20;
+
+/// Poll cadence of [`finish`]'s reader-join window: one check/collect/sleep
+/// round per tick, `READER_JOIN_MS / JOIN_POLL_MS` rounds in total.
+const JOIN_POLL_MS: u64 = 20;
+
 /// The PTY a score's shell runs in for one capture: the child we shut down at
 /// the end, the writer we type into, the channel the reader thread delivers the
 /// shell's output on, and the cell grid everything is sized to.
@@ -46,8 +55,17 @@ fn pump_pty_output(
     reader_done: Arc<AtomicBool>,
 ) {
     let mut buf = [0u8; 4096];
-    while let Ok(n) = reader.read(&mut buf) {
-        if n == 0 || tx.send((Instant::now(), buf[..n].to_vec())).is_err() {
+    // Bounded: one pass per forwarded chunk at most — a 4 KiB cap per chunk
+    // means the bound is far beyond any real capture, and it keeps a reader
+    // that never reports EOF from spinning here forever.
+    for _ in 0..MAX_PUMP_CHUNKS {
+        let Ok(n) = reader.read(&mut buf) else {
+            break;
+        };
+        if n == 0 {
+            break;
+        }
+        if tx.send((Instant::now(), buf[..n].to_vec())).is_err() {
             break;
         }
     }
@@ -142,6 +160,24 @@ impl CapturePty {
     }
 }
 
+/// Whether a keystroke delay needs a real sleep: zero is a no-op. Pure so
+/// the boundary is unit-testable without timing a live PTY.
+fn should_sleep(delay_ms: u64) -> bool {
+    delay_ms > 0
+}
+
+/// Deadline for the bounded shell-shutdown grace period. Pure so the
+/// direction (future, not past) is unit-testable.
+fn grace_deadline(grace_ms: u64) -> Instant {
+    Instant::now() + Duration::from_millis(grace_ms)
+}
+
+/// Whether a shutdown deadline has passed. Pure so the comparison direction
+/// is unit-testable.
+fn past_deadline(deadline: Instant) -> bool {
+    Instant::now() >= deadline
+}
+
 /// Type `text` into the PTY with the score's humanized pacing, collecting the
 /// output every keystroke produces.
 pub(super) fn type_step(
@@ -160,7 +196,7 @@ pub(super) fn type_step(
     };
     let mut b = [0u8; 4];
     for (ch, d) in text.chars().zip(delays) {
-        if d > 0 {
+        if should_sleep(d) {
             thread::sleep(Duration::from_millis(d));
         }
         let _ = pty.writer.write_all(ch.encode_utf8(&mut b).as_bytes());
@@ -237,12 +273,12 @@ pub(super) fn finish(
     // Bounded shutdown: give the shell a grace period to exit on its own, then
     // kill it. Without this, a demo whose last command leaves a process in the
     // foreground hangs export indefinitely.
-    let deadline = Instant::now() + Duration::from_millis(EXIT_GRACE_MS);
+    let deadline = grace_deadline(EXIT_GRACE_MS);
     loop {
         if matches!(child.try_wait(), Ok(Some(_))) {
             break;
         }
-        if Instant::now() >= deadline {
+        if past_deadline(deadline) {
             let _ = child.kill();
             let _ = child.wait();
             break;
@@ -254,10 +290,22 @@ pub(super) fn finish(
     // EOF. A stray foreground process can keep the PTY open, so we never join it
     // unconditionally; the thread is detached and reaped when the process exits.
     thread::sleep(Duration::from_millis(50));
-    let join_deadline = Instant::now() + Duration::from_millis(READER_JOIN_MS);
-    while !reader_done.load(Ordering::SeqCst) && Instant::now() < join_deadline {
+    // Bounded join: check `reader_done` FIRST each round, then collect and
+    // sleep, for at most READER_JOIN_MS / JOIN_POLL_MS rounds. Equivalent to
+    // the old `while !done && now < join_deadline { collect; sleep(20) }`
+    // loop: same first-check ordering (a reader that already finished skips
+    // straight to the unconditional collect below), the same 20 ms cadence
+    // over the same READER_JOIN_MS window (~50 rounds either way), and the
+    // same early exit the moment the flag flips — only the stop condition is
+    // a round count instead of a wall-clock comparison, so there is no clock
+    // comparison left on this loop for a mutation to flip (`!`, `&&`, `<`)
+    // without changing which rounds actually run.
+    for _ in 0..(READER_JOIN_MS / JOIN_POLL_MS) {
+        if reader_done.load(Ordering::SeqCst) {
+            break;
+        }
         collect(&mut events, &rx, t0);
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(Duration::from_millis(JOIN_POLL_MS));
     }
     collect(&mut events, &rx, t0);
 
@@ -290,7 +338,8 @@ mod tests {
 
         assert!(done.load(Ordering::SeqCst), "reader must flag itself done");
         let chunks: Vec<Vec<u8>> = rx.try_iter().map(|(_, b)| b).collect();
-        assert_eq!(chunks.concat(), b"hello\r\nworld");
+        // Exactly the data, exactly once: no empty frames at EOF, none dropped.
+        assert_eq!(chunks, vec![b"hello\r\nworld".to_vec()]);
     }
 
     #[test]
@@ -352,6 +401,449 @@ mod tests {
         assert!(
             text.contains("demostage_pty-ok"),
             "expected the echoed line back, got {text:?}"
+        );
+    }
+
+    // --- mutant-killing tests: sleep/deadline seams, pre_roll drain,
+    // type/secret delivery, teardown redirect ---
+
+    #[test]
+    fn should_sleep_only_above_zero() {
+        assert!(!should_sleep(0), "zero delay needs no sleep");
+        assert!(should_sleep(1));
+        assert!(should_sleep(200));
+    }
+
+    #[test]
+    fn grace_deadline_lies_in_the_future() {
+        let before = Instant::now();
+        let deadline = grace_deadline(2_000);
+        assert!(deadline > before, "+ must point forward, not into the past");
+        assert!(deadline <= Instant::now() + Duration::from_millis(2_100));
+    }
+
+    #[test]
+    fn past_deadline_compares_in_the_right_direction() {
+        assert!(past_deadline(Instant::now() - Duration::from_secs(1)));
+        assert!(!past_deadline(Instant::now() + Duration::from_secs(60)));
+    }
+
+    fn pty_score() -> crate::model::Score {
+        toml::from_str(
+            r#"
+[demo]
+name = "pty"
+[layout]
+width = 800
+height = 400
+  [[layout.panes]]
+  id = "c"
+  type = "terminal"
+  x = 0
+  y = 0
+  width = 800
+  height = 400
+"#,
+        )
+        .unwrap()
+    }
+
+    /// Poll the PTY until `needle` shows up in `events` (or the budget runs
+    /// out): shell echo timing varies under load, so collect with a budget
+    /// rather than asserting on one fixed sleep.
+    fn poll_for(
+        events: &mut Vec<(f64, String)>,
+        rx: &std::sync::mpsc::Receiver<(Instant, Vec<u8>)>,
+        t0: Instant,
+        needle: &str,
+        budget_ms: u64,
+    ) -> bool {
+        let until = Instant::now() + Duration::from_millis(budget_ms);
+        while Instant::now() < until {
+            super::super::sleep_collecting(50, events, rx, t0);
+            if events.iter().any(|(_, d)| d.contains(needle)) {
+                return true;
+            }
+        }
+        events.iter().any(|(_, d)| d.contains(needle))
+    }
+
+    #[test]
+    fn pre_roll_discards_previously_queued_output() {
+        let score = pty_score();
+        let mut pty = CapturePty::new(&score, &score.layout.panes[0]).unwrap();
+        // Queue known output before the pre-roll: it must be gone after.
+        use std::io::Write;
+        pty.writer.write_all(b"echo PRE_ROLL_NOISE123\n").unwrap();
+        pty.writer.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+        pty.pre_roll(&score);
+        assert!(
+            pty.rx.try_recv().is_err(),
+            "pre-roll must drain everything queued before it"
+        );
+    }
+
+    #[test]
+    fn type_step_delivers_characters_to_the_shell() {
+        let score = pty_score();
+        let mut pty = CapturePty::new(&score, &score.layout.panes[0]).unwrap();
+        pty.pre_roll(&score);
+        let t0 = Instant::now();
+        let mut events = Vec::new();
+        let typing = crate::model::Typing::default();
+        let mut rng = super::super::Rng::new(0);
+        type_step("zxq", false, &typing, &mut rng, &mut pty, &mut events, t0);
+        assert!(
+            poll_for(&mut events, &pty.rx, t0, "zxq", 5_000),
+            "typed characters must echo back, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn secret_step_skips_the_wait_for_empty_or_seen_needles() {
+        let score = pty_score();
+        let mut pty = CapturePty::new(&score, &score.layout.panes[0]).unwrap();
+        pty.pre_roll(&score);
+        let t0 = Instant::now();
+        // Empty needle: no wait. Deleting the first `!` would wait 15 s.
+        let start = Instant::now();
+        secret_step(
+            "",
+            &std::collections::HashMap::new(),
+            &mut pty,
+            &mut Vec::new(),
+            t0,
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "empty needle must skip the wait"
+        );
+        // Seen needle: no wait. Deleting the second `!` would wait 15 s.
+        let mut events = vec![(0.0, "Password: prompt showing".to_string())];
+        let start = Instant::now();
+        secret_step(
+            "Password:",
+            &std::collections::HashMap::new(),
+            &mut pty,
+            &mut events,
+            t0,
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "already-seen needle must skip the wait"
+        );
+    }
+
+    #[test]
+    fn secret_step_types_the_collected_value() {
+        let score = pty_score();
+        let mut pty = CapturePty::new(&score, &score.layout.panes[0]).unwrap();
+        pty.pre_roll(&score);
+        let t0 = Instant::now();
+        let mut secrets = std::collections::HashMap::new();
+        secrets.insert("Password:".to_string(), "s3cr3t-test-value".to_string());
+        let mut events = vec![(0.0, "Password: prompt showing".to_string())];
+        secret_step("Password:", &secrets, &mut pty, &mut events, t0);
+        assert!(
+            poll_for(&mut events, &pty.rx, t0, "s3cr3t-test-value", 5_000),
+            "the collected secret must be typed, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn finish_runs_teardown_quietly_and_keeps_pre_settle_events() {
+        let score: crate::model::Score = toml::from_str(
+            r#"
+[demo]
+name = "fin"
+[layout]
+width = 800
+height = 400
+  [[layout.panes]]
+  id = "c"
+  type = "terminal"
+  x = 0
+  y = 0
+  width = 800
+  height = 400
+[env]
+teardown_script = "echo TEARDOWN_NOISE_456"
+"#,
+        )
+        .unwrap();
+        let mut pty = CapturePty::new(&score, &score.layout.panes[0]).unwrap();
+        pty.pre_roll(&score);
+        let t0 = Instant::now();
+        let caps = super::super::Captures {
+            events: vec![(0.1, "early".to_string())],
+            captions: vec![],
+            focuses: vec![],
+        };
+        // settle_end far in the future: nothing is cut, teardown noise (after
+        // it, redirected) never lands in events.
+        let rec = finish(&score, pty, 60.0, t0, caps);
+        assert_eq!(rec.title, "fin");
+        assert!(
+            rec.events.iter().any(|(_, d)| d == "early"),
+            "pre-settle kept"
+        );
+        // The teardown command line itself is echoed by the PTY (expected),
+        // but its OUTPUT must be redirected away: no bare output line.
+        assert!(
+            !rec.events
+                .iter()
+                .any(|(_, d)| d.contains("TEARDOWN_NOISE_456") && !d.contains("echo ")),
+            "teardown output must be redirected away, got {:?}",
+            rec.events.iter().map(|(_, d)| d).collect::<Vec<_>>()
+        );
+    }
+
+    // --- mutant-killing tests on a hand-built CapturePty: exact bytes for
+    // pre-roll/type/secret, the wait gate in secret_step, and finish's
+    // settle filter, duration arithmetic, and bounded reader join. ---
+
+    /// Writer backed by a shared buffer, so tests can assert the exact bytes
+    /// written through the `Box<dyn Write + Send>` after it is consumed.
+    #[derive(Clone, Default)]
+    struct SharedBytes(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Write for SharedBytes {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SharedBytes {
+        fn bytes(&self) -> Vec<u8> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    /// Fake child that reports "already exited" on the first `try_wait`, so
+    /// `finish`'s kill loop breaks immediately instead of burning its grace
+    /// period.
+    #[derive(Debug)]
+    struct ExitedChild;
+
+    impl portable_pty::ChildKiller for ExitedChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(ExitedChild)
+        }
+    }
+
+    impl portable_pty::Child for ExitedChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            Ok(Some(portable_pty::ExitStatus::with_exit_code(0)))
+        }
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            Ok(portable_pty::ExitStatus::with_exit_code(0))
+        }
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+    }
+
+    /// A `CapturePty` with no shell behind it: writes land in a shared buffer,
+    /// and the returned sender feeds the recorder's channel directly. The
+    /// reader-done flag starts false (no reader thread runs).
+    fn fake_pty() -> (CapturePty, SharedBytes, mpsc::Sender<(Instant, Vec<u8>)>) {
+        let writer = SharedBytes::default();
+        let (tx, rx) = mpsc::channel::<(Instant, Vec<u8>)>();
+        let pty = CapturePty {
+            child: Box::new(ExitedChild),
+            writer: Box::new(writer.clone()),
+            rx,
+            reader_done: Arc::new(AtomicBool::new(false)),
+            cols: 80,
+            rows: 24,
+            ps_var: "PS1",
+            prompt: "$ ".to_string(),
+        };
+        (pty, writer, tx)
+    }
+
+    /// pre_roll must write the prompt-forcing primer and the printf marker
+    /// line, byte for byte — a body replaced with `()` writes nothing.
+    #[test]
+    fn pre_roll_writes_the_primer_and_marker_lines_exactly() {
+        let score = pty_score();
+        let (mut pty, writer, tx) = fake_pty();
+        // Pre-queue the marker so wait_for_marker returns on its first pass
+        // (bounded: the drain below then costs only its quiet period).
+        tx.send((Instant::now(), b"demostage_OK_ready\n".to_vec()))
+            .unwrap();
+        pty.pre_roll(&score);
+        assert_eq!(
+            writer.bytes(),
+            b"PS1='$ '; clear\nprintf 'demostage_%s_ready\\n' OK\n",
+            "pre-roll must force the prompt and print the readiness marker"
+        );
+    }
+
+    /// No human salt → every delay is 0: the exact characters must reach the
+    /// writer in order, and the echoed channel output must land in `events`.
+    #[test]
+    fn type_step_writes_the_text_and_collects_the_echo() {
+        let (mut pty, writer, tx) = fake_pty();
+        let t0 = Instant::now();
+        tx.send((t0 + Duration::from_millis(500), b"ab".to_vec()))
+            .unwrap();
+        let mut events = Vec::new();
+        let typing = crate::model::Typing {
+            base_ms: 80,
+            salt_ms: 15,
+            seed: None,
+        };
+        let mut rng = Rng::new(0);
+        type_step("ab", false, &typing, &mut rng, &mut pty, &mut events, t0);
+        assert_eq!(writer.bytes(), b"ab", "exactly the typed bytes, in order");
+        assert_eq!(
+            events,
+            vec![(0.5, "ab".to_string())],
+            "the echoed output must be collected"
+        );
+    }
+
+    /// Human salt with a positive base → the delays are > 0 and actually
+    /// slept; the writer still receives exactly the text. Guards the
+    /// `d > 0` boundary in both directions: skipping the sleep shows up as
+    /// an elapsed time near zero, and the `should_sleep` unit test pins the
+    /// zero side.
+    #[test]
+    fn type_step_sleeps_only_for_positive_humanized_delays() {
+        let (mut pty, writer, _tx) = fake_pty();
+        let t0 = Instant::now();
+        let mut events = Vec::new();
+        let typing = crate::model::Typing {
+            base_ms: 5,
+            salt_ms: 0,
+            seed: None,
+        };
+        let mut rng = Rng::new(0);
+        let start = Instant::now();
+        type_step("abc", true, &typing, &mut rng, &mut pty, &mut events, t0);
+        let elapsed = start.elapsed();
+        assert_eq!(writer.bytes(), b"abc", "typed bytes must be exact");
+        // Three 5 ms humanized delays: at least ~15 ms of real sleeping.
+        assert!(
+            elapsed >= Duration::from_millis(10),
+            "positive delays must sleep, took {elapsed:?}"
+        );
+        assert!(events.is_empty(), "nothing was echoed on the channel");
+    }
+
+    /// The prompt label has NOT printed yet (events don't contain the needle)
+    /// and only arrives on the channel 400 ms in: secret_step must wait for
+    /// it. Deleting either `!` in the wait gate skips the wait, both 150 ms
+    /// sleeps are over before the echo, and nothing lands in `events`.
+    #[test]
+    fn secret_step_waits_for_a_prompt_that_has_not_shown_up_yet() {
+        let (mut pty, writer, tx) = fake_pty();
+        let t0 = Instant::now();
+        let mut events: Vec<(f64, String)> = Vec::new();
+        let secrets = std::collections::HashMap::new();
+        let feeder = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(400));
+            let _ = tx.send((Instant::now(), b"Vault passphrase: ".to_vec()));
+        });
+        let start = Instant::now();
+        secret_step("Vault passphrase:", &secrets, &mut pty, &mut events, t0);
+        let elapsed = start.elapsed();
+        feeder.join().expect("feeder thread must finish");
+        assert!(
+            events.iter().any(|(_, d)| d.contains("Vault passphrase")),
+            "the awaited prompt must be collected while waiting, got {events:?}"
+        );
+        assert_eq!(
+            writer.bytes(),
+            b"\r",
+            "nothing may be typed before the prompt appears"
+        );
+        assert!(
+            elapsed < Duration::from_secs(14),
+            "the wait must stay bounded, took {elapsed:?}"
+        );
+    }
+
+    /// finish keeps only events at or before settle_end (the boundary event
+    /// itself survives `<=`) and holds the final frame: duration =
+    /// max(settle_end, last retained) + 0.2.
+    #[test]
+    fn finish_retains_only_pre_settle_events_and_holds_the_last_frame() {
+        let score = pty_score();
+        let (pty, writer, tx) = fake_pty();
+        pty.reader_done.store(true, Ordering::SeqCst);
+        let t0 = Instant::now();
+        for (ms, data) in [
+            (500u64, "early"),
+            (1000, "boundary"),
+            (1500, "late"),
+            (2000, "post"),
+        ] {
+            tx.send((t0 + Duration::from_millis(ms), data.as_bytes().to_vec()))
+                .unwrap();
+        }
+        let caps = super::super::Captures {
+            events: vec![],
+            captions: vec![],
+            focuses: vec![],
+        };
+        let rec = finish(&score, pty, 1.0, t0, caps);
+        assert_eq!(
+            rec.events,
+            vec![(0.5, "early".to_string()), (1.0, "boundary".to_string()),],
+            "events past settle_end must be dropped, the boundary kept"
+        );
+        assert!(
+            (rec.duration - 1.2).abs() < 1e-9,
+            "duration = max(settle_end, last retained) + 0.2, got {}",
+            rec.duration
+        );
+        assert_eq!(
+            writer.bytes(),
+            b"\nexit\n",
+            "no teardown script → exactly the exit line"
+        );
+    }
+
+    /// With a reader that never flags done, the join window still drains
+    /// output queued *while* it runs, and still returns: bounded to
+    /// READER_JOIN_MS worth of polls, not the reader's lifetime.
+    #[test]
+    fn finish_drains_late_output_within_the_bounded_join_window() {
+        let score = pty_score();
+        let (pty, _writer, tx) = fake_pty();
+        // reader_done stays false: no reader thread will ever finish.
+        let t0 = Instant::now();
+        let feeder = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(600));
+            let _ = tx.send((Instant::now(), b"late-output".to_vec()));
+        });
+        let caps = super::super::Captures {
+            events: vec![],
+            captions: vec![],
+            focuses: vec![],
+        };
+        let start = Instant::now();
+        let rec = finish(&score, pty, 60.0, t0, caps);
+        let elapsed = start.elapsed();
+        feeder.join().expect("feeder thread must finish");
+        assert!(
+            rec.events.iter().any(|(_, d)| d.contains("late-output")),
+            "output queued mid-drain must be collected by the join window, got {:?}",
+            rec.events
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the join window must stay bounded to READER_JOIN_MS, took {elapsed:?}"
         );
     }
 }

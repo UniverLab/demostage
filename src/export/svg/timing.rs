@@ -121,3 +121,130 @@ fn merge_stop(stops: &mut Vec<(f64, u8)>, opacity: u8) {
         last.1 = opacity;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keygen_names_are_fresh_and_strictly_sequential() {
+        let mut keys = KeyGen::new();
+        assert_eq!(keys.fresh(), "k0");
+        assert_eq!(keys.fresh(), "k1");
+        assert_eq!(keys.fresh(), "k2");
+    }
+
+    #[test]
+    fn duration_is_frames_divided_by_fps() {
+        assert_eq!(duration_secs(10, 5), 2.0);
+        assert_eq!(duration_secs(0, 5), 0.0);
+        // fps 0 is raised to 1, so the duration is the frame count itself.
+        assert_eq!(duration_secs(7, 0), 7.0);
+    }
+
+    #[test]
+    fn pct_of_is_the_frame_boundary_as_a_percentage() {
+        assert_eq!(pct_of(5, 10), 50.0);
+        assert_eq!(pct_of(3, 10), 30.0);
+        assert_eq!(pct_of(10, 10), 100.0);
+        assert_eq!(pct_of(0, 10), 0.0);
+        // A zero total has no timeline at all: the guard fires before division.
+        assert_eq!(pct_of(4, 0), 0.0);
+        assert_eq!(pct_of(0, 0), 0.0);
+    }
+
+    #[test]
+    fn trim_num_rounds_to_four_decimals_and_drops_padding() {
+        assert_eq!(trim_num(0.0), "0");
+        assert_eq!(trim_num(30.0), "30");
+        assert_eq!(trim_num(100.0), "100");
+        assert_eq!(trim_num(66.6666666), "66.6667");
+        assert_eq!(trim_num(1.5), "1.5");
+    }
+
+    #[test]
+    fn a_window_lands_on_exactly_its_frame_percentages() {
+        // Frames 3..6 of 10 → 30% on, 60% off, hidden at both ends.
+        assert_eq!(
+            keyframes_rule("k0", &[(3, 6)], 10),
+            "@keyframes k0{0%{opacity:0}30%{opacity:1}60%{opacity:0}100%{opacity:0}}"
+        );
+        // Closing window: it must still read 100%{opacity:0} at the end.
+        assert_eq!(
+            keyframes_rule("k1", &[(7, 10)], 10),
+            "@keyframes k1{0%{opacity:0}70%{opacity:1}100%{opacity:0}}"
+        );
+    }
+
+    #[test]
+    fn a_window_opening_at_frame_zero_merges_into_the_first_stop() {
+        // Nudging the equal stop would hide the opening state for a rounding
+        // step of every loop — 0% must read opacity:1 directly.
+        assert_eq!(
+            keyframes_rule("k0", &[(0, 3)], 10),
+            "@keyframes k0{0%{opacity:1}30%{opacity:0}100%{opacity:0}}"
+        );
+    }
+
+    #[test]
+    fn windows_sharing_a_boundary_stay_visible_across_it() {
+        // The shared 40% boundary merges into one continuous visible stretch —
+        // no hidden 40% sliver — while the closing 100% stop stays put.
+        assert_eq!(
+            keyframes_rule("k0", &[(2, 4), (4, 6)], 10),
+            "@keyframes k0{0%{opacity:0}20%{opacity:1}60%{opacity:0}100%{opacity:0}}"
+        );
+    }
+
+    #[test]
+    fn a_stop_that_goes_backwards_is_nudged_strictly_forward() {
+        // end frame 2 lands at 20% after a start at 50%: it cannot collide or
+        // run backwards, so it is nudged to 50.0001%.
+        assert_eq!(
+            keyframes_rule("k0", &[(5, 2)], 10),
+            "@keyframes k0{0%{opacity:0}50%{opacity:1}50.0001%{opacity:0}100%{opacity:0}}"
+        );
+    }
+
+    #[test]
+    fn a_run_that_holds_into_its_own_reappearance_merges_to_one_stretch() {
+        // The second window starts exactly where the first ends while both
+        // are visible: one unbroken visible stretch, no 50% blink. This is
+        // also the two-element-list merge case in merge_stop.
+        assert_eq!(
+            keyframes_rule("k0", &[(0, 5), (5, 7)], 10),
+            "@keyframes k0{0%{opacity:1}70%{opacity:0}100%{opacity:0}}"
+        );
+    }
+
+    #[test]
+    fn item_rule_is_silent_only_for_a_static_full_timeline() {
+        let mut keys = KeyGen::new();
+        let mut rules: Vec<String> = Vec::new();
+
+        // Covers the whole timeline statically: no key, no rule.
+        assert_eq!(item_rule(&mut keys, &mut rules, &[(0, 4)], 4), "");
+        assert!(rules.is_empty(), "a static element has no rule");
+
+        // A partial window gets the first fresh key and pushes its rule.
+        assert_eq!(item_rule(&mut keys, &mut rules, &[(0, 2)], 4), "k0");
+        assert_eq!(
+            rules,
+            vec!["@keyframes k0{0%{opacity:1}50%{opacity:0}100%{opacity:0}}"]
+        );
+
+        // Two windows sharing a boundary still count as animated, and take
+        // the next key.
+        assert_eq!(item_rule(&mut keys, &mut rules, &[(0, 2), (2, 4)], 4), "k1");
+        assert_eq!(rules[1], "@keyframes k1{0%{opacity:1}100%{opacity:0}}");
+    }
+
+    #[test]
+    fn style_for_animates_a_keyed_element_and_stays_silent_otherwise() {
+        assert_eq!(
+            style_for("k0", 0.6),
+            " style=\"animation:k0 0.6s steps(1,end) infinite;opacity:0\""
+        );
+        assert_eq!(style_for("", 1.0), "");
+    }
+}

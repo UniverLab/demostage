@@ -1070,6 +1070,31 @@ data = "file.txt\n"
         assert_eq!(cutoff, Some(500));
     }
 
+    /// Control-only input must not start a line: a later `demo stop` is cut
+    /// at its own timestamp, not the earlier control noise. Deleting the
+    /// control-skip arm would keep the bytes, plant `line_start` early, and
+    /// report the wrong cutoff.
+    #[test]
+    fn stop_cutoff_ms_ignores_leading_control_noise() {
+        let r = raw(vec![
+            RawEvent::Input {
+                t_ms: 100,
+                bytes: "\x1b\x00".into(),
+            },
+            RawEvent::Input {
+                t_ms: 200,
+                bytes: "demo stop\r".into(),
+            },
+        ]);
+        assert_eq!(stop_cutoff_ms(&r), Some(200));
+        // Control-only input alone creates no line and no cutoff.
+        let r2 = raw(vec![RawEvent::Input {
+            t_ms: 100,
+            bytes: "\x1b\x00".into(),
+        }]);
+        assert_eq!(stop_cutoff_ms(&r2), None);
+    }
+
     #[test]
     fn stop_cutoff_ms_stop_among_other_commands() {
         let r = raw(vec![

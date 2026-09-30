@@ -174,12 +174,17 @@ fn is_secret_prompt(line: &str) -> bool {
 fn decode_streaming(pending: &mut Vec<u8>, bytes: &[u8]) -> String {
     pending.extend_from_slice(bytes);
     let mut out = String::new();
-    loop {
+    // Bounded passes: every `Some(bad)` pass drains at least one byte, so one
+    // pass per buffered byte always covers the whole buffer, and the clean
+    // remainder is flushed after the budget. The pass count is fixed up front
+    // so the loop cannot be steered into spinning by its own drain.
+    let budget = pending.len();
+    for _ in 0..budget {
         match std::str::from_utf8(pending) {
             Ok(s) => {
                 out.push_str(s);
                 pending.clear();
-                break;
+                return out;
             }
             Err(e) => {
                 let valid = e.valid_up_to();
@@ -195,11 +200,17 @@ fn decode_streaming(pending: &mut Vec<u8>, bytes: &[u8]) -> String {
                     // Incomplete sequence at the end: hold it for the next read.
                     None => {
                         pending.drain(..valid);
-                        break;
+                        return out;
                     }
                 }
             }
         }
+    }
+    // Budget spent: every pass consumed a byte, so whatever decodes cleanly
+    // now (usually nothing) is flushed in one last step.
+    if let Ok(s) = std::str::from_utf8(pending) {
+        out.push_str(s);
+        pending.clear();
     }
     out
 }
@@ -250,8 +261,13 @@ fn route_input_chunk(
             *cmd_start = Some(now);
         }
     };
-    while i < n {
-        let b = chunk[i];
+    // Bounded: one pass per input byte at most, so the walk always ends even
+    // if a branch fails to advance `i`; the read below stops the pass when the
+    // chunk is consumed.
+    for _ in 0..n {
+        let Some(&b) = chunk.get(i) else {
+            break;
+        };
         if b == b'\r' || b == b'\n' {
             to_pty.push(b);
             let t = cmd_line.trim_start();
@@ -1612,5 +1628,513 @@ mod tests {
             !secret_prompt_cleared.load(Ordering::SeqCst),
             "partial line at chunk end must not set secret_prompt_cleared"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Pump tests: OutputPump / InputPump driven directly with scripted I/O.
+    // ---------------------------------------------------------------------
+
+    use std::sync::Arc;
+
+    /// One step a scripted reader replays: some bytes, or an error.
+    enum ReadStep {
+        Data(&'static [u8]),
+        Err(std::io::ErrorKind),
+    }
+
+    /// A `Read` that plays back a fixed sequence of results and then returns
+    /// `Ok(0)` (EOF) forever. The trailing EOF guarantee means the read loop
+    /// terminates under every mutant of its match arms — none can spin.
+    struct ScriptedReader {
+        steps: Vec<ReadStep>,
+        idx: usize,
+    }
+
+    fn scripted(steps: Vec<ReadStep>) -> ScriptedReader {
+        ScriptedReader { steps, idx: 0 }
+    }
+
+    impl Read for ScriptedReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.steps.get(self.idx) {
+                // Scripted EOF: `idx` never advances again, so a loop that
+                // keeps reading past the script still terminates.
+                None => Ok(0),
+                Some(ReadStep::Data(b)) => {
+                    self.idx += 1;
+                    let n = b.len().min(buf.len());
+                    buf[..n].copy_from_slice(&b[..n]);
+                    Ok(n)
+                }
+                Some(ReadStep::Err(kind)) => {
+                    self.idx += 1;
+                    Err(std::io::Error::from(*kind))
+                }
+            }
+        }
+    }
+
+    /// A writer that records what was written, for asserting PTY forwarding.
+    #[derive(Clone, Default)]
+    struct VecWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl VecWriter {
+        fn written(&self) -> Vec<u8> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl Write for VecWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A writer whose every write fails — the PTY went away mid-capture.
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "pty write failed",
+            ))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A minimal reveal armed by `--when`, as the control layer builds it.
+    fn test_reveal() -> super::super::Reveal {
+        super::super::Reveal {
+            panes: vec![crate::model::RevealPane::terminal()],
+            orientation: crate::model::Orientation::Horizontal,
+            hold_ms: None,
+            scroll: false,
+        }
+    }
+
+    /// How many `Reveal` events the recording holds.
+    fn reveal_count(state: &CaptureState) -> usize {
+        state
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, RawEvent::Reveal { .. }))
+            .count()
+    }
+
+    #[test]
+    fn is_secret_prompt_accepts_a_200_byte_line_and_rejects_201() {
+        // The length guard is `> 200`, so exactly 200 bytes is still a prompt.
+        let at_limit = format!("password{}:", "x".repeat(191));
+        assert_eq!(at_limit.len(), 200);
+        assert!(is_secret_prompt(&at_limit), "200 bytes must still match");
+
+        let over_limit = format!("password{}:", "x".repeat(192));
+        assert_eq!(over_limit.len(), 201);
+        assert!(!is_secret_prompt(&over_limit), "201 bytes is screen paint");
+
+        // At the very same 200-byte length, no keyword still means no match.
+        let no_hint = format!("{}:", "x".repeat(199));
+        assert_eq!(no_hint.len(), 200);
+        assert!(!is_secret_prompt(&no_hint));
+    }
+
+    #[test]
+    fn route_input_chunk_decodes_multibyte_utf8_into_the_cmd_line() {
+        // "é" = [0xc3, 0xa9]: a byte >= 0x80 must take the UTF-8 branch, so
+        // the tracked line gets the decoded character — not one latin-1
+        // mojibake char per raw byte.
+        let chunk = "é".as_bytes();
+        let mut cmd_line = String::new();
+        let mut cmd_start = None;
+        let out = route_input_chunk(chunk, &mut cmd_line, &mut cmd_start, 0);
+        assert_eq!(out.to_pty, chunk, "keystrokes reach the PTY byte-for-byte");
+        assert_eq!(
+            cmd_line, "é",
+            "the tracked line holds the decoded character"
+        );
+        assert!(
+            !cmd_line.contains('Ã') && !cmd_line.contains('©'),
+            "raw bytes must not leak into the line as mojibake"
+        );
+    }
+
+    #[test]
+    fn output_pump_run_retries_an_interrupted_read_until_eof() {
+        // EINTR (e.g. SIGWINCH) is not the shell exiting: the loop must retry
+        // and still record the next chunk, then flag shell_exited at EOF.
+        let state = CaptureState::new();
+        state.ready.store(true, Ordering::SeqCst);
+        let mut pump = OutputPump::new(
+            state.clone(),
+            Box::new(scripted(vec![
+                ReadStep::Err(std::io::ErrorKind::Interrupted),
+                ReadStep::Data(b"data"),
+            ])),
+            Instant::now(),
+        );
+        pump.run();
+        {
+            let events = state.events.lock().unwrap();
+            assert_eq!(events.len(), 1, "the read after an EINTR must be recorded");
+            match &events[0] {
+                RawEvent::Output { data, .. } => assert_eq!(data.as_str(), "data"),
+                other => panic!("expected Output, got {other:?}"),
+            }
+        }
+        assert!(
+            state.shell_exited.load(Ordering::SeqCst),
+            "EOF must flag the shell as exited"
+        );
+    }
+
+    #[test]
+    fn output_pump_run_stops_on_a_non_interrupted_read_error() {
+        // A hard read error is not retryable: the pump must stop WITHOUT
+        // consuming (and recording) whatever the reader offers next.
+        let state = CaptureState::new();
+        state.ready.store(true, Ordering::SeqCst);
+        let mut pump = OutputPump::new(
+            state.clone(),
+            Box::new(scripted(vec![
+                ReadStep::Err(std::io::ErrorKind::Other),
+                ReadStep::Data(b"data"),
+            ])),
+            Instant::now(),
+        );
+        pump.run();
+        assert!(
+            state.events.lock().unwrap().is_empty(),
+            "a hard read error must stop the pump before later data is recorded"
+        );
+        assert!(
+            state.shell_exited.load(Ordering::SeqCst),
+            "the stopped pump still flags the shell as exited"
+        );
+    }
+
+    #[test]
+    fn output_pump_feed_records_output_when_ready() {
+        let state = CaptureState::new();
+        state.ready.store(true, Ordering::SeqCst);
+        let mut pump = OutputPump::new(state.clone(), Box::new(scripted(vec![])), Instant::now());
+        pump.feed(b"hello");
+        let events = state.events.lock().unwrap();
+        assert_eq!(events.len(), 1, "ready output must be recorded");
+        match &events[0] {
+            RawEvent::Output { data, .. } => assert_eq!(data.as_str(), "hello"),
+            other => panic!("expected Output, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn output_pump_absorbs_preroll_and_records_only_the_tail_after_the_marker() {
+        // Before the readiness marker nothing is recorded; the marker itself
+        // and everything before it are discarded, the tail after it is the
+        // first Output event — exactly once, byte-for-byte.
+        let state = CaptureState::new();
+        let mut pump = OutputPump::new(state.clone(), Box::new(scripted(vec![])), Instant::now());
+        pump.feed(b"setup chatter ");
+        assert!(!state.ready.load(Ordering::SeqCst));
+        assert!(
+            state.events.lock().unwrap().is_empty(),
+            "pre-marker output must not be recorded"
+        );
+        pump.feed(format!("xx{PROMPT_READY}TAIL").as_bytes());
+        assert!(
+            state.ready.load(Ordering::SeqCst),
+            "the marker must arm recording"
+        );
+        let events = state.events.lock().unwrap();
+        assert_eq!(events.len(), 1, "only the post-marker tail is recorded");
+        match &events[0] {
+            RawEvent::Output { data, .. } => assert_eq!(data.as_str(), "TAIL"),
+            other => panic!("expected Output, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recent_window_keeps_a_cue_split_across_two_chunks() {
+        // The `--when` cue spans a read boundary: the first half must survive
+        // in the recent-output window so the second half can complete it.
+        let state = CaptureState::new();
+        state.ready.store(true, Ordering::SeqCst);
+        state
+            .pending_opens
+            .lock()
+            .unwrap()
+            .push((test_reveal(), "XY".to_string()));
+        let mut pump = OutputPump::new(state.clone(), Box::new(scripted(vec![])), Instant::now());
+        pump.feed(b"abcX");
+        pump.feed(b"Y done");
+        assert_eq!(
+            reveal_count(&state),
+            1,
+            "a cue spanning two chunks must fire once its second half arrives"
+        );
+        assert!(
+            state.pending_opens.lock().unwrap().is_empty(),
+            "the fired reveal must be drained"
+        );
+    }
+
+    #[test]
+    fn recent_window_is_not_cleared_at_exactly_8192_bytes() {
+        // The window trims only when it exceeds 8192 bytes. Right at the
+        // boundary the accumulated output must survive so a cue completed by
+        // the next chunk still matches.
+        let state = CaptureState::new();
+        state.ready.store(true, Ordering::SeqCst);
+        state
+            .pending_opens
+            .lock()
+            .unwrap()
+            .push((test_reveal(), "MARKER".to_string()));
+        let mut pump = OutputPump::new(state.clone(), Box::new(scripted(vec![])), Instant::now());
+        let mut first = vec![b'x'; 8192 - 4];
+        first.extend_from_slice(b"MARK");
+        assert_eq!(first.len(), 8192, "boundary chunk is exactly 8192 bytes");
+        pump.feed(&first);
+        pump.feed(b"ER");
+        assert_eq!(
+            reveal_count(&state),
+            1,
+            "the window must keep exactly-8192 bytes so the cue can complete"
+        );
+    }
+
+    #[test]
+    fn fire_due_reveals_records_the_matched_reveal_at_the_given_time() {
+        let state = CaptureState::new();
+        state
+            .pending_opens
+            .lock()
+            .unwrap()
+            .push((test_reveal(), "build ok".to_string()));
+        let mut pump = OutputPump::new(state.clone(), Box::new(scripted(vec![])), Instant::now());
+        pump.recent.push_str("everything build ok now");
+        pump.fire_due_reveals(1234);
+        {
+            let events = state.events.lock().unwrap();
+            assert_eq!(events.len(), 1, "a matched cue must produce a Reveal");
+            match &events[0] {
+                RawEvent::Reveal { t_ms, .. } => assert_eq!(*t_ms, 1234),
+                other => panic!("expected Reveal, got {other:?}"),
+            }
+        }
+        assert!(
+            state.pending_opens.lock().unwrap().is_empty(),
+            "the fired reveal must be drained"
+        );
+    }
+
+    #[test]
+    fn handle_returns_true_when_the_pty_write_fails() {
+        // A failed PTY write means the session is dead: `handle` must report
+        // it so the read loop stops, and record nothing after the failure.
+        let state = CaptureState::new();
+        state.ready.store(true, Ordering::SeqCst);
+        let mut pump = InputPump::new(state.clone(), Box::new(FailingWriter), Instant::now());
+        let stop = pump.handle(b"hi");
+        assert!(stop, "a failed PTY write must tell the read loop to stop");
+        assert!(
+            state.events.lock().unwrap().is_empty(),
+            "nothing is recorded after a failed write"
+        );
+    }
+
+    #[test]
+    fn handle_forwards_and_records_input_and_returns_false_when_healthy() {
+        let state = CaptureState::new();
+        state.ready.store(true, Ordering::SeqCst);
+        let writer = VecWriter::default();
+        let mut pump = InputPump::new(state.clone(), Box::new(writer.clone()), Instant::now());
+        let stop = pump.handle(b"hi");
+        assert!(!stop, "a healthy write must not stop the read loop");
+        assert_eq!(
+            writer.written(),
+            b"hi",
+            "keystrokes must reach the PTY verbatim"
+        );
+        let events = state.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            RawEvent::Input { bytes, .. } => assert_eq!(bytes.as_str(), "hi"),
+            other => panic!("expected Input, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_ignores_input_during_the_pre_roll() {
+        // Until the readiness marker arms recording, keystrokes are neither
+        // forwarded nor recorded.
+        let state = CaptureState::new();
+        let writer = VecWriter::default();
+        let mut pump = InputPump::new(state.clone(), Box::new(writer.clone()), Instant::now());
+        let stop = pump.handle(b"hi");
+        assert!(!stop);
+        assert!(
+            state.events.lock().unwrap().is_empty(),
+            "pre-roll keystrokes must not be recorded"
+        );
+        assert!(
+            writer.written().is_empty(),
+            "pre-roll keystrokes must not reach the PTY"
+        );
+    }
+
+    #[test]
+    fn secret_submission_records_the_prompt_event_on_enter() {
+        // Enter submits the secret: exactly one `Secret` event holding the
+        // prompt label (never the typed value), and the latch clears.
+        let state = CaptureState::new();
+        state.ready.store(true, Ordering::SeqCst);
+        state.sensitive.store(true, Ordering::SeqCst);
+        *state.secret_prompt.lock().unwrap() = Some("Vault passphrase:".to_string());
+        let mut pump = InputPump::new(
+            state.clone(),
+            Box::new(VecWriter::default()),
+            Instant::now(),
+        );
+        let stop = pump.handle(b"hunter2\r");
+        assert!(!stop);
+        assert!(
+            !state.sensitive.load(Ordering::SeqCst),
+            "Enter clears the sensitive latch"
+        );
+        let events = state.events.lock().unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one Secret event, and the typed value is never recorded"
+        );
+        match &events[0] {
+            RawEvent::Secret { prompt, .. } => assert_eq!(prompt.as_str(), "Vault passphrase:"),
+            other => panic!("expected Secret, got {other:?}"),
+        }
+    }
+
+    /// A lone carriage return submits: only `==` on `\\r` sees it — `!=`
+    /// would find no differing byte and skip the submission.
+    #[test]
+    fn lone_carriage_return_submits_the_secret() {
+        let state = CaptureState::new();
+        state.ready.store(true, Ordering::SeqCst);
+        state.sensitive.store(true, Ordering::SeqCst);
+        *state.secret_prompt.lock().unwrap() = Some("Password:".to_string());
+        let mut pump = InputPump::new(
+            state.clone(),
+            Box::new(VecWriter::default()),
+            Instant::now(),
+        );
+        pump.handle(b"\r");
+        assert_eq!(
+            state.events.lock().unwrap().len(),
+            1,
+            "a lone CR must submit the secret"
+        );
+    }
+
+    /// A lone line feed submits too: only `==` on `\\n` sees it.
+    #[test]
+    fn lone_line_feed_submits_the_secret() {
+        let state = CaptureState::new();
+        state.ready.store(true, Ordering::SeqCst);
+        state.sensitive.store(true, Ordering::SeqCst);
+        *state.secret_prompt.lock().unwrap() = Some("Password:".to_string());
+        let mut pump = InputPump::new(
+            state.clone(),
+            Box::new(VecWriter::default()),
+            Instant::now(),
+        );
+        pump.handle(b"\n");
+        assert_eq!(
+            state.events.lock().unwrap().len(),
+            1,
+            "a lone LF must submit the secret"
+        );
+    }
+
+    #[test]
+    fn keystrokes_during_a_secret_prompt_are_not_a_submission() {
+        // Without Enter there is no submission: the latch stays set, the
+        // prompt stays armed, and no Secret event is recorded.
+        let state = CaptureState::new();
+        state.ready.store(true, Ordering::SeqCst);
+        state.sensitive.store(true, Ordering::SeqCst);
+        *state.secret_prompt.lock().unwrap() = Some("Password:".to_string());
+        let mut pump = InputPump::new(
+            state.clone(),
+            Box::new(VecWriter::default()),
+            Instant::now(),
+        );
+        let stop = pump.handle(b"abc");
+        assert!(!stop);
+        assert!(
+            state.sensitive.load(Ordering::SeqCst),
+            "the latch must stay set until Enter"
+        );
+        assert!(
+            state.secret_prompt.lock().unwrap().is_some(),
+            "the prompt must stay armed"
+        );
+        assert!(
+            state.events.lock().unwrap().is_empty(),
+            "no Secret event without Enter"
+        );
+    }
+
+    #[test]
+    fn secret_submission_dedups_redraws_until_the_prompt_leaves_the_screen() {
+        let state = CaptureState::new();
+        state.ready.store(true, Ordering::SeqCst);
+        let mut pump = InputPump::new(
+            state.clone(),
+            Box::new(VecWriter::default()),
+            Instant::now(),
+        );
+        let submit = |cleared: bool| {
+            state.sensitive.store(true, Ordering::SeqCst);
+            *state.secret_prompt.lock().unwrap() = Some("Password:".to_string());
+            state.secret_prompt_cleared.store(cleared, Ordering::SeqCst);
+        };
+        // 1) First submission records one Secret event.
+        submit(false);
+        assert!(!pump.handle(b"pw1\r"));
+        assert!(!state.sensitive.load(Ordering::SeqCst));
+        assert_eq!(state.events.lock().unwrap().len(), 1);
+        // 2) An immediate redraw of the same prompt (still on screen) dedups.
+        submit(false);
+        assert!(!pump.handle(b"pw2\r"));
+        assert!(!state.sensitive.load(Ordering::SeqCst));
+        assert_eq!(
+            state.events.lock().unwrap().len(),
+            1,
+            "a redraw without the prompt leaving the screen must not duplicate"
+        );
+        // 3) Once a completed line sent the prompt off screen, it records again.
+        submit(true);
+        assert!(!pump.handle(b"pw3\r"));
+        assert_eq!(
+            state.events.lock().unwrap().len(),
+            2,
+            "prompt left screen → the same prompt records a new event"
+        );
+        for ev in state.events.lock().unwrap().iter() {
+            match ev {
+                RawEvent::Secret { prompt, .. } => {
+                    assert_eq!(prompt.as_str(), "Password:")
+                }
+                other => panic!("expected only Secret events, got {other:?}"),
+            }
+        }
     }
 }

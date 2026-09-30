@@ -72,7 +72,9 @@ pub(super) fn braille_cell(ch: char, w: usize, h: usize) -> Option<Vec<u8>> {
     if !(0x2800..=0x28ff).contains(&cp) {
         return None;
     }
-    let bits = (cp - 0x2800) as u8;
+    // Low byte of `cp - 0x2800` — which is just the low byte of `cp`,
+    // since 0x2800 is a multiple of 256 and `as u8` keeps only that byte.
+    let bits = cp as u8;
     let mut v = vec![0u8; w * h];
     // (col, row) → Unicode dot bit. Left column = dots 1,2,3,7; right = 4,5,6,8.
     let dot_bit = |col: usize, row: usize| -> u8 {
@@ -140,22 +142,23 @@ pub(super) fn block_cell(ch: char, w: usize, h: usize) -> Option<Vec<u8>> {
         Some(v)
     };
     match ch {
-        '\u{2588}' => Some(vec![255; n]),             // █ full block
-        '\u{2591}' => Some(vec![64; n]),              // ░ light shade
-        '\u{2592}' => Some(vec![128; n]),             // ▒ medium shade
-        '\u{2593}' => Some(vec![192; n]),             // ▓ dark shade
-        '\u{2580}' => region(&|_, y| y < h / 2),      // ▀ upper half
-        '\u{2584}' => region(&|_, y| y >= h / 2),     // ▄ lower half
-        '\u{258C}' => region(&|x, _| x < w / 2),      // ▌ left half
-        '\u{2590}' => region(&|x, _| x >= w / 2),     // ▐ right half
-        '\u{2594}' => region(&|_, y| y < h / 8),      // ▔ upper one-eighth
+        '\u{2588}' => Some(vec![255; n]),         // █ full block
+        '\u{2591}' => Some(vec![64; n]),          // ░ light shade
+        '\u{2592}' => Some(vec![128; n]),         // ▒ medium shade
+        '\u{2593}' => Some(vec![192; n]),         // ▓ dark shade
+        '\u{2580}' => region(&|_, y| y < h / 2),  // ▀ upper half
+        '\u{2584}' => region(&|_, y| y >= h / 2), // ▄ lower half
+        // (No ▌ arm: 0x258C is the midpoint of the left-eighths range
+        // below — fill w * 4 / 8 = w / 2, the same left half.)
+        '\u{2590}' => region(&|x, _| x >= w / 2), // ▐ right half
+        '\u{2594}' => region(&|_, y| y < h / 8),  // ▔ upper one-eighth
         '\u{2595}' => region(&|x, _| x >= w - w / 8), // ▕ right one-eighth
         // Lower 1–7 eighths (▁▂▃▄▅▆▇).
         '\u{2581}'..='\u{2587}' => {
             let fill = h * (ch as usize - 0x2580) / 8;
             region(&move |_, y| y >= h - fill)
         }
-        // Left 7–1 eighths (▉▊▋▍▎▏ — ▌ left-half is handled above).
+        // Left 8–1 eighths (▉▊▋▌▍▎▏ — ▌ is the w/2 midpoint).
         '\u{2589}'..='\u{258F}' => {
             let fill = w * (0x2590 - ch as usize) / 8;
             region(&move |x, _| x < fill)
@@ -313,7 +316,7 @@ pub(super) fn render_cells(
                     fallback_report,
                 )
             });
-            if m.width == 0 || m.height == 0 {
+            if is_empty_glyph(m) {
                 continue;
             }
             paint_glyph_cell(&ctx, &mut img, m, cov);
@@ -338,6 +341,14 @@ struct CellPaintCtx {
     /// Distance from the cell top to the baseline, in pixels.
     ascent: f32,
     fg: [u8; 3],
+}
+
+/// Whether a rasterized glyph has nothing to paint: either dimension zero
+/// means `paint_glyph_cell`'s loops are empty. Pure so the `||` is directly
+/// testable (a zero width with a nonzero height — or the reverse — still
+/// paints nothing and must be skipped).
+pub(super) fn is_empty_glyph(m: &fontdue::Metrics) -> bool {
+    m.width == 0 || m.height == 0
 }
 
 /// Fill one cell's rectangle with an opaque `bg`.
@@ -394,11 +405,12 @@ pub(super) fn blend_pixel(img: &mut [u8], p: usize, fg: [u8; 3], a: u32) {
     }
 }
 
-/// Map a vt100 colour to RGB.
+/// Map a vt100 colour to RGB. Indices 0..15 resolve through [`xterm256`],
+/// whose first line returns the ANSI16 entry for them — byte-identical to a
+/// dedicated fast-path arm, so there is deliberately only one route.
 pub(super) fn resolve(c: Color, default: [u8; 3]) -> [u8; 3] {
     match c {
         Color::Default => default,
-        Color::Idx(i) if (i as usize) < 16 => ANSI16[i as usize],
         Color::Idx(i) => xterm256(i),
         Color::Rgb(r, g, b) => [r, g, b],
     }

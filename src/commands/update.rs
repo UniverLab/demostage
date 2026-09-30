@@ -295,9 +295,15 @@ fn check_failure_line(cause: &str) -> String {
 /// The shared status line: current version, with the newest stable tag when
 /// one is available.
 fn report_status(current: &str, latest: Option<&str>) {
+    println!("{}", status_line(current, latest));
+}
+
+/// Pure rendering of the shared status line, so the wording is testable
+/// without capturing stdout.
+fn status_line(current: &str, latest: Option<&str>) -> String {
     match latest {
-        None => println!("{}", up_to_date_line(current)),
-        Some(tag) => println!("{}", arrow_line(current, tag)),
+        None => up_to_date_line(current),
+        Some(tag) => arrow_line(current, tag),
     }
 }
 
@@ -390,12 +396,20 @@ pub fn asset_name(tag: &str, target: &str) -> String {
 /// `$CARGO_HOME/bin`, else the conventional `$HOME/.cargo/bin` (no `dirs`
 /// crate in this repo — the environment is read directly).
 pub fn cargo_bin_dir() -> PathBuf {
-    std::env::var_os("CARGO_HOME")
+    cargo_bin_from(
+        std::env::var_os("CARGO_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+/// Pure resolution of the cargo bin directory from its two environment
+/// inputs, so the empty-`CARGO_HOME` fallback is unit-testable.
+fn cargo_bin_from(cargo_home: Option<&std::ffi::OsStr>, home: Option<&std::ffi::OsStr>) -> PathBuf {
+    cargo_home
         .filter(|value| !value.is_empty())
         .map(|value| PathBuf::from(value).join("bin"))
         .unwrap_or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
+            home.map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join(".cargo")
                 .join("bin")

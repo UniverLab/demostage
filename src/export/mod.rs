@@ -27,7 +27,7 @@ use crate::error::{Error, Result};
 use crate::model::Score;
 use crate::validate::validate;
 
-use run::{progress_bar, progress_clear, Recording};
+use run::{progress_bar, progress_clear, Progress, Recording};
 
 /// Start a local HTTP server if any pane needs one (local `file://` URLs or
 /// wizard localhost URLs). Returns the server (must be kept alive while
@@ -152,12 +152,11 @@ fn render_gif(rec: &Recording, score: &Score, plan: &RenderPlan) -> Result<PathB
     ensure_parent(&path)?;
     let mut report = raster::FallbackReport::new();
     if plan.staged {
-        let mut n = 0usize;
+        let mut progress = Progress::new("exporting gif", plan.total_frames);
         let mut browser_reports = Vec::new();
         gif::encode(&path, plan.cw, plan.ch, plan.fps, |emit| {
             let r = stage::render_stage(rec, score, plan.speed, |f| {
-                n += 1;
-                progress_bar("exporting gif", n, plan.total_frames);
+                progress.tick();
                 emit(f);
             })?;
             report = r.0;
@@ -167,11 +166,10 @@ fn render_gif(rec: &Recording, score: &Score, plan: &RenderPlan) -> Result<PathB
         progress_clear();
         report_browser_captures(&browser_reports);
     } else {
-        let mut n = 0usize;
+        let mut progress = Progress::new("exporting gif", plan.total_frames);
         gif::encode(&path, plan.cw, plan.ch, plan.fps, |emit| {
             let (_plan, r) = raster::render_frames(rec, score, |f| {
-                n += 1;
-                progress_bar("exporting gif", n, plan.total_frames);
+                progress.tick();
                 emit(f);
             })?;
             report = r;
@@ -191,12 +189,11 @@ fn render_mp4(rec: &Recording, score: &Score, plan: &RenderPlan) -> Result<PathB
     ensure_parent(&path)?;
     let mut report = raster::FallbackReport::new();
     if plan.staged {
-        let mut n = 0usize;
+        let mut progress = Progress::new("exporting mp4", plan.total_frames);
         let mut browser_reports = Vec::new();
         mp4::encode(&path, plan.cw, plan.ch, plan.fps, |emit| {
             let r = stage::render_stage(rec, score, plan.speed, |f| {
-                n += 1;
-                progress_bar("exporting mp4", n, plan.total_frames);
+                progress.tick();
                 emit(f);
             })?;
             report = r.0;
@@ -206,11 +203,10 @@ fn render_mp4(rec: &Recording, score: &Score, plan: &RenderPlan) -> Result<PathB
         progress_clear();
         report_browser_captures(&browser_reports);
     } else {
-        let mut n = 0usize;
+        let mut progress = Progress::new("exporting mp4", plan.total_frames);
         mp4::encode(&path, plan.cw, plan.ch, plan.fps, |emit| {
             let (_plan, r) = raster::render_frames(rec, score, |f| {
-                n += 1;
-                progress_bar("exporting mp4", n, plan.total_frames);
+                progress.tick();
                 emit(f);
             })?;
             report = r;
@@ -268,12 +264,11 @@ fn render_svg_poster(
         // score has no cell grid to draw, so replay the stage and keep
         // ONE composited frame, embedded as a base64 PNG in the SVG.
         let keep = svg::frame_index(at_secs, plan.fps, plan.total_frames);
-        let mut n = 0usize;
+        let mut progress = Progress::new("exporting svg", plan.total_frames);
         let mut browser_reports = Vec::new();
         svg::encode(path, plan.cw, plan.ch, keep, |emit| {
             let r = stage::render_stage(rec, score, plan.speed, |f| {
-                n += 1;
-                progress_bar("exporting svg", n, plan.total_frames);
+                progress.tick();
                 emit(&svg::PosterFrame::Rgba(f));
             })?;
             report = r.0;
@@ -983,5 +978,96 @@ pane = "p"
         } else {
             panic!("expected Scroll step");
         }
+    }
+
+    // --- render() mutants: invalid score errors; every format writes its
+    // exact path for a single-terminal replay (headless, no browser/ffmpeg
+    // gate beyond the provisioned binary).
+
+    fn single_terminal_score(dir: &std::path::Path) -> Score {
+        let mut score: Score = toml::from_str(
+            r#"
+[demo]
+name = "t"
+[layout]
+width = 800
+height = 600
+fps = 15
+  [[layout.panes]]
+  id = "main"
+  type = "terminal"
+  x = 0
+  y = 0
+  width = 800
+  height = 600
+"#,
+        )
+        .unwrap();
+        score.demo.output_dir = dir.to_path_buf();
+        score
+    }
+
+    fn render_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "demo-test-render-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn render_rejects_an_invalid_score() {
+        let dir = render_dir("invalid");
+        let mut score = single_terminal_score(&dir);
+        score.layout.width = 0;
+        let err = render(&rec(), &score, Target::Gif, 1.0, None).unwrap_err();
+        assert!(err.to_string().contains("width"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_gif_writes_its_exact_path() {
+        let dir = render_dir("gif");
+        let score = single_terminal_score(&dir);
+        let path = render(&rec(), &score, Target::Gif, 1.0, None).unwrap();
+        assert_eq!(path, dir.join("t.gif"));
+        assert!(path.exists(), "gif file must be written");
+        assert!(std::fs::metadata(&path).unwrap().len() > 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_mp4_writes_its_exact_path() {
+        let dir = render_dir("mp4");
+        let score = single_terminal_score(&dir);
+        let path = render(&rec(), &score, Target::Mp4, 1.0, None).unwrap();
+        assert_eq!(path, dir.join("t.mp4"));
+        assert!(path.exists(), "mp4 file must be written");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_svg_animation_writes_its_exact_path() {
+        let dir = render_dir("svg");
+        let score = single_terminal_score(&dir);
+        let path = render(&rec(), &score, Target::Svg, 1.0, None).unwrap();
+        assert_eq!(path, dir.join("t.svg"));
+        assert!(path.exists(), "svg file must be written");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_svg_poster_writes_its_timestamped_path() {
+        let dir = render_dir("poster");
+        let score = single_terminal_score(&dir);
+        let path = render(&rec(), &score, Target::Svg, 1.0, Some(0.5)).unwrap();
+        assert_eq!(path, dir.join("t-at-0.5.svg"));
+        assert!(path.exists(), "poster file must be written");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

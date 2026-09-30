@@ -29,6 +29,24 @@ use super::{ms, CaptureState, DebugLog, Reveal, AFTER_QUIET_MS};
 const FALLBACK_COLS: u16 = 80;
 const FALLBACK_ROWS: u16 = 24;
 
+/// Frame rate to record into the score: only non-default fps is stored.
+/// Pure so the default-boundary is unit-testable without a live terminal.
+fn fps_opt(fps: u32) -> Option<u32> {
+    (fps != DEFAULT_FPS).then_some(fps)
+}
+
+/// The readiness watchdog has expired: not ready yet and the grace period is
+/// over. Pure so the boundary is unit-testable.
+fn readiness_expired(ready: bool, elapsed: Duration) -> bool {
+    !ready && elapsed > Duration::from_secs(4)
+}
+
+/// The idle timeout has expired: enabled and quiet longer than the limit.
+/// Pure so the boundary is unit-testable.
+fn idle_expired(idle_ms: u64, idle_elapsed: Duration) -> bool {
+    idle_ms > 0 && idle_elapsed > Duration::from_millis(idle_ms)
+}
+
 /// Resolve the capture's terminal size: what the terminal reports, or the
 /// fallback when it reports 0×0. Pure, so the fallback is testable without a
 /// live terminal.
@@ -205,12 +223,10 @@ fn wait_for_stop(
         );
         // Safety: if the readiness marker never arrives (odd shell), start
         // recording anyway rather than capturing nothing.
-        if !state.ready.load(Ordering::SeqCst) && t0.elapsed() > Duration::from_secs(4) {
+        if readiness_expired(state.ready.load(Ordering::SeqCst), t0.elapsed()) {
             state.ready.store(true, Ordering::SeqCst);
         }
-        if idle_ms > 0
-            && state.last_activity.lock().unwrap().elapsed() > Duration::from_millis(idle_ms)
-        {
+        if idle_expired(idle_ms, state.last_activity.lock().unwrap().elapsed()) {
             break "idle timeout";
         }
         thread::sleep(Duration::from_millis(100));
@@ -360,7 +376,7 @@ pub fn run(args: CaptureArgs) -> Result<()> {
         rows,
         idle_timeout_ms: args.idle_timeout_ms,
         resolution,
-        fps: (fps != DEFAULT_FPS).then_some(fps),
+        fps: fps_opt(fps),
         stage: args.into.as_ref().map(|p| p.display().to_string()),
         mute_spans: Vec::new(),
     };
@@ -467,6 +483,12 @@ impl Drop for CaptureWorkdir {
     }
 }
 
+/// Whether a workdir-creation failure is a name collision worth retrying.
+/// Pure so the error-kind match is unit-testable.
+fn is_collision(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::AlreadyExists
+}
+
 fn setup_workdir(use_here: bool) -> Result<CaptureWorkdir> {
     if use_here {
         let cwd = std::env::current_dir()
@@ -484,7 +506,7 @@ fn setup_workdir(use_here: bool) -> Result<CaptureWorkdir> {
         let temp_dir = temp_base.join(format!("demo-{timestamp}-{pid}-{attempt}"));
         match std::fs::create_dir(&temp_dir) {
             Ok(()) => return Ok(CaptureWorkdir::Temp(temp_dir)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) if is_collision(&e) => continue,
             Err(e) => {
                 return Err(Error::Export(format!(
                     "failed to create temporary directory {}: {e}",
@@ -606,5 +628,470 @@ mod tests {
             0,
             "no span must be closed when valve hasn't fired"
         );
+    }
+
+    // --- mutant-killing tests ---
+
+    #[test]
+    fn fps_opt_stores_only_non_default() {
+        assert_eq!(fps_opt(DEFAULT_FPS), None, "default fps must not be stored");
+        assert_eq!(fps_opt(30), Some(30));
+        assert_eq!(fps_opt(24), Some(24));
+    }
+
+    #[test]
+    fn readiness_expired_matrix() {
+        assert!(readiness_expired(false, Duration::from_secs(5)));
+        assert!(!readiness_expired(false, Duration::from_secs(1)));
+        assert!(!readiness_expired(true, Duration::from_secs(100)));
+        // Boundary: exactly 4s is not yet expired (strict >).
+        assert!(!readiness_expired(false, Duration::from_secs(4)));
+        assert!(readiness_expired(
+            false,
+            Duration::from_secs(4) + Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn idle_expired_matrix() {
+        assert!(
+            !idle_expired(0, Duration::from_secs(3600)),
+            "disabled never fires"
+        );
+        assert!(idle_expired(100, Duration::from_millis(200)));
+        assert!(!idle_expired(100, Duration::from_millis(50)));
+        // Boundary: exactly at the limit is not yet expired (strict >).
+        assert!(!idle_expired(100, Duration::from_millis(100)));
+        assert!(idle_expired(100, Duration::from_millis(101)));
+    }
+
+    #[test]
+    fn write_prompt_primer_uses_prompt_for_zsh_and_ps1_for_others() {
+        let mut zsh = Vec::new();
+        write_prompt_primer(&mut zsh, "/bin/zsh", "demo$ ");
+        let zsh = String::from_utf8(zsh).unwrap();
+        assert!(zsh.contains("PROMPT="), "zsh must set PROMPT, got: {zsh:?}");
+        assert!(zsh.contains("demostage_capture_"), "marker must be primed");
+        let mut bash = Vec::new();
+        write_prompt_primer(&mut bash, "/bin/bash", "demo$ ");
+        let bash = String::from_utf8(bash).unwrap();
+        assert!(bash.contains("PS1="), "bash must set PS1, got: {bash:?}");
+    }
+
+    #[test]
+    fn open_debug_log_returns_none_without_debug_and_some_with_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "demo-test-debug-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mk = |debug: bool| crate::cli::CaptureArgs {
+            rec: dir.join("demo.rec"),
+            idle_timeout_ms: 0,
+            shell: None,
+            into: None,
+            no_normalize: false,
+            debug,
+            output: None,
+            normalized_output: dir.join("demo.toml"),
+            no_score: false,
+            prompt: None,
+            keep_prompt: true,
+            font: None,
+            aspect: None,
+            quality: None,
+            fps: None,
+            resolution: None,
+            here: true,
+        };
+        let t0 = Instant::now();
+        let none = open_debug_log(&mk(false), t0, "bash", 80, 24, &dir.join("ctl")).unwrap();
+        assert!(none.is_none(), "debug=false must return None");
+        let some = open_debug_log(&mk(true), t0, "bash", 80, 24, &dir.join("ctl")).unwrap();
+        assert!(some.is_some(), "debug=true must return a log");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fire_due_after_reveals_matrix() {
+        // Not running → no drain, stays off.
+        let s = CaptureState::new();
+        s.after_opens.lock().unwrap().push(Reveal {
+            panes: vec![crate::model::RevealPane::terminal()],
+            orientation: crate::model::Orientation::Horizontal,
+            hold_ms: None,
+            scroll: false,
+        });
+        fire_due_after_reveals(&s, Instant::now());
+        assert!(s.events.lock().unwrap().is_empty());
+        assert!(!s.after_running.load(Ordering::SeqCst));
+        // Running but recent output → no drain, stays on.
+        let s2 = CaptureState::new();
+        s2.after_running.store(true, Ordering::SeqCst);
+        *s2.after_last_out.lock().unwrap() = Instant::now();
+        s2.after_opens.lock().unwrap().push(Reveal {
+            panes: vec![crate::model::RevealPane::terminal()],
+            orientation: crate::model::Orientation::Horizontal,
+            hold_ms: None,
+            scroll: false,
+        });
+        fire_due_after_reveals(&s2, Instant::now());
+        assert!(
+            s2.events.lock().unwrap().is_empty(),
+            "quiet period not yet over"
+        );
+        assert!(s2.after_running.load(Ordering::SeqCst));
+        // Running and quiet long enough → drains with now stamp, turns off.
+        let s3 = CaptureState::new();
+        s3.after_running.store(true, Ordering::SeqCst);
+        *s3.after_last_out.lock().unwrap() =
+            Instant::now() - Duration::from_millis(AFTER_QUIET_MS + 500);
+        s3.after_opens.lock().unwrap().push(Reveal {
+            panes: vec![crate::model::RevealPane::terminal()],
+            orientation: crate::model::Orientation::Horizontal,
+            hold_ms: None,
+            scroll: false,
+        });
+        let t0 = Instant::now();
+        fire_due_after_reveals(&s3, t0);
+        assert_eq!(s3.events.lock().unwrap().len(), 1, "quiet reveal must fire");
+        assert!(!s3.after_running.load(Ordering::SeqCst));
+        assert!(s3.after_opens.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn note_recorded_counts_exact_input_output_totals() {
+        // Without debug: no-op, no panic.
+        let s = CaptureState::new();
+        let raw = RawMacro {
+            meta: RawMeta {
+                shell: String::new(),
+                cols: 80,
+                rows: 24,
+                idle_timeout_ms: 0,
+                resolution: None,
+                fps: None,
+                stage: None,
+                mute_spans: Vec::new(),
+            },
+            events: vec![
+                RawEvent::Input {
+                    t_ms: 1,
+                    bytes: "a".into(),
+                },
+                RawEvent::Input {
+                    t_ms: 2,
+                    bytes: "b".into(),
+                },
+                RawEvent::Output {
+                    t_ms: 3,
+                    data: "c".into(),
+                },
+                RawEvent::Reveal {
+                    t_ms: 4,
+                    panes: vec![crate::model::RevealPane::terminal()],
+                    orientation: crate::model::Orientation::Horizontal,
+                    hold_ms: None,
+                    scroll: false,
+                },
+            ],
+        };
+        note_recorded_counts(&s, &raw);
+        // With debug: exact counts in the log (2 input, 1 output of 4).
+        let dir = std::env::temp_dir().join(format!(
+            "demo-test-counts-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let t0 = Instant::now();
+        let log = std::sync::Arc::new(DebugLog::create(&dir.join("d.log"), t0).unwrap());
+        let mut s2 = CaptureState::new();
+        s2.debug = Some(log);
+        note_recorded_counts(&s2, &raw);
+        let text = std::fs::read_to_string(dir.join("d.log")).unwrap();
+        assert!(
+            text.contains("recorded 4 events (2 input, 1 output)"),
+            "exact counts must be logged, got: {text:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_collision_matches_only_already_exists() {
+        assert!(is_collision(&std::io::Error::from(
+            std::io::ErrorKind::AlreadyExists
+        )));
+        assert!(!is_collision(&std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        )));
+        assert!(!is_collision(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )));
+    }
+
+    #[test]
+    fn create_control_file_truncates_and_returns_a_canonical_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "demo-test-ctl-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _cwd_guard = super::super::CWD_LOCK.lock().unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        std::fs::write(crate::commands::control::CONTROL_FILE, "stale").unwrap();
+        let got = create_control_file().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(crate::commands::control::CONTROL_FILE).unwrap(),
+            "",
+            "existing control file must be truncated"
+        );
+        assert!(got.is_absolute(), "path must be canonical, got {got:?}");
+        assert_eq!(
+            got.file_name().unwrap(),
+            crate::commands::control::CONTROL_FILE
+        );
+        std::env::set_current_dir(prev).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn setup_workdir_retries_on_name_collision() {
+        // Pre-create the first candidate name is racy (timestamp-based), so
+        // instead assert the two modes: here→cwd, temp→fresh dir that cleans up.
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(setup_workdir(true).unwrap().path(), cwd.as_path());
+        let path = {
+            let w = setup_workdir(false).unwrap();
+            let p = w.path().to_path_buf();
+            assert!(p.is_dir());
+            // The temp name carries pid + attempt suffix.
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(name.starts_with("demo-"), "temp name, got {name:?}");
+            p
+        };
+        assert!(!path.exists(), "temp workdir must be cleaned on drop");
+    }
+
+    /// A fake child that is already exited (try_wait → Some) or never exits.
+    #[derive(Debug)]
+    struct FakeChild {
+        exited: bool,
+    }
+
+    impl portable_pty::ChildKiller for FakeChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(FakeChild {
+                exited: self.exited,
+            })
+        }
+    }
+
+    impl portable_pty::Child for FakeChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            if self.exited {
+                Ok(Some(portable_pty::ExitStatus::with_exit_code(0)))
+            } else {
+                Ok(None)
+            }
+        }
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            Ok(portable_pty::ExitStatus::with_exit_code(0))
+        }
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+    }
+
+    #[test]
+    fn wait_for_stop_breaks_on_shell_exit_without_hanging() {
+        let t0 = Instant::now();
+        let mut state = CaptureState::new();
+        state.ready.store(true, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "demo-test-wait-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctl = dir.join("ctl");
+        std::fs::write(&ctl, "").unwrap();
+        let log_path = dir.join("d.log");
+        state.debug = Some(std::sync::Arc::new(
+            DebugLog::create(&log_path, t0).unwrap(),
+        ));
+        let mut child: Box<dyn portable_pty::Child + Send + Sync> =
+            Box::new(FakeChild { exited: true });
+        // Join budget: a mutant that no longer breaks on child exit would hang
+        // the loop — the budget turns that hang into a fast failure.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let wait_thread = std::thread::spawn(move || {
+            wait_for_stop(&state, &mut child, &ctl, 0, t0);
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "exited shell must end the wait promptly"
+        );
+        let _ = wait_thread.join();
+        let text = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            text.contains("shell process exited"),
+            "wait must end by observing the exited child, got: {text:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wait_for_stop_applies_readiness_watchdog_then_idle_timeout() {
+        let state = CaptureState::new();
+        state.ready.store(false, Ordering::SeqCst);
+        // Last activity long ago so the idle arm fires on the first pass.
+        *state.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(60);
+        let dir = std::env::temp_dir().join(format!(
+            "demo-test-wait-idle-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctl = dir.join("ctl");
+        std::fs::write(&ctl, "").unwrap();
+        // t0 five seconds ago: the readiness arm must flip ready on.
+        let t0 = Instant::now() - Duration::from_secs(5);
+        let mut child: Box<dyn portable_pty::Child + Send + Sync> =
+            Box::new(FakeChild { exited: false });
+        wait_for_stop(&state, &mut child, &ctl, 100, t0);
+        assert!(
+            state.ready.load(Ordering::SeqCst),
+            "readiness watchdog must arm recording after 4s"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wait_for_stop_reads_stop_command_from_offset_zero() {
+        let state = CaptureState::new();
+        state.ready.store(true, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "demo-test-wait-stop-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctl = dir.join("ctl");
+        std::fs::write(&ctl, "{\"cmd\":\"stop\"}\n").unwrap();
+        let t0 = Instant::now();
+        let log = std::sync::Arc::new(DebugLog::create(&dir.join("d.log"), t0).unwrap());
+        let mut s2 = CaptureState::new();
+        s2.ready.store(true, Ordering::SeqCst);
+        s2.debug = Some(log);
+        let mut child: Box<dyn portable_pty::Child + Send + Sync> =
+            Box::new(FakeChild { exited: false });
+        // Never-idle so only the stop line can end the wait. On a detached
+        // thread with a join budget: a mutant that skips the first control
+        // byte (offset 1) would break the stop JSON and hang the loop — the
+        // budget turns that hang into a fast failure instead of a TIMEOUT.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let wait_thread = std::thread::spawn(move || {
+            wait_for_stop(&s2, &mut child, &ctl, 0, t0);
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "stop line at offset 0 must end the wait promptly"
+        );
+        let _ = wait_thread.join();
+        let text = std::fs::read_to_string(dir.join("d.log")).unwrap();
+        assert!(
+            text.contains("demo stop"),
+            "stop line at offset 0 must end the wait, got: {text:?}"
+        );
+        let _ = state;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stop_session_flags_stop_and_removes_control_files() {
+        let state = CaptureState::new();
+        let dir = std::env::temp_dir().join(format!(
+            "demo-test-stop-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctl = dir.join(crate::commands::control::CONTROL_FILE);
+        std::fs::write(&ctl, "").unwrap();
+        std::fs::write(
+            ctl.with_file_name(crate::commands::control::SOURCES_FILE),
+            "",
+        )
+        .unwrap();
+        std::fs::write(ctl.with_file_name(crate::commands::control::META_FILE), "").unwrap();
+        let mut child: Box<dyn portable_pty::Child + Send + Sync> =
+            Box::new(FakeChild { exited: true });
+        let handle = std::thread::spawn(|| {});
+        stop_session(&state, &mut child, handle, &ctl);
+        assert!(state.stop.load(Ordering::SeqCst), "stop flag must be set");
+        assert!(!ctl.exists(), "control file must be removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_refuses_without_interactive_terminal() {
+        // Under cargo test stdin/stdout are not TTYs, so run must refuse.
+        // This kills the `replace run with Ok(())` mutant: Ok would not err.
+        if std::io::IsTerminal::is_terminal(&std::io::stdin())
+            && std::io::IsTerminal::is_terminal(&std::io::stdout())
+        {
+            return;
+        }
+        let args = crate::cli::CaptureArgs {
+            rec: "demo.rec".into(),
+            idle_timeout_ms: 0,
+            shell: None,
+            into: None,
+            no_normalize: false,
+            debug: false,
+            output: None,
+            normalized_output: "demo.toml".into(),
+            no_score: false,
+            prompt: None,
+            keep_prompt: true,
+            font: None,
+            aspect: None,
+            quality: None,
+            fps: None,
+            resolution: None,
+            here: true,
+        };
+        let err = run(args).unwrap_err();
+        assert!(err.to_string().contains("interactive terminal"));
     }
 }

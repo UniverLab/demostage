@@ -644,7 +644,13 @@ pub fn write_animated(path: &Path, rec: &Recording, score: &Score) -> Result<()>
     };
     let mut default_bg = [11, 15, 20];
     let mut seen_first = false;
-    while let Some(tf) = source.next_text_frame() {
+    // Bounded: the source yields exactly `n_frames` frames, so walk them by
+    // count — the walk ends on its own whatever the per-frame result is.
+    let n = source.n_frames();
+    for _ in 0..n {
+        let Some(tf) = source.next_text_frame() else {
+            break;
+        };
         if !seen_first {
             geom = Geom {
                 cw: tf.cell_w,
