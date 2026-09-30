@@ -35,7 +35,7 @@ impl Kept {
     }
 }
 
-/// Encode the poster at `path`. Mirrors [`super::gif::encode`]'s callback
+/// Encode the poster at `path`. Mirrors [`crate::export::gif::encode`]'s callback
 /// shape: `render` replays frames through `emit`; the encoder keeps frame
 /// `#keep` (0-based among EMITTED frames) and drops the rest, so only one
 /// frame is ever held in memory. A source that has already seeked
@@ -75,7 +75,7 @@ pub fn encode(
     std::fs::write(path, svg).map_err(|e| Error::io(path, e))
 }
 
-/// Single-terminal fast path, mirrors [`super::gif::write_gif`]: build a
+/// Single-terminal fast path, mirrors [`crate::export::gif::write_gif`]: build a
 /// [`FrameSource`], seek to the requested frame (no rasterizing of the frames
 /// in between) and emit its cell grid. `at_secs: None` means the last frame.
 pub fn write_svg(path: &Path, rec: &Recording, score: &Score, at_secs: Option<f64>) -> Result<()> {

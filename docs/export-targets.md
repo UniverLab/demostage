@@ -6,14 +6,14 @@ order: 7
 
 # Export targets
 
-`demo export [fmt[,fmt…]] [recording]` renders a recording to **`gif`** and/or
-**`mp4`**. `gif` is pure-Rust and offline; `mp4` and multi-scene **browser panes**
+`demo export [fmt[,fmt…]] [recording]` renders a recording to **`gif`**, **`mp4`**
+and/or the opt-in **`svg`**. `gif` is pure-Rust and offline; `mp4` and multi-scene **browser panes**
 auto-provision their tool (ffmpeg / Chromium) on first use. Pass both at once
 (`demo export gif,mp4`), **omit the format to build them all** (`demo export`),
 and use `--speed 2x` (or `3x`, `0.5x`) to retime the whole demo.
 
-There is also a third, **opt-in** target: **`svg`**, a static poster drawn as
-vector text. Naming no format (or naming `all`) still builds **only `gif` +
+There is also a third, **opt-in** target: **`svg`**, an animated vector export
+(terminal-only demos) or a static poster with `--at`. Naming no format (or naming `all`) still builds **only `gif` +
 `mp4`** — `svg` is built when you ask for it by name, alone or combined
 (`demo export svg`, `demo export gif,svg`).
 
@@ -85,7 +85,8 @@ composites both panes onto the canvas frame by frame.
 
 Chromium is provisioned the same tectonic-style way as ffmpeg: a system Chrome is
 used if present, otherwise `headless_chrome` downloads a managed build on first
-use. (Browser panes only appear on `gif`/`mp4` — there's no text target.)
+use. (Browser panes animate only on `gif`/`mp4` — the animated `svg` is
+terminal-only; an `svg` poster of a staged score embeds one PNG frame.)
 
 **Reveal on focus:** a browser pane is blank until the timeline `focus`es it, then
 appears — so you can `focus` it right after a server comes up or a PDF compiles,

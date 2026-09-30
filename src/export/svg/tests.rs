@@ -310,6 +310,40 @@ height = 100
 }
 
 #[test]
+fn an_image_pane_uses_an_as_its_article() {
+    let score: Score = toml::from_str(
+        r#"
+[demo]
+name = "t"
+[layout]
+width = 200
+height = 100
+  [[layout.panes]]
+  id = "c"
+  type = "terminal"
+  x = 0
+  y = 0
+  width = 100
+  height = 100
+  [[layout.panes]]
+  id = "p"
+  type = "browser"
+  x = 100
+  y = 0
+  width = 100
+  height = 100
+  url = "file:///x.png"
+"#,
+    )
+    .unwrap();
+    let msg = animated_refusal(&score).expect("an image pane must refuse");
+    assert!(
+        msg.contains("an image pane"),
+        "article wrong for image: {msg}"
+    );
+}
+
+#[test]
 fn a_single_terminal_score_does_not_refuse() {
     let score: Score = toml::from_str(
         r#"

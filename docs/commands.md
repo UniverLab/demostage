@@ -166,9 +166,12 @@ demo export [fmt[,fmt…]] [demo.rec] [--speed 2x] [--at SECONDS]
   render it directly.
 - `--speed` — retimes the recording: `2x`, `3x`, `0.5x` (a bare number works too).
   `1x` (the default) keeps the recorded pace.
-- `--at` — for the `svg` poster: the frame this many **seconds** into the demo
-  (`--at 12.5`). Defaults to the **last frame**; a value past the end clamps to
-  it. Ignored by `gif`/`mp4`, which render the whole timeline.
+- `--at` — for `svg`: without it, a terminal-only demo exports the whole
+  timeline as an **animated SVG**; with it (e.g. `--at 12.5`), the SVG is a
+  **static poster** of that frame, written to `dist/<name>-at-12.5.svg`
+  (defaults to the **last frame**; a value past the end clamps to it).
+  Multi-pane demos refuse the animated path — use gif/mp4, or `--at` for a
+  poster. Ignored by `gif`/`mp4`, which render the whole timeline.
 - `--force` — render a **faithful capture** as-is. By default `export` refuses a
   capture's `.rec` (its typing/idle aren't humanized) and points you at
   `demo record` for a clean re-take; pass `--force` to render the live capture
@@ -176,13 +179,18 @@ demo export [fmt[,fmt…]] [demo.rec] [--speed 2x] [--at SECONDS]
   (a wizard that creates a repo, a flow needing secrets) that a `demo record`
   re-run would repeat or desync — there, faithful + `--force` is the only option.
 
-Each format is written to its default path `<output_dir>/<name>.<ext>`.
+Each format is written to its default path `<output_dir>/<name>.<ext>` — except an
+`svg` poster with `--at`, which carries its timestamp
+(`<output_dir>/<name>-at-12.5.svg`) so posters never overwrite each other or
+the animated `<name>.svg`.
 
 For a **multi-pane stage**, `gif`/`mp4` composite the recorded terminal with its
 browser panes — each captured via headless Chromium (auto-provisioned) and
-revealed at the moment the timeline focuses it. An `svg` poster of a staged
-score falls back to embedding **one** composited frame as a base64 PNG — a
-composited canvas has no cell grid to draw as vector text.
+revealed at the moment the timeline focuses it. `demo export svg` without
+`--at` refuses a staged score (the animated SVG is terminal-only); with `--at`
+it draws an `svg` poster of a staged score, falling back to embedding **one**
+composited frame as a base64 PNG — a composited canvas has no cell grid to
+draw as vector text.
 
 ## `demo doctor`
 

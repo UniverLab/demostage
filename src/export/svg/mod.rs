@@ -71,8 +71,17 @@ fn pane_kind_label(url: Option<&str>) -> &'static str {
 }
 
 fn refusal_message(kind: &str, time: f64) -> String {
+    let article = if kind
+        .chars()
+        .next()
+        .is_some_and(|c| matches!(c.to_ascii_lowercase(), 'a' | 'e' | 'i' | 'o' | 'u'))
+    {
+        "an"
+    } else {
+        "a"
+    };
     format!(
-        "animated svg supports terminal-only demos; this score shows a {kind} pane at {time:.1}s \
+        "animated svg supports terminal-only demos; this score shows {article} {kind} pane at {time:.1}s \
          — use gif/mp4, or --at <s> for a poster"
     )
 }
