@@ -132,6 +132,14 @@ pub(crate) fn scene_of(tf: &TextFrame) -> Scene {
     scene
 }
 
+/// Bits of a braille cell: codepoint minus U+2800, as the `<circle>` painter
+/// re-adds the base. A checked conversion (not a truncating `as`) so the `-`
+/// is load-bearing: `+` overflows the `u8` and maps every cell to blank,
+/// which the tests observe. Pure so the arithmetic is unit-testable.
+pub(crate) fn braille_bits(ch: char) -> u8 {
+    u8::try_from(ch as u32 - 0x2800).unwrap_or(0)
+}
+
 /// Braille cells become dot items (never text): viewer fonts lack U+2800–U+28FF.
 fn collect_dots(tf: &TextFrame, scene: &mut Scene) {
     for row in 0..tf.rows {
@@ -143,7 +151,7 @@ fn collect_dots(tf: &TextFrame, scene: &mut Scene) {
                 scene.dots.push(DotItem {
                     row,
                     col,
-                    bits: (cell.ch as u32 - 0x2800) as u8,
+                    bits: braille_bits(cell.ch),
                     fg: cell.fg,
                 });
             }

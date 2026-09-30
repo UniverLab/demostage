@@ -1272,4 +1272,120 @@ pane = "never"
         assert!(screen.parser.is_some(), "parser must be initialized");
         assert_eq!(screen.fed, events.len());
     }
+
+    /// drive_timeline runs every step until Terminate: with two focuses before
+    /// it, both land. Deleting the `!` on the stop gate breaks after the
+    /// first step instead, and the second focus never lands.
+    #[test]
+    fn drive_timeline_runs_every_step_until_terminate() {
+        let score = live_score(
+            r#"
+[[timeline]]
+action = "focus"
+pane = "first"
+[[timeline]]
+action = "focus"
+pane = "second"
+[[timeline]]
+action = "terminate"
+[[timeline]]
+action = "focus"
+pane = "never"
+"#,
+        );
+        let mut pty = CapturePty::new(&score, &score.layout.panes[0]).unwrap();
+        let secrets = std::collections::HashMap::new();
+        let caps = drive_timeline(&score, &mut pty, &secrets, Instant::now());
+        let panes: Vec<&str> = caps.focuses.iter().map(|(_, p)| p.as_str()).collect();
+        assert_eq!(
+            panes,
+            vec!["first", "second"],
+            "every step before Terminate must run, none after it"
+        );
+    }
+
+    /// Fake child that never exits on its own, so keypress delivery is
+    /// observed without a live shell.
+    #[derive(Debug)]
+    struct FakeChild;
+
+    impl portable_pty::ChildKiller for FakeChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(FakeChild)
+        }
+    }
+
+    impl portable_pty::Child for FakeChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            Ok(None)
+        }
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            Ok(portable_pty::ExitStatus::with_exit_code(0))
+        }
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+    }
+
+    /// Writer backed by a shared buffer, so tests can assert the exact bytes
+    /// written through the `Box<dyn Write + Send>` after it is consumed.
+    #[derive(Clone, Default)]
+    struct SharedWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A `CapturePty` with no shell behind it: writes land in a shared buffer,
+    /// and the returned sender feeds the recorder's channel directly.
+    fn fake_capture_pty() -> (
+        CapturePty,
+        SharedWriter,
+        std::sync::mpsc::Sender<(Instant, Vec<u8>)>,
+    ) {
+        let writer = SharedWriter::default();
+        let (tx, rx) = std::sync::mpsc::channel::<(Instant, Vec<u8>)>();
+        let pty = CapturePty {
+            child: Box::new(FakeChild),
+            writer: Box::new(writer.clone()),
+            rx,
+            reader_done: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cols: 80,
+            rows: 24,
+            ps_var: "PS1",
+            prompt: "$ ".to_string(),
+        };
+        (pty, writer, tx)
+    }
+
+    /// press_key_step writes the key's bytes and collects the output it
+    /// produces. A body replaced with `()` writes nothing and collects nothing.
+    #[test]
+    fn press_key_step_writes_key_bytes_and_collects_output() {
+        let (mut pty, writer, tx) = fake_capture_pty();
+        let t0 = Instant::now();
+        tx.send((t0 + Duration::from_millis(500), b"hi".to_vec()))
+            .unwrap();
+        let mut events = Vec::new();
+        press_key_step("a", &mut pty, &mut events, t0);
+        assert_eq!(
+            writer.0.lock().unwrap().as_slice(),
+            b"a",
+            "exactly the key's bytes must reach the PTY"
+        );
+        assert_eq!(
+            events,
+            vec![(0.5, "hi".to_string())],
+            "the output the key produced must be collected"
+        );
+    }
 }

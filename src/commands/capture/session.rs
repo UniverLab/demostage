@@ -47,6 +47,36 @@ fn idle_expired(idle_ms: u64, idle_elapsed: Duration) -> bool {
     idle_ms > 0 && idle_elapsed > Duration::from_millis(idle_ms)
 }
 
+/// Poll cadence of [`wait_for_stop`]: one control read plus checks per pass.
+const WAIT_POLL_MS: u64 = 100;
+/// Slack polls past the idle deadline before the watchdog gives up. The idle
+/// arm always fires on the first pass past its deadline, so this is reachable
+/// only when the idle comparison itself is broken — turning a hang into a
+/// wrong reason the tests observe, with identical output otherwise.
+const WAIT_SLACK_PASSES: u64 = 50;
+
+/// Bounded iteration budget for [`wait_for_stop`]: the idle deadline in polls,
+/// plus slack for scheduling jitter. Disabled idle (`0`) never expires, so its
+/// budget is effectively infinite. Pure so the arithmetic is unit-testable.
+fn wait_budget_passes(idle_ms: u64) -> u64 {
+    if idle_ms == 0 {
+        u64::MAX
+    } else {
+        idle_ms / WAIT_POLL_MS + WAIT_SLACK_PASSES
+    }
+}
+
+/// Consecutive polls with no new output: resets to zero whenever the quiet
+/// duration shrinks (fresh output arrived), otherwise counts one more. Pure so
+/// the reset boundary is unit-testable.
+fn quiet_passes(prev: u64, quiet: Duration, prev_quiet: Duration) -> u64 {
+    if quiet < prev_quiet {
+        0
+    } else {
+        prev + 1
+    }
+}
+
 /// Resolve the capture's terminal size: what the terminal reports, or the
 /// fallback when it reports 0×0. Pure, so the fallback is testable without a
 /// live terminal.
@@ -198,6 +228,12 @@ fn wait_for_stop(
     t0: Instant,
 ) {
     let mut control_read = 0u64;
+    // Bounded: at most `budget` passes — the idle arm always fires on the
+    // first pass past its deadline, so the count below is reachable only when
+    // the idle comparison is broken, and the wait still ends on its own.
+    let budget = wait_budget_passes(idle_ms);
+    let mut passes = 0u64;
+    let mut prev_quiet = Duration::ZERO;
     let reason = loop {
         if state.shell_exited.load(Ordering::SeqCst) {
             break "reader closed (shell exited)";
@@ -226,10 +262,16 @@ fn wait_for_stop(
         if readiness_expired(state.ready.load(Ordering::SeqCst), t0.elapsed()) {
             state.ready.store(true, Ordering::SeqCst);
         }
-        if idle_expired(idle_ms, state.last_activity.lock().unwrap().elapsed()) {
+        let quiet = state.last_activity.lock().unwrap().elapsed();
+        passes = quiet_passes(passes, quiet, prev_quiet);
+        prev_quiet = quiet;
+        if idle_expired(idle_ms, quiet) {
             break "idle timeout";
         }
-        thread::sleep(Duration::from_millis(100));
+        if passes == budget {
+            break "watchdog budget exhausted";
+        }
+        thread::sleep(Duration::from_millis(WAIT_POLL_MS));
     };
     let _ = read_control(control_abs, &mut control_read, &control_io(state, t0));
     if let Some(d) = &state.debug {
@@ -456,11 +498,11 @@ fn maybe_close_safety_valve(
     true
 }
 
+#[derive(Debug)]
 enum CaptureWorkdir {
     Current(std::path::PathBuf),
     Temp(std::path::PathBuf),
 }
-
 impl CaptureWorkdir {
     fn path(&self) -> &std::path::Path {
         match self {
@@ -502,9 +544,21 @@ fn setup_workdir(use_here: bool) -> Result<CaptureWorkdir> {
         .unwrap_or_default()
         .as_nanos();
     let pid = std::process::id();
+    setup_workdir_unique(&temp_base, timestamp, pid, |p| std::fs::create_dir(p))
+}
+
+/// Create a unique `demo-<timestamp>-<pid>-<attempt>` directory under
+/// `temp_base`, retrying name collisions. `create` is injectable so the
+/// retry/propagate boundary is unit-testable without racing timestamps.
+fn setup_workdir_unique(
+    temp_base: &Path,
+    timestamp: u128,
+    pid: u32,
+    mut create: impl FnMut(&Path) -> std::io::Result<()>,
+) -> Result<CaptureWorkdir> {
     for attempt in 0..100 {
         let temp_dir = temp_base.join(format!("demo-{timestamp}-{pid}-{attempt}"));
-        match std::fs::create_dir(&temp_dir) {
+        match create(&temp_dir) {
             Ok(()) => return Ok(CaptureWorkdir::Temp(temp_dir)),
             Err(e) if is_collision(&e) => continue,
             Err(e) => {
@@ -962,7 +1016,7 @@ mod tests {
 
     #[test]
     fn wait_for_stop_applies_readiness_watchdog_then_idle_timeout() {
-        let state = CaptureState::new();
+        let mut state = CaptureState::new();
         state.ready.store(false, Ordering::SeqCst);
         // Last activity long ago so the idle arm fires on the first pass.
         *state.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(60);
@@ -979,12 +1033,20 @@ mod tests {
         std::fs::write(&ctl, "").unwrap();
         // t0 five seconds ago: the readiness arm must flip ready on.
         let t0 = Instant::now() - Duration::from_secs(5);
+        state.debug = Some(std::sync::Arc::new(
+            DebugLog::create(&dir.join("d.log"), t0).unwrap(),
+        ));
         let mut child: Box<dyn portable_pty::Child + Send + Sync> =
             Box::new(FakeChild { exited: false });
         wait_for_stop(&state, &mut child, &ctl, 100, t0);
         assert!(
             state.ready.load(Ordering::SeqCst),
             "readiness watchdog must arm recording after 4s"
+        );
+        let text = std::fs::read_to_string(dir.join("d.log")).unwrap();
+        assert!(
+            text.contains("idle timeout"),
+            "the wait must end on the idle arm, not the watchdog budget, got: {text:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1064,6 +1126,50 @@ mod tests {
     }
 
     #[test]
+    fn wait_for_stop_reaches_late_passes_without_tripping_the_watchdog() {
+        // The stop line arrives after several polls: the wait must walk past
+        // the watchdog line on every early pass and still end on the stop
+        // reason. `==`→`!=` would trip the watchdog on the first pass instead.
+        let mut state = CaptureState::new();
+        state.ready.store(true, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "demo-test-wait-late-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctl = dir.join("ctl");
+        std::fs::write(&ctl, "").unwrap();
+        let t0 = Instant::now();
+        state.debug = Some(std::sync::Arc::new(
+            DebugLog::create(&dir.join("d.log"), t0).unwrap(),
+        ));
+        // Idle disabled and a live child: only the stop line ends the wait.
+        let mut child: Box<dyn portable_pty::Child + Send + Sync> =
+            Box::new(FakeChild { exited: false });
+        let feeder_ctl = ctl.clone();
+        let feeder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(350));
+            std::fs::write(&feeder_ctl, "{\"cmd\":\"stop\"}\n").unwrap();
+        });
+        wait_for_stop(&state, &mut child, &ctl, 0, t0);
+        feeder.join().expect("feeder thread must finish");
+        let text = std::fs::read_to_string(dir.join("d.log")).unwrap();
+        assert!(
+            text.contains("demo stop"),
+            "the wait must end on the late stop line, got: {text:?}"
+        );
+        assert!(
+            !text.contains("watchdog"),
+            "early passes must not trip the watchdog, got: {text:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn run_refuses_without_interactive_terminal() {
         // Under cargo test stdin/stdout are not TTYs, so run must refuse.
         // This kills the `replace run with Ok(())` mutant: Ok would not err.
@@ -1093,5 +1199,71 @@ mod tests {
         };
         let err = run(args).unwrap_err();
         assert!(err.to_string().contains("interactive terminal"));
+    }
+
+    #[test]
+    fn wait_budget_passes_covers_the_idle_deadline_plus_slack() {
+        // Disabled idle never expires: effectively infinite.
+        assert_eq!(wait_budget_passes(0), u64::MAX);
+        // Otherwise the deadline in 100 ms polls, plus the slack.
+        assert_eq!(wait_budget_passes(100), 51);
+        assert_eq!(wait_budget_passes(1000), 60);
+    }
+
+    #[test]
+    fn quiet_passes_resets_on_fresh_output_and_counts_otherwise() {
+        // Fresh output (quiet duration shrank) resets the streak.
+        assert_eq!(
+            quiet_passes(5, Duration::from_millis(10), Duration::from_millis(20)),
+            0
+        );
+        // Still quiet (duration grew) counts one more poll.
+        assert_eq!(
+            quiet_passes(5, Duration::from_millis(30), Duration::from_millis(20)),
+            6
+        );
+        // Equal durations mean no new output: still counts, never resets.
+        assert_eq!(quiet_passes(0, Duration::ZERO, Duration::ZERO), 1);
+        assert_eq!(
+            quiet_passes(41, Duration::from_secs(60), Duration::from_secs(59)),
+            42
+        );
+    }
+
+    #[test]
+    fn workdir_unique_retries_a_collision_then_succeeds() {
+        // First candidate collides, second is free: the guard must retry, so
+        // the second name wins. `guard → false` would return the error instead.
+        let base = std::env::temp_dir();
+        let mut calls = 0;
+        let got = setup_workdir_unique(&base, 1, 2, |_| {
+            calls += 1;
+            if calls == 1 {
+                Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(got.path(), base.join("demo-1-2-1"));
+        assert_eq!(calls, 2, "one collision, one success");
+    }
+
+    #[test]
+    fn workdir_unique_propagates_a_non_collision_error_at_once() {
+        // A real failure is returned immediately with its directory named:
+        // `guard → true` would retry 100 times and report "unique" instead.
+        let base = std::env::temp_dir();
+        let mut calls = 0;
+        let err = setup_workdir_unique(&base, 1, 2, |_| {
+            calls += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("demo-1-2-0"),
+            "the failing directory must be named, got: {err}"
+        );
+        assert_eq!(calls, 1, "no retry on a non-collision error");
     }
 }

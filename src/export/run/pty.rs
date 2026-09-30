@@ -32,6 +32,12 @@ const MAX_PUMP_CHUNKS: usize = 1 << 20;
 /// round per tick, `READER_JOIN_MS / JOIN_POLL_MS` rounds in total.
 const JOIN_POLL_MS: u64 = 20;
 
+/// Poll rounds in [`finish`]'s bounded reader-join window. Pure so the `/`
+/// is unit-testable: `*` would stretch the window 400x and hang the export.
+fn join_rounds() -> u64 {
+    READER_JOIN_MS / JOIN_POLL_MS
+}
+
 /// The PTY a score's shell runs in for one capture: the child we shut down at
 /// the end, the writer we type into, the channel the reader thread delivers the
 /// shell's output on, and the cell grid everything is sized to.
@@ -300,7 +306,7 @@ pub(super) fn finish(
     // a round count instead of a wall-clock comparison, so there is no clock
     // comparison left on this loop for a mutation to flip (`!`, `&&`, `<`)
     // without changing which rounds actually run.
-    for _ in 0..(READER_JOIN_MS / JOIN_POLL_MS) {
+    for _ in 0..join_rounds() {
         if reader_done.load(Ordering::SeqCst) {
             break;
         }
@@ -845,5 +851,12 @@ teardown_script = "echo TEARDOWN_NOISE_456"
             elapsed < Duration::from_secs(3),
             "the join window must stay bounded to READER_JOIN_MS, took {elapsed:?}"
         );
+    }
+
+    /// The join window is READER_JOIN_MS of JOIN_POLL_MS polls: `/`→`*`
+    /// would run 20_000 rounds (~400 s) instead of 50.
+    #[test]
+    fn join_rounds_divides_the_window_by_the_cadence() {
+        assert_eq!(join_rounds(), 50);
     }
 }

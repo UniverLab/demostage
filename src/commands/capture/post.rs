@@ -74,6 +74,13 @@ pub(super) fn finish_recording(state: &CaptureState, mut meta: RawMeta, t0: Inst
     RawMacro { meta, events }
 }
 
+/// Whether an existing score file's sources survive normalization: only when a
+/// score is actually written (`!no_score`) and the file is there to read.
+/// Pure so the `&&` boundary is unit-testable without touching the disk.
+fn should_preserve_existing_sources(no_score: bool, output_exists: bool) -> bool {
+    !no_score && output_exists
+}
+
 /// Normalize the captured events into a score, persist it when asked, and write
 /// the faithful recording beside it. Returns the score path, if one was written.
 pub(super) fn write_score(
@@ -95,7 +102,7 @@ pub(super) fn write_score(
         None => {
             let normalized = normalize(raw, name, &opts);
             // Preserve sources from an existing score file (defined before capture).
-            if !args.no_score && args.normalized_output.exists() {
+            if should_preserve_existing_sources(args.no_score, args.normalized_output.exists()) {
                 if let Ok(existing) = Score::load(&args.normalized_output) {
                     if !existing.sources.is_empty() {
                         let mut score = normalized;
@@ -1389,6 +1396,16 @@ height = 100
         let saved = Score::load(&got).unwrap();
         assert_eq!(saved.sources, stage_sources, "stage sources must win");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Sources are preserved only when a score is written AND a file exists:
+    /// every `&&`→`||` / `!`-deletion truth-table row is pinned here.
+    #[test]
+    fn should_preserve_existing_sources_truth_table() {
+        assert!(should_preserve_existing_sources(false, true));
+        assert!(!should_preserve_existing_sources(false, false));
+        assert!(!should_preserve_existing_sources(true, true));
+        assert!(!should_preserve_existing_sources(true, false));
     }
 
     /// write_faithful_cast writes a non-empty recording; the score name is

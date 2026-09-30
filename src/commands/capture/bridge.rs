@@ -2137,4 +2137,12 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn route_input_chunk_control_byte_advances_past_it() {
+        // A control byte (e.g. Ctrl-C) is forwarded verbatim and the walk moves
+        // past it: `+=`→`*=` sticks at index 0 and re-emits it for every pass.
+        let (to_pty, _) = route(&[b"\x03ab\n"]);
+        assert_eq!(to_pty, b"\x03ab\n");
+    }
 }

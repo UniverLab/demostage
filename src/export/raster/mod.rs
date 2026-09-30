@@ -153,6 +153,13 @@ fn precache_glyphs(
     }
 }
 
+/// Canvas size the caption is drawn over: the full frame (`cols * cell_w` by
+/// `rows * cell_h`), not a sum or quotient. Pure so the `*` operators are
+/// unit-testable without rendering a frame.
+fn caption_canvas(cols: usize, cell_w: usize, rows: usize, cell_h: usize) -> (usize, usize) {
+    (cols * cell_w, rows * cell_h)
+}
+
 /// A stateful, frame-by-frame terminal renderer. Advancing it monotonically
 /// replays the recording at the score's fps — used directly by gif/mp4 and, in
 /// lockstep with other panes, by the multi-scene stage.
@@ -329,13 +336,8 @@ impl<'a> FrameSource<'a> {
         // caption is drawn here. (The stage clears captions from its terminal
         // source and draws them on the composited canvas instead.)
         if let Some(caption) = &mut self.caption {
-            caption.draw(
-                &mut img,
-                self.cols * self.cell_w,
-                self.rows * self.cell_h,
-                t,
-                &mut self.fallback_report,
-            );
+            let (cap_w, cap_h) = caption_canvas(self.cols, self.cell_w, self.rows, self.cell_h);
+            caption.draw(&mut img, cap_w, cap_h, t, &mut self.fallback_report);
         }
         Some(img)
     }

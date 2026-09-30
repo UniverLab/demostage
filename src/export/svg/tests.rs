@@ -1,6 +1,6 @@
 use super::animated::{
-    fold_scenes, render_document, scene_of, windows_for, write_animated, BgItem, DocInput, DotItem,
-    Geom, Scene, TextItem, ANIM_FAMILY,
+    braille_bits, fold_scenes, render_document, scene_of, windows_for, write_animated, BgItem,
+    DocInput, DotItem, Geom, Scene, TextItem, ANIM_FAMILY,
 };
 use super::animated_refusal;
 use super::paint::{escape_attr, escape_xml, merge_runs};
@@ -1311,4 +1311,13 @@ height = 100
         ),
         "the fast lane is exactly one pane; a fullsize first pane must not claim it"
     );
+}
+
+/// Braille bits are codepoint minus U+2800: `-`→`+` overflows the `u8` and
+/// maps every cell to blank, so each nonzero pattern below kills it.
+#[test]
+fn braille_bits_subtract_the_base() {
+    assert_eq!(braille_bits('\u{2801}'), 0x01);
+    assert_eq!(braille_bits('\u{2847}'), 0x47);
+    assert_eq!(braille_bits('\u{28ff}'), 0xff);
 }

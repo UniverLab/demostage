@@ -1870,3 +1870,12 @@ fn render_cells_skips_zero_metric_glyphs() {
         }
     }
 }
+
+/// The caption canvas is the whole frame: every `*`→`+`/`/` swap changes at
+/// least one dimension here.
+#[test]
+fn caption_canvas_covers_the_whole_frame() {
+    assert_eq!(caption_canvas(80, 10, 24, 19), (800, 456));
+    assert_eq!(caption_canvas(8, 10, 2, 19), (80, 38));
+    assert_eq!(caption_canvas(1, 1, 1, 1), (1, 1));
+}
