@@ -105,7 +105,7 @@ fn push_stop(stops: &mut Vec<(f64, u8)>, pct: f64, opacity: u8) {
         Some((last, _)) if (pct - *last).abs() < 1e-9 => merge_stop(stops, opacity),
         // Strictly earlier: it would collide with the stop already there, so
         // nudge forward by the smallest representable step.
-        Some((last, _)) if pct < *last => stops.push(((*last + 0.0001).min(100.0), opacity)),
+        Some((last, _)) if *last > pct => stops.push(((*last + 0.0001).min(100.0), opacity)),
         _ => stops.push((pct.min(100.0), opacity)),
     }
 }
@@ -125,6 +125,14 @@ fn merge_stop(stops: &mut Vec<(f64, u8)>, opacity: u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stop_exactly_the_merge_tolerance_away_is_kept_separate() {
+        // `< 1e-9` is strict: a gap of exactly 1e-9 is not "the same stop".
+        let mut stops = vec![(0.0, 1)];
+        push_stop(&mut stops, 1e-9, 0);
+        assert_eq!(stops, vec![(0.0, 1), (1e-9, 0)]);
+    }
 
     #[test]
     fn keygen_names_are_fresh_and_strictly_sequential() {

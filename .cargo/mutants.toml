@@ -81,4 +81,11 @@ exclude_re = [
   "impl ReleaseFetcher for RealFetcher",
   # src/commands/update.rs::<impl BinaryDownloader for RealDownloader>::download — real HTTP download.
   "impl BinaryDownloader for RealDownloader",
+  # Equivalent mutants: no input tells them apart from the original.
+  # base64 — b0<<16, b1<<8 and b2 occupy disjoint bits, so `|` and `^` build the same word.
+  'src/export/svg/poster.rs:.*: replace \| with \^ in base64',
+  # braille_dots — the result is truncated to u8 and 0x2800 is a multiple of 256, so `ch - 0x2800` and `ch + 0x2800` keep the same low byte.
+  'src/export/svg/paint.rs:.*: replace - with \+ in braille_dots',
+  # push_stop — an equal pct is merged by the arm above (|pct - last| < 1e-9), so `last > pct` and `last >= pct` never differ here.
+  'src/export/svg/timing.rs:.*: replace > with >= in push_stop',
 ]

@@ -102,10 +102,7 @@ pub(crate) fn bg_spans(tf: &TextFrame) -> Vec<BgSpan> {
                 col += 1;
                 continue;
             }
-            let mut end = col + 1;
-            while end < cells.len() && cells[end].bg == bg {
-                end += 1;
-            }
+            let end = col + 1 + cells[col + 1..].iter().take_while(|c| c.bg == bg).count();
             out.push(BgSpan {
                 row,
                 start: col,
