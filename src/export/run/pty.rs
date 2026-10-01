@@ -33,9 +33,18 @@ const MAX_PUMP_CHUNKS: usize = 1 << 20;
 const JOIN_POLL_MS: u64 = 20;
 
 /// Poll rounds in [`finish`]'s bounded reader-join window. Pure so the `/`
-/// is unit-testable: `*` would stretch the window 400x and hang the export.
+/// is unit-testable: `*` would run 40_000 rounds instead of 50 (the wall-clock
+/// backstop in the loop still ends them after the same window).
 fn join_rounds() -> u64 {
     READER_JOIN_MS / JOIN_POLL_MS
+}
+
+/// Whether [`finish`]'s reader-join window has used up its wall clock. The
+/// loop's round count is its stop condition; this is the backstop that keeps
+/// the teardown bounded even when that count overstates the window. Pure so
+/// both sides of the deadline are unit-testable.
+fn join_window_expired(deadline: Instant) -> bool {
+    deadline.saturating_duration_since(Instant::now()).is_zero()
 }
 
 /// The PTY a score's shell runs in for one capture: the child we shut down at
@@ -302,15 +311,22 @@ pub(super) fn finish(
     // loop: same first-check ordering (a reader that already finished skips
     // straight to the unconditional collect below), the same 20 ms cadence
     // over the same READER_JOIN_MS window (~50 rounds either way), and the
-    // same early exit the moment the flag flips — only the stop condition is
-    // a round count instead of a wall-clock comparison, so there is no clock
-    // comparison left on this loop for a mutation to flip (`!`, `&&`, `<`)
-    // without changing which rounds actually run.
+    // same early exit the moment the flag flips — the round count is the stop
+    // condition, and the wall-clock deadline below is the backstop that keeps
+    // the teardown bounded even if the count itself is ever wrong.
+    //
+    // Both bounds stop at the same round in practice (50 polls x 20 ms), so
+    // the deadline break below never fires before the count runs out: it only
+    // ends the loop when the count overstates the window.
+    let join_deadline = Instant::now() + Duration::from_millis(READER_JOIN_MS);
     for _ in 0..join_rounds() {
         if reader_done.load(Ordering::SeqCst) {
             break;
         }
         collect(&mut events, &rx, t0);
+        if join_window_expired(join_deadline) {
+            break;
+        }
         thread::sleep(Duration::from_millis(JOIN_POLL_MS));
     }
     collect(&mut events, &rx, t0);
@@ -858,5 +874,23 @@ teardown_script = "echo TEARDOWN_NOISE_456"
     #[test]
     fn join_rounds_divides_the_window_by_the_cadence() {
         assert_eq!(join_rounds(), 50);
+    }
+
+    /// The wall-clock backstop: the join loop ends once the window's wall
+    /// clock is spent, in both directions of the deadline.
+    #[test]
+    fn join_window_backstop_ends_the_loop_once_the_deadline_is_spent() {
+        assert!(
+            !join_window_expired(Instant::now() + Duration::from_millis(READER_JOIN_MS)),
+            "a deadline in the future must leave the window open"
+        );
+        assert!(
+            join_window_expired(Instant::now() - Duration::from_millis(1)),
+            "a spent deadline must close the window"
+        );
+        assert!(
+            join_window_expired(Instant::now()),
+            "the deadline instant itself is spent"
+        );
     }
 }

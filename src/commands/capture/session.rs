@@ -220,6 +220,10 @@ fn control_io(state: &CaptureState, t0: Instant) -> ControlIo<'_> {
 /// final control read happens after the loop, because the loop checks exit
 /// conditions *before* reading: a control line written in the last ≤100 ms
 /// before shell exit would otherwise be lost.
+///
+/// The pass budget comes from the idle timeout ([`wait_budget_passes`]), so
+/// with the idle timeout disabled the wait is open-ended — exactly as long as
+/// the capture runs.
 fn wait_for_stop(
     state: &CaptureState,
     child: &mut Box<dyn Child + Send + Sync>,
@@ -227,11 +231,27 @@ fn wait_for_stop(
     idle_ms: u64,
     t0: Instant,
 ) {
+    let budget = wait_budget_passes(idle_ms);
+    wait_for_stop_bounded(state, child, control_abs, idle_ms, budget, t0);
+}
+
+/// [`wait_for_stop`] with the iteration budget passed in rather than derived
+/// from the idle timeout. The only difference is where `budget` comes from:
+/// production passes [`wait_budget_passes`], tests pass a small ceiling, so a
+/// broken stop condition ends the wait with the budget reason (observable in
+/// the debug log) instead of looping until the test binary is killed.
+fn wait_for_stop_bounded(
+    state: &CaptureState,
+    child: &mut Box<dyn Child + Send + Sync>,
+    control_abs: &Path,
+    idle_ms: u64,
+    budget: u64,
+    t0: Instant,
+) {
     let mut control_read = 0u64;
     // Bounded: at most `budget` passes — the idle arm always fires on the
     // first pass past its deadline, so the count below is reachable only when
     // the idle comparison is broken, and the wait still ends on its own.
-    let budget = wait_budget_passes(idle_ms);
     let mut passes = 0u64;
     let mut prev_quiet = Duration::ZERO;
     let reason = loop {
@@ -994,18 +1014,11 @@ mod tests {
         ));
         let mut child: Box<dyn portable_pty::Child + Send + Sync> =
             Box::new(FakeChild { exited: true });
-        // Join budget: a mutant that no longer breaks on child exit would hang
-        // the loop — the budget turns that hang into a fast failure.
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-        let wait_thread = std::thread::spawn(move || {
-            wait_for_stop(&state, &mut child, &ctl, 0, t0);
-            let _ = done_tx.send(());
-        });
-        assert!(
-            done_rx.recv_timeout(Duration::from_secs(10)).is_ok(),
-            "exited shell must end the wait promptly"
-        );
-        let _ = wait_thread.join();
+        // Join budget: idle disabled (the wait is otherwise open-ended), so the
+        // loop runs at most 5 passes. A mutant that no longer breaks on child
+        // exit then ends the wait with the budget reason in 0.5 s — a fast
+        // failure instead of a loop that never returns.
+        wait_for_stop_bounded(&state, &mut child, &ctl, 0, 5, t0);
         let text = std::fs::read_to_string(&log_path).unwrap();
         assert!(
             text.contains("shell process exited"),
@@ -1073,20 +1086,11 @@ mod tests {
         s2.debug = Some(log);
         let mut child: Box<dyn portable_pty::Child + Send + Sync> =
             Box::new(FakeChild { exited: false });
-        // Never-idle so only the stop line can end the wait. On a detached
-        // thread with a join budget: a mutant that skips the first control
-        // byte (offset 1) would break the stop JSON and hang the loop — the
-        // budget turns that hang into a fast failure instead of a TIMEOUT.
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-        let wait_thread = std::thread::spawn(move || {
-            wait_for_stop(&s2, &mut child, &ctl, 0, t0);
-            let _ = done_tx.send(());
-        });
-        assert!(
-            done_rx.recv_timeout(Duration::from_secs(10)).is_ok(),
-            "stop line at offset 0 must end the wait promptly"
-        );
-        let _ = wait_thread.join();
+        // Never-idle so only the stop line can end the wait, and a 5-pass
+        // join budget so a mutant that skips the first control byte (offset 1)
+        // breaks the stop JSON and ends the wait with the budget reason —
+        // a fast failure instead of a TIMEOUT.
+        wait_for_stop_bounded(&s2, &mut child, &ctl, 0, 5, t0);
         let text = std::fs::read_to_string(dir.join("d.log")).unwrap();
         assert!(
             text.contains("demo stop"),
@@ -1147,7 +1151,10 @@ mod tests {
         state.debug = Some(std::sync::Arc::new(
             DebugLog::create(&dir.join("d.log"), t0).unwrap(),
         ));
-        // Idle disabled and a live child: only the stop line ends the wait.
+        // Idle disabled and a live child: only the stop line ends the wait. The
+        // 20-pass ceiling is 4x the passes the feeder needs, so the real wait
+        // ends on the stop reason; a mutant that never sees the stop line ends
+        // it with the budget reason after ~2 s instead of looping forever.
         let mut child: Box<dyn portable_pty::Child + Send + Sync> =
             Box::new(FakeChild { exited: false });
         let feeder_ctl = ctl.clone();
@@ -1155,7 +1162,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(350));
             std::fs::write(&feeder_ctl, "{\"cmd\":\"stop\"}\n").unwrap();
         });
-        wait_for_stop(&state, &mut child, &ctl, 0, t0);
+        wait_for_stop_bounded(&state, &mut child, &ctl, 0, 20, t0);
         feeder.join().expect("feeder thread must finish");
         let text = std::fs::read_to_string(dir.join("d.log")).unwrap();
         assert!(
