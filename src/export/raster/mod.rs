@@ -22,6 +22,10 @@ use crate::fonts;
 use crate::model::Score;
 
 pub use caption::CaptionOverlay;
+/// The block coverage the SVG targets' geometry is asserted against, for
+/// tests only — production code reaches it through [`cells::solid_cell`].
+#[cfg(test)]
+pub(crate) use cells::block_cell;
 pub use cells::{parse_hex, TextCell, TextFrame};
 use cells::{render_cells, resolve, FontSet, GridLayout};
 use glyph::rasterize_with_fallback;

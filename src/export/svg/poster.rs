@@ -4,6 +4,7 @@
 
 use std::path::Path;
 
+use super::blocks::{block_rects, is_block};
 use super::font::{collect_poster_glyphs, embed_for};
 use super::paint::{bg_rects, braille_dots, hex, is_braille, merge_runs, row_cells, run_text};
 use crate::error::{Error, Result};
@@ -105,6 +106,29 @@ pub fn frame_index(at_secs: Option<f64>, fps: u32, n_frames: usize) -> usize {
     }
 }
 
+/// One row's block elements as `<rect>` geometry, one line per cell — the same
+/// coverage the raster paints, so a banner or a shade fills the cell instead
+/// of showing the embedded face's own glyph. Cells that are not blocks (or a
+/// block the raster leaves empty) contribute nothing.
+fn paint_block_row(tf: &TextFrame, row: usize) -> String {
+    let mut out = String::new();
+    let Some(cells) = row_cells(tf, row) else {
+        return out;
+    };
+    for (col, cell) in cells.iter().enumerate() {
+        if !is_block(cell.ch) {
+            continue;
+        }
+        let rects = block_rects(row, col, cell.ch, cell.fg, tf.cell_w, tf.cell_h);
+        if rects.is_empty() {
+            continue;
+        }
+        out.push_str(&rects);
+        out.push('\n');
+    }
+    out
+}
+
 /// One row's braille cells as `<circle>` dots, one element per dot.
 /// Cells without braille (or the blank U+2800) contribute nothing.
 fn paint_braille_row(tf: &TextFrame, row: usize) -> String {
@@ -137,9 +161,10 @@ fn paint_text_row(tf: &TextFrame, row: usize) -> String {
 }
 
 /// The whole `<svg>` for a cell-grid frame: the embedded subset font, the
-/// rounded canvas, the background runs of every row, then each row's braille
-/// dots and text runs. Geometry is all integers (the one `f32` — the font
-/// size — is rounded once here), so the document is byte-stable.
+/// rounded canvas, the background runs of every row, then each row's block
+/// `<rect>`s and braille dots and finally its text runs — the procedural
+/// geometry sits under the text layer. Geometry is all integers (the one `f32`
+/// — the font size — is rounded once here), so the document is byte-stable.
 pub(crate) fn poster_document(tf: &TextFrame, w: usize, h: usize) -> Result<String> {
     let face = embed_for(&collect_poster_glyphs(tf), &tf.font_family)?.1;
     let mut out = String::new();
@@ -157,6 +182,7 @@ pub(crate) fn poster_document(tf: &TextFrame, w: usize, h: usize) -> Result<Stri
         out.push('\n');
     }
     for row in 0..tf.rows {
+        out.push_str(&paint_block_row(tf, row));
         out.push_str(&paint_braille_row(tf, row));
         out.push_str(&paint_text_row(tf, row));
     }

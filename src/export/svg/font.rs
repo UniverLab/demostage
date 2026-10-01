@@ -6,6 +6,7 @@
 use std::collections::{BTreeSet, HashSet};
 
 use super::animated::Scene;
+use super::blocks::is_block;
 use super::paint::{escape_attr, is_braille, merge_runs};
 use super::poster::base64;
 use crate::error::{Error, Result};
@@ -22,9 +23,11 @@ pub fn text_family(score_font: &str) -> String {
 }
 
 /// A character the subset must shape: printable text the font can supply.
-/// Controls draw nothing and braille rides as `<circle>` dots, never `<text>`.
+/// Controls draw nothing, braille rides as `<circle>` dots and block elements
+/// as `<rect>` geometry — none of them ever reach a `<text>` node, so shaping
+/// them in the face would only bloat it.
 fn keep_char(ch: char) -> bool {
-    !ch.is_control() && !is_braille(ch)
+    !ch.is_control() && !is_braille(ch) && !is_block(ch)
 }
 
 /// The distinct printable characters of the animated timeline's text runs,

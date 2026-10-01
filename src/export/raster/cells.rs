@@ -128,7 +128,11 @@ fn disc_coverage(v: &mut [u8], w: usize, h: usize, cx: f32, cy: f32, r: f32) {
 }
 
 /// Block elements (U+2580–U+259F): full block, shades, halves, eighths, quadrants.
-pub(super) fn block_cell(ch: char, w: usize, h: usize) -> Option<Vec<u8>> {
+///
+/// `pub(crate)` (not `pub(super)`) so the SVG targets' tests can assert their
+/// `<rect>` geometry against this coverage — the raster is the reference and
+/// must stay the one definition of a block's shape.
+pub(crate) fn block_cell(ch: char, w: usize, h: usize) -> Option<Vec<u8>> {
     let n = w * h;
     let region = |pred: &dyn Fn(usize, usize) -> bool| {
         let mut v = vec![0u8; n];

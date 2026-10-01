@@ -1,14 +1,16 @@
 use std::collections::BTreeSet;
 
 use super::animated::{
-    braille_bits, fold_scenes, render_document, scene_hold_windows, scene_of, windows_for,
-    write_animated, BgItem, DocInput, DotItem, Geom, Hold, Scene, TextItem,
+    braille_bits, fold_scenes, render_document, scene_hold_windows, scene_of, windows_for, BgItem,
+    BlockItem, DocInput, DotItem, Geom, Hold, Scene, TextItem,
 };
 use super::animated_refusal;
+use super::blocks::is_block;
 use super::font::{collect_animated_glyphs, embed_for, subset_bytes, EMBED_FAMILY};
 use super::paint::{escape_attr, escape_xml, merge_runs};
 use super::poster::{base64, encode, frame_index, poster_document, write_svg, PosterFrame};
 use super::timing::keyframes_rule;
+use super::writer::write_animated;
 use crate::export::raster::{TextCell, TextFrame};
 use crate::export::run::Recording;
 use crate::model::Score;
@@ -949,6 +951,7 @@ fn scene_of_builds_the_exact_scene() {
                 bits: 0xff,
                 fg: [10, 20, 30],
             }],
+            blocks: vec![],
         },
         "scene_of must map every lane exactly"
     );
@@ -1614,4 +1617,190 @@ fn poster_embeds_one_face_while_the_staged_fallback_embeds_none() {
         "the PNG fallback must not fake vector text"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Every character inside a `<text>…</text>` node — the shape assertion both
+/// targets share: no block element may ride as a glyph.
+fn text_nodes(doc: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = doc;
+    while let Some(start) = rest.find("<text") {
+        let after = &rest[start..];
+        let Some(open) = after.find('>') else {
+            break;
+        };
+        let Some(close) = after[open..].find("</text>") else {
+            break;
+        };
+        out.push(after[open + 1..open + close].to_string());
+        rest = &after[open + close..];
+    }
+    out
+}
+
+/// The poster paints block cells as `<rect>` geometry: the four blocks break
+/// the text runs either side of them, no `<text>` node holds a block glyph, and
+/// the geometry carries the raster's own coverage (a full-cell shade at
+/// 64/255, a solid full block).
+#[test]
+fn poster_block_cells_break_runs_and_ride_as_rects() {
+    let tf = frame(
+        7,
+        1,
+        vec![
+            cell('a', [255, 255, 255]),
+            cell('░', [255, 255, 255]),
+            cell('▒', [255, 255, 255]),
+            cell('▓', [255, 255, 255]),
+            cell('█', [255, 255, 255]),
+            cell(' ', [255, 255, 255]),
+            cell('b', [255, 255, 255]),
+        ],
+    );
+    // The blocks break the run: only the two letters survive, and the leading
+    // space before "b" trims its start (column 5 → 6).
+    let runs: Vec<(usize, String)> = merge_runs(&tf, 0)
+        .into_iter()
+        .map(|r| (r.start, r.text))
+        .collect();
+    assert_eq!(
+        runs,
+        vec![(0, "a".to_string()), (6, "b".to_string())],
+        "a block must break the text run"
+    );
+
+    let doc = poster_document(&tf, 70, 20).unwrap();
+    for node in text_nodes(&doc) {
+        assert!(
+            !node.chars().any(is_block),
+            "block glyph {node:?} rode a <text> node"
+        );
+    }
+    // Cell 10×20, row 0: ░ at col 1 → 64/255 = 0.251; █ at col 4 → opaque.
+    assert!(
+        doc.contains(
+            "<rect x=\"10\" y=\"0\" width=\"10\" height=\"20\" \
+                      fill=\"#ffffff\" fill-opacity=\"0.251\"/>"
+        ),
+        "the light shade must be one full-cell rect:\n{doc}"
+    );
+    assert!(
+        doc.contains("<rect x=\"40\" y=\"0\" width=\"10\" height=\"20\" fill=\"#ffffff\"/>"),
+        "the full block must be one opaque full-cell rect:\n{doc}"
+    );
+    assert!(
+        doc.contains("font-family=\"'ds-term',"),
+        "the letter runs still name the embed first:\n{doc}"
+    );
+}
+
+/// The animated target folds block cells through the same lane as the braille
+/// dots: `scene_of` collects a `BlockItem`, the document renders its `<rect>`
+/// geometry, no `<text>` node holds a block glyph, and the timing/dedup shape
+/// is unchanged (one `<use>` per distinct scene, a keyframes rule per item).
+#[test]
+fn animated_block_cells_are_scene_items_not_text() {
+    let f0 = frame(
+        5,
+        1,
+        vec![
+            cell('a', [200, 200, 200]),
+            cell('░', [255, 0, 0]),
+            cell('▒', [255, 0, 0]),
+            cell('▓', [255, 0, 0]),
+            cell('█', [255, 0, 0]),
+        ],
+    );
+    // The ░▒▓█ run survives into the second frame, so it spans two holds and
+    // becomes persistent while the letter churns under it. The third frame
+    // drops the blocks, which gives their window an end shorter than the
+    // timeline.
+    let f1 = frame(
+        5,
+        1,
+        vec![
+            cell('b', [200, 200, 200]),
+            cell('░', [255, 0, 0]),
+            cell('▒', [255, 0, 0]),
+            cell('▓', [255, 0, 0]),
+            cell('█', [255, 0, 0]),
+        ],
+    );
+    let f2 = frame(5, 1, text_row("ccc", 5));
+    assert_eq!(
+        scene_of(&f0).blocks,
+        vec![
+            BlockItem {
+                row: 0,
+                col: 1,
+                ch: '░',
+                fg: [255, 0, 0],
+            },
+            BlockItem {
+                row: 0,
+                col: 2,
+                ch: '▒',
+                fg: [255, 0, 0],
+            },
+            BlockItem {
+                row: 0,
+                col: 3,
+                ch: '▓',
+                fg: [255, 0, 0],
+            },
+            BlockItem {
+                row: 0,
+                col: 4,
+                ch: '█',
+                fg: [255, 0, 0],
+            },
+        ],
+        "each block cell must become exactly one BlockItem"
+    );
+    assert!(
+        scene_of(&f2).blocks.is_empty(),
+        "a frame without a block has no block item"
+    );
+
+    let doc = animated_doc(&[f0, f1, f2], 50, 20, 3);
+    for node in text_nodes(&doc) {
+        assert!(
+            !node.chars().any(is_block),
+            "block glyph {node:?} rode a <text> node"
+        );
+    }
+    // Cell 10×20: ░▒▓█ at cols 1..4 → 64/128/192/255, drawn ONCE together in
+    // the persistent `#pt` layer over frames 0..2 of 3 (one second at 3 fps) —
+    // the shared frame window groups them under one rule, the same fold the
+    // braille dots ride.
+    assert!(
+        doc.contains(
+            "<g style=\"animation:k0 1s steps(1,end) infinite;opacity:0\">\
+             <rect x=\"10\" y=\"0\" width=\"10\" height=\"20\" \
+             fill=\"#ff0000\" fill-opacity=\"0.251\"/> \
+             <rect x=\"20\" y=\"0\" width=\"10\" height=\"20\" \
+             fill=\"#ff0000\" fill-opacity=\"0.502\"/> \
+             <rect x=\"30\" y=\"0\" width=\"10\" height=\"20\" \
+             fill=\"#ff0000\" fill-opacity=\"0.753\"/> \
+             <rect x=\"40\" y=\"0\" width=\"10\" height=\"20\" \
+             fill=\"#ff0000\"/></g>"
+        ),
+        "the shades and full block must ride as animated rect geometry:\n{doc}"
+    );
+    assert!(
+        doc.contains("@keyframes k0{0%{opacity:1}66.6667%{opacity:0}100%{opacity:0}}"),
+        "the persistent block must carry its own keyframes rule:\n{doc}"
+    );
+    // Timing and dedup are unchanged: three distinct states, one `<use>` each.
+    for (gid, key) in [("r0", "k1"), ("r1", "k2"), ("r2", "k3")] {
+        let use_row = format!(
+            "<use href=\"#{gid}\" xlink:href=\"#{gid}\" \
+             style=\"animation:{key} 1s steps(1,end) infinite;opacity:0\"/>"
+        );
+        assert_eq!(
+            doc.matches(&use_row).count(),
+            1,
+            "one <use> per distinct scene:\n{doc}"
+        );
+    }
 }

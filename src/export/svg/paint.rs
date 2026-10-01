@@ -2,6 +2,7 @@
 //! spans, braille dots, and escaping. Both the static poster and the animated
 //! document build from these, so the two cannot drift on colour or geometry.
 
+use super::blocks::is_block;
 use crate::export::raster::{TextCell, TextFrame};
 
 /// A maximal horizontal span of cells sharing `(fg, bg, bold)`, trimmed to the
@@ -35,9 +36,11 @@ pub(crate) fn row_cells(tf: &TextFrame, row: usize) -> Option<&[TextCell]> {
 
 /// Cells whose character can't ride in a `<text>` run: viewer fonts have no
 /// braille (raster.rs paints those dots itself) and no control character draws
-/// ink — both break the run instead.
+/// ink; block elements ride as `<rect>` geometry so the SVG fills exactly the
+/// pixels the GIF does, not the embedded face's own shade glyphs — all three
+/// break the run instead.
 fn breaks_run(ch: char) -> bool {
-    ch.is_control() || is_braille(ch)
+    ch.is_control() || is_braille(ch) || is_block(ch)
 }
 
 pub(crate) fn is_braille(ch: char) -> bool {
@@ -340,14 +343,19 @@ mod tests {
     }
 
     #[test]
-    fn breaks_run_covers_controls_and_braille() {
+    fn breaks_run_covers_controls_braille_and_blocks() {
         assert!(breaks_run('\n'));
         assert!(breaks_run('\t'));
         assert!(breaks_run('\u{7}'));
         assert!(breaks_run('⣿'));
+        assert!(breaks_run('░'));
+        assert!(breaks_run('█'));
         assert!(!breaks_run('a'));
         assert!(!breaks_run(' '));
         assert!(!breaks_run('é'));
+        // Box drawing (U+2500–U+257F) stays text: the embedded font has it.
+        assert!(!breaks_run('─'));
+        assert!(!breaks_run('\u{257f}'));
     }
 
     #[test]

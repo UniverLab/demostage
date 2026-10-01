@@ -3,16 +3,18 @@
 //! `<foreignObject>` — the animated document renders in a README `<img>`.
 
 mod animated;
+mod blocks;
 mod font;
 mod paint;
 mod poster;
 mod timing;
+mod writer;
 
 #[cfg(test)]
 mod tests;
 
-pub use animated::write_animated;
 pub use poster::{encode, frame_index, write_svg, PosterFrame};
+pub use writer::write_animated;
 
 use crate::model::{Pane, PaneKind, Score};
 

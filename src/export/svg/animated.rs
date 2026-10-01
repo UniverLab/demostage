@@ -8,16 +8,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
-use std::path::Path;
 
-use super::font::{collect_animated_glyphs, embed_for};
+use super::blocks::{block_rects, is_block};
 use super::paint::{bg_spans, braille_dots, escape_xml, hex, is_braille, merge_runs};
 use super::paint::{row_cells, Run};
 use super::timing::{duration_secs, item_rule, style_for, KeyGen};
-use crate::error::{Error, Result};
-use crate::export::raster::{FrameSource, TextFrame};
-use crate::export::run::Recording;
-use crate::model::Score;
+use crate::export::raster::TextFrame;
 
 /// One merged text run placed on the grid.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -47,17 +43,29 @@ pub(crate) struct DotItem {
     pub(crate) fg: [u8; 3],
 }
 
+/// One block-element cell: `ch` is painted as `<rect>` geometry, never as a
+/// `<text>` glyph — the embedded face draws ░▒▓ as its own dotted patterns,
+/// the raster paints a uniform wash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct BlockItem {
+    pub(crate) row: usize,
+    pub(crate) col: usize,
+    pub(crate) ch: char,
+    pub(crate) fg: [u8; 3],
+}
+
 /// One distinct screen state, in deterministic (row) order.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub(crate) struct Scene {
     pub(crate) bg: Vec<BgItem>,
     pub(crate) text: Vec<TextItem>,
     pub(crate) dots: Vec<DotItem>,
+    pub(crate) blocks: Vec<BlockItem>,
 }
 
 impl Scene {
     fn is_empty(&self) -> bool {
-        self.bg.is_empty() && self.text.is_empty() && self.dots.is_empty()
+        self.bg.is_empty() && self.text.is_empty() && self.dots.is_empty() && self.blocks.is_empty()
     }
 }
 
@@ -101,6 +109,7 @@ struct Persistent {
     bg: HashSet<BgItem>,
     text: HashSet<TextItem>,
     dots: HashSet<DotItem>,
+    blocks: HashSet<BlockItem>,
 }
 
 /// The scene of one grid frame: background spans, merged runs, braille cells.
@@ -129,6 +138,7 @@ pub(crate) fn scene_of(tf: &TextFrame) -> Scene {
         }
     }
     collect_dots(tf, &mut scene);
+    collect_blocks(tf, &mut scene);
     scene
 }
 
@@ -152,6 +162,27 @@ fn collect_dots(tf: &TextFrame, scene: &mut Scene) {
                     row,
                     col,
                     bits: braille_bits(cell.ch),
+                    fg: cell.fg,
+                });
+            }
+        }
+    }
+}
+
+/// Block cells become rect items (never text): they ride the same
+/// persistence/dedup machinery as the braille dots, so a static logo costs the
+/// same as a static one.
+fn collect_blocks(tf: &TextFrame, scene: &mut Scene) {
+    for row in 0..tf.rows {
+        let Some(cells) = row_cells(tf, row) else {
+            break;
+        };
+        for (col, cell) in cells.iter().enumerate() {
+            if is_block(cell.ch) {
+                scene.blocks.push(BlockItem {
+                    row,
+                    col,
+                    ch: cell.ch,
                     fg: cell.fg,
                 });
             }
@@ -268,7 +299,13 @@ fn split_persistent(unique: &[Scene], holds: &[Hold]) -> Persistent {
     let bg = persistent_set(holds, unique, |s| &s.bg);
     let text = persistent_set(holds, unique, |s| &s.text);
     let dots = persistent_set(holds, unique, |s| &s.dots);
-    Persistent { bg, text, dots }
+    let blocks = persistent_set(holds, unique, |s| &s.blocks);
+    Persistent {
+        bg,
+        text,
+        dots,
+        blocks,
+    }
 }
 
 /// The items of one lane that span consecutive holds.
@@ -307,6 +344,12 @@ fn residual_of(scene: &Scene, persistent: &Persistent) -> Scene {
             .dots
             .iter()
             .filter(|i| !persistent.dots.contains(*i))
+            .cloned()
+            .collect(),
+        blocks: scene
+            .blocks
+            .iter()
+            .filter(|i| !persistent.blocks.contains(*i))
             .cloned()
             .collect(),
     }
@@ -355,26 +398,120 @@ fn anim_dots_xml(item: &DotItem, geom: &Geom, extra: &str) -> String {
     format!("<g{extra}>{dots}</g>")
 }
 
-/// A scene's items as static markup: backgrounds, then dots, then text.
-fn residual_markup(scene: &Scene, geom: &Geom, family: &str) -> String {
-    let mut out = String::new();
-    for item in &scene.bg {
-        out.push_str(&anim_bg_xml(item, geom, ""));
-        out.push('\n');
+/// One block cell as `<rect>` geometry, wrapped in `<g>` when animated.
+fn anim_blocks_xml(item: &BlockItem, geom: &Geom, extra: &str) -> String {
+    let rects = block_rects(item.row, item.col, item.ch, item.fg, geom.cw, geom.ch);
+    if rects.is_empty() || extra.is_empty() {
+        return rects;
     }
-    for item in &scene.dots {
-        let dots = anim_dots_xml(item, geom, "");
-        if dots.is_empty() {
+    format!("<g{extra}>{rects}</g>")
+}
+
+/// Append one lane's items, a line each, skipping the ones that render
+/// nothing (the blank braille cell, a block the raster leaves empty) — the
+/// same rule for every lane, so they share it.
+fn push_lane<T>(items: &[T], out: &mut String, render: impl Fn(&T) -> String) {
+    for item in items {
+        let markup = render(item);
+        if markup.is_empty() {
             continue;
         }
-        out.push_str(&dots);
+        out.push_str(&markup);
         out.push('\n');
     }
-    for item in &scene.text {
-        out.push_str(&anim_text_xml(item, geom, family, ""));
+}
+
+/// A scene's items as static markup: backgrounds, then blocks and dots, then
+/// text — the procedural geometry sits under the text layer.
+fn residual_markup(scene: &Scene, geom: &Geom, family: &str) -> String {
+    let mut out = String::new();
+    push_lane(&scene.bg, &mut out, |i| anim_bg_xml(i, geom, ""));
+    push_lane(&scene.blocks, &mut out, |i| anim_blocks_xml(i, geom, ""));
+    push_lane(&scene.dots, &mut out, |i| anim_dots_xml(i, geom, ""));
+    push_lane(&scene.text, &mut out, |i| {
+        anim_text_xml(i, geom, family, "")
+    });
+    out
+}
+
+/// One persistent lane: every item of `lane` that survives consecutive holds,
+/// drawn once across them.
+///
+/// Items whose frame windows are IDENTICAL are grouped into one `<g>` sharing
+/// one `@keyframes` rule: a logo is hundreds of adjacent cells that all appear
+/// and vanish together, and emitting one rule each would multiply the document
+/// for no visual difference.
+///
+/// The lanes differ only in which [`Scene`] field they read and how an item is
+/// spelled, so they share this one walk — the background layer (`#pb`), the
+/// text, braille and block lanes (`#pt`) are the same shape.
+fn persistent_lane<T: Clone + Eq + Hash>(
+    input: &DocInput,
+    keys: &mut KeyGen,
+    total_secs: f64,
+    rules: &mut Vec<String>,
+    lane: impl Fn(&Scene) -> &[T],
+    render: impl Fn(&T, &Geom, &str) -> String,
+) -> String {
+    let per_hold: Vec<Vec<T>> = input
+        .holds
+        .iter()
+        .map(|h| lane(&input.unique[h.scene]).to_vec())
+        .collect();
+    let mut out = String::new();
+    for (frames, items) in persistent_groups(&per_hold, input.holds) {
+        let key = item_rule(keys, rules, &frames, input.n_frames);
+        let style = style_for(&key, total_secs);
+        let geom = &input.geom;
+        // A group of ONE keeps the plain spelling this lane has always emitted
+        // (the style on the item itself); only a genuinely shared window groups.
+        let markup = match items.as_slice() {
+            [one] => render(one, geom, &style),
+            _ => wrap_group(items.iter().map(|i| render(i, geom, "")), &style),
+        };
+        if markup.is_empty() {
+            continue;
+        }
+        out.push_str(&markup);
         out.push('\n');
     }
     out
+}
+
+/// One lane's persistent items that share a frame window, with those windows.
+type LaneGroup<T> = (Vec<(usize, usize)>, Vec<T>);
+
+/// The persistent items grouped by their exact frame windows, in first-seen
+/// order.
+fn persistent_groups<T: Clone + Eq + Hash>(
+    per_hold: &[Vec<T>],
+    holds: &[Hold],
+) -> Vec<LaneGroup<T>> {
+    let mut groups: Vec<LaneGroup<T>> = Vec::new();
+    for (item, windows) in windows_for(per_hold) {
+        if !is_persistent(&windows) {
+            continue;
+        }
+        let frames = hold_windows_to_frames(&windows, holds);
+        match groups.iter_mut().find(|(f, _)| *f == frames) {
+            Some((_, group)) => group.push(item),
+            None => groups.push((frames, vec![item])),
+        }
+    }
+    groups
+}
+
+/// Several items under one animation: their non-empty markup joined, wrapped
+/// in the one `<g>` that can carry the group's style.
+fn wrap_group(items: impl Iterator<Item = String>, style: &str) -> String {
+    let joined = items
+        .filter(|markup| !markup.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    match joined.is_empty() {
+        true => joined,
+        false => format!("<g{style}>{joined}</g>"),
+    }
 }
 
 /// The persistent background layer (`#pb`).
@@ -384,97 +521,44 @@ fn persistent_bg(
     total_secs: f64,
     rules: &mut Vec<String>,
 ) -> String {
-    let per_hold: Vec<Vec<BgItem>> = input
-        .holds
-        .iter()
-        .map(|h| input.unique[h.scene].bg.clone())
-        .collect();
-    let mut out = String::new();
-    for (item, windows) in windows_for(&per_hold) {
-        if !is_persistent(&windows) {
-            continue;
-        }
-        let frames = hold_windows_to_frames(&windows, input.holds);
-        let key = item_rule(keys, rules, &frames, input.n_frames);
-        out.push_str(&anim_bg_xml(
-            &item,
-            &input.geom,
-            &style_for(&key, total_secs),
-        ));
-        out.push('\n');
-    }
-    out
+    persistent_lane(input, keys, total_secs, rules, |s| &s.bg, anim_bg_xml)
 }
 
-/// The persistent text + braille layer (`#pt`).
+/// The persistent text + braille + block layer (`#pt`). The lanes are emitted
+/// in draw order — text, then the procedural braille dots, then the block rects
+/// — which is also the order their keyframes rules take.
 fn persistent_fg(
     input: &DocInput,
     keys: &mut KeyGen,
     total_secs: f64,
     rules: &mut Vec<String>,
 ) -> String {
+    let family = &input.font_family;
     let mut out = String::new();
-    out.push_str(&persistent_text(input, keys, total_secs, rules));
-    out.push_str(&persistent_dots(input, keys, total_secs, rules));
-    out
-}
-
-/// Persistent text runs, each drawn once across its consecutive holds.
-fn persistent_text(
-    input: &DocInput,
-    keys: &mut KeyGen,
-    total_secs: f64,
-    rules: &mut Vec<String>,
-) -> String {
-    let per_hold: Vec<Vec<TextItem>> = input
-        .holds
-        .iter()
-        .map(|h| input.unique[h.scene].text.clone())
-        .collect();
-    let mut out = String::new();
-    for (item, windows) in windows_for(&per_hold) {
-        if !is_persistent(&windows) {
-            continue;
-        }
-        let frames = hold_windows_to_frames(&windows, input.holds);
-        let key = item_rule(keys, rules, &frames, input.n_frames);
-        out.push_str(&anim_text_xml(
-            &item,
-            &input.geom,
-            &input.font_family,
-            &style_for(&key, total_secs),
-        ));
-        out.push('\n');
-    }
-    out
-}
-
-/// Persistent braille cells, each drawn once across its consecutive holds.
-fn persistent_dots(
-    input: &DocInput,
-    keys: &mut KeyGen,
-    total_secs: f64,
-    rules: &mut Vec<String>,
-) -> String {
-    let per_hold: Vec<Vec<DotItem>> = input
-        .holds
-        .iter()
-        .map(|h| input.unique[h.scene].dots.clone())
-        .collect();
-    let mut out = String::new();
-    for (item, windows) in windows_for(&per_hold) {
-        if !is_persistent(&windows) {
-            continue;
-        }
-        let frames = hold_windows_to_frames(&windows, input.holds);
-        let key = item_rule(keys, rules, &frames, input.n_frames);
-        let dots = anim_dots_xml(&item, &input.geom, &style_for(&key, total_secs));
-        if dots.is_empty() {
-            continue;
-        }
-        out.push_str(&dots);
-        out.push('\n');
-    }
+    out.push_str(&persistent_lane(
+        input,
+        keys,
+        total_secs,
+        rules,
+        |s| &s.text,
+        |item, geom, style| anim_text_xml(item, geom, family, style),
+    ));
+    out.push_str(&persistent_lane(
+        input,
+        keys,
+        total_secs,
+        rules,
+        |s| &s.dots,
+        anim_dots_xml,
+    ));
+    out.push_str(&persistent_lane(
+        input,
+        keys,
+        total_secs,
+        rules,
+        |s| &s.blocks,
+        anim_blocks_xml,
+    ));
     out
 }
 
@@ -647,69 +731,4 @@ pub(crate) fn render_document(input: &DocInput) -> String {
     out.push_str(&final_group(input));
     out.push_str("</svg>\n");
     out
-}
-
-/// Walk the whole replay once (allocation only — nothing rasterized), fold it
-/// into scenes + holds, and write the animated SVG.
-pub fn write_animated(path: &Path, rec: &Recording, score: &Score) -> Result<()> {
-    let mut source = FrameSource::new(rec, score)?;
-    let (w, h) = source.dims();
-    let fps = score.layout.fps.max(1);
-    let mut scenes: Vec<Scene> = Vec::new();
-    let mut geom = Geom {
-        cw: 10,
-        ch: 20,
-        px: 16.0,
-    };
-    let mut default_bg = [11, 15, 20];
-    let mut seen_first = false;
-    // Bounded: the source yields exactly `n_frames` frames, so walk them by
-    // count — the walk ends on its own whatever the per-frame result is.
-    let n = source.n_frames();
-    for _ in 0..n {
-        let Some(tf) = source.next_text_frame() else {
-            break;
-        };
-        if !seen_first {
-            geom = Geom {
-                cw: tf.cell_w,
-                ch: tf.cell_h,
-                px: tf.px,
-            };
-            default_bg = tf.default_bg;
-            seen_first = true;
-        }
-        scenes.push(scene_of(&tf));
-    }
-    if scenes.is_empty() {
-        return Err(Error::Export("svg: no frames were emitted".to_string()));
-    }
-    let final_tf = source.text_frame();
-    let (unique, holds) = fold_scenes(scenes);
-    let (font_family, font_face) =
-        embed_for(&collect_animated_glyphs(&unique), &final_tf.font_family)?;
-    let input = DocInput {
-        unique: &unique,
-        holds: &holds,
-        // The frames actually walked, not `n_frames()`: the holds index real
-        // frames, so the percentages that place every state on the timeline
-        // must be scaled by however many the walk produced.
-        n_frames: holds.last().map_or(0, |h| h.end),
-        fps,
-        w,
-        h,
-        geom,
-        default_bg,
-        final_tf: &final_tf,
-        font_family,
-        font_face,
-    };
-    let doc = render_document(&input);
-    std::fs::write(path, &doc).map_err(|e| Error::io(path, e))?;
-    eprintln!(
-        "demo: animated svg: {} states, {:.1} KB",
-        unique.len(),
-        doc.len() as f64 / 1024.0
-    );
-    Ok(())
 }
