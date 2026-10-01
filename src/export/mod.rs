@@ -72,6 +72,13 @@ pub fn rewrite_local_urls(score: &Score, server_port: u16) -> Score {
     score
 }
 
+/// The MP4 encoder [`render_mp4`] drives: it receives the resolved geometry and
+/// a frame source, and writes the container at the given path. Production always
+/// passes [`mp4::encode`], which spawns a real ffmpeg (provisioned on first
+/// use) — taking it as a parameter is what lets the render path be tested
+/// without a provisioned ffmpeg on the machine.
+type Mp4Encoder<'a> = &'a dyn Fn(&Path, usize, usize, u32, mp4::FrameSource<'_>) -> Result<()>;
+
 /// The resolved geometry and rate a target renders at, plus how the frames are
 /// produced (staged compositing vs. a single terminal grid).
 struct RenderPlan {
@@ -111,6 +118,22 @@ pub fn render(
     speed: f64,
     at_secs: Option<f64>,
 ) -> Result<PathBuf> {
+    render_with(rec, score, target, speed, at_secs, &mp4::encode)
+}
+
+/// [`render`] with the MP4 encoder injected. `render` always uses the real
+/// ffmpeg-backed [`mp4::encode`]; this seam exists so a test can drive the
+/// whole render path (geometry resolution, frame production, the exact output
+/// path) with a stub encoder, on a machine where ffmpeg is neither installed
+/// nor downloadable. Behaviour is otherwise identical.
+fn render_with(
+    rec: &Recording,
+    score: &Score,
+    target: Target,
+    speed: f64,
+    at_secs: Option<f64>,
+    encode: Mp4Encoder<'_>,
+) -> Result<PathBuf> {
     let problems = validate(score);
     if !problems.is_empty() {
         return Err(Error::Validation(problems.join("\n")));
@@ -141,7 +164,7 @@ pub fn render(
 
     match target {
         Target::Gif => render_gif(rec, &score, &plan),
-        Target::Mp4 => render_mp4(rec, &score, &plan),
+        Target::Mp4 => render_mp4(rec, &score, &plan, encode),
         Target::Svg => render_svg(rec, &score, &plan, at_secs),
     }
 }
@@ -184,14 +207,19 @@ fn render_gif(rec: &Recording, score: &Score, plan: &RenderPlan) -> Result<PathB
 }
 
 /// Render every frame into an MP4 (via ffmpeg) at the resolved geometry.
-fn render_mp4(rec: &Recording, score: &Score, plan: &RenderPlan) -> Result<PathBuf> {
+fn render_mp4(
+    rec: &Recording,
+    score: &Score,
+    plan: &RenderPlan,
+    encode: Mp4Encoder<'_>,
+) -> Result<PathBuf> {
     let path = resolve_output(score, "mp4");
     ensure_parent(&path)?;
     let mut report = raster::FallbackReport::new();
     if plan.staged {
         let mut progress = Progress::new("exporting mp4", plan.total_frames);
         let mut browser_reports = Vec::new();
-        mp4::encode(&path, plan.cw, plan.ch, plan.fps, |emit| {
+        encode(&path, plan.cw, plan.ch, plan.fps, &mut |emit| {
             let r = stage::render_stage(rec, score, plan.speed, |f| {
                 progress.tick();
                 emit(f);
@@ -204,7 +232,7 @@ fn render_mp4(rec: &Recording, score: &Score, plan: &RenderPlan) -> Result<PathB
         report_browser_captures(&browser_reports);
     } else {
         let mut progress = Progress::new("exporting mp4", plan.total_frames);
-        mp4::encode(&path, plan.cw, plan.ch, plan.fps, |emit| {
+        encode(&path, plan.cw, plan.ch, plan.fps, &mut |emit| {
             let (_plan, r) = raster::render_frames(rec, score, |f| {
                 progress.tick();
                 emit(f);
@@ -1041,13 +1069,148 @@ fps = 15
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A stand-in for `mp4::encode` that records what the render path asked for
+    /// and writes a placeholder container, so the mp4 branch of `render` is
+    /// covered without a real ffmpeg. Mutating the real encoder is out of scope
+    /// for a unit test: it spawns a process and may download a binary.
+    type StubCalls =
+        std::rc::Rc<std::cell::RefCell<Vec<(std::path::PathBuf, usize, usize, u32, usize)>>>;
+
+    /// Owned form of [`Mp4Encoder`] so the capturing stub closure below can be
+    /// stored (and named) without repeating the function type inline.
+    type OwnedMp4Encoder =
+        Box<dyn Fn(&Path, usize, usize, u32, mp4::FrameSource<'_>) -> Result<()>>;
+
+    struct StubEncoder {
+        calls: StubCalls,
+        encode: OwnedMp4Encoder,
+    }
+
+    impl StubEncoder {
+        /// Each recorded call ends with the number of frames the render path
+        /// produced for the resolved geometry.
+        fn new() -> Self {
+            let calls: StubCalls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let record = std::rc::Rc::clone(&calls);
+            let encode =
+                move |path: &Path, w: usize, h: usize, fps: u32, frames: mp4::FrameSource<'_>| {
+                    let mut n = 0usize;
+                    frames(&mut |_frame: &[u8]| n += 1)?;
+                    record.borrow_mut().push((path.to_path_buf(), w, h, fps, n));
+                    std::fs::write(path, b"stub-mp4").map_err(|e| Error::io(path, e))
+                };
+            Self {
+                calls,
+                encode: Box::new(encode),
+            }
+        }
+
+        /// The stub as the encoder `render` expects.
+        fn as_encoder(&self) -> Mp4Encoder<'_> {
+            &*self.encode
+        }
+    }
+
     #[test]
     fn render_mp4_writes_its_exact_path() {
         let dir = render_dir("mp4");
         let score = single_terminal_score(&dir);
-        let path = render(&rec(), &score, Target::Mp4, 1.0, None).unwrap();
+        let encoder = StubEncoder::new();
+        let path =
+            render_with(&rec(), &score, Target::Mp4, 1.0, None, encoder.as_encoder()).unwrap();
         assert_eq!(path, dir.join("t.mp4"));
         assert!(path.exists(), "mp4 file must be written");
+
+        // The render path resolved the pane grid's geometry (cols*cell_w by
+        // rows*cell_h), not the layout canvas, and the score's fps.
+        let calls = encoder.calls.borrow();
+        assert_eq!(calls.len(), 1, "the encoder must be driven exactly once");
+        let (asked_path, w, h, fps, frames) = calls[0].clone();
+        assert_eq!(asked_path, dir.join("t.mp4"));
+        // 80x24 cells of 10x19 px (font 16: 16*0.6 and 16*1.2) — the pane grid,
+        // NOT the 800x600 layout canvas, which only the staged path uses.
+        assert_eq!(
+            (w, h),
+            (80 * 10, 24 * 19),
+            "pane grid geometry, not the canvas"
+        );
+        assert_ne!((w, h), (800, 600), "a single terminal is not staged");
+        assert_eq!(fps, 15, "the score's fps");
+        assert_eq!(frames, 16, "duration*fps + 1 frames");
+        drop(calls);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_mp4_propagates_an_encoder_failure() {
+        let dir = render_dir("mp4-fail");
+        let score = single_terminal_score(&dir);
+        let fail = |_p: &Path, _w: usize, _h: usize, _fps: u32, _frames: mp4::FrameSource<'_>| {
+            Err(Error::Export("stub encode failed".to_string()))
+        };
+        let err = render_with(&rec(), &score, Target::Mp4, 1.0, None, &fail).unwrap_err();
+        assert!(err.to_string().contains("stub encode failed"), "got: {err}");
+        assert!(
+            !dir.join("t.mp4").exists(),
+            "a failed encode must not leave a container behind"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A two-terminal score: `needs_stage` is true (more than one pane), so
+    /// the staged branch of `render_mp4` runs and composites on the canvas.
+    /// Terminal-only, so it stays headless — no browser pane, no Chromium.
+    fn two_terminal_score(dir: &std::path::Path) -> Score {
+        let mut score: Score = toml::from_str(
+            r#"
+[demo]
+name = "t"
+[layout]
+width = 800
+height = 600
+fps = 15
+  [[layout.panes]]
+  id = "left"
+  type = "terminal"
+  x = 0
+  y = 0
+  width = 400
+  height = 600
+  [[layout.panes]]
+  id = "right"
+  type = "terminal"
+  x = 400
+  y = 0
+  width = 400
+  height = 600
+"#,
+        )
+        .unwrap();
+        score.demo.output_dir = dir.to_path_buf();
+        score
+    }
+
+    #[test]
+    fn render_mp4_staged_composites_on_the_canvas() {
+        let dir = render_dir("mp4-staged");
+        let score = two_terminal_score(&dir);
+        let encoder = StubEncoder::new();
+        let path =
+            render_with(&rec(), &score, Target::Mp4, 1.0, None, encoder.as_encoder()).unwrap();
+        assert_eq!(path, dir.join("t.mp4"));
+        assert!(path.exists(), "mp4 file must be written");
+
+        // A staged score renders at the layout canvas (800x600), NOT the pane
+        // grid — this is the branch a single terminal never reaches.
+        let calls = encoder.calls.borrow();
+        assert_eq!(calls.len(), 1, "the encoder must be driven exactly once");
+        let (asked_path, w, h, fps, frames) = calls[0].clone();
+        assert_eq!(asked_path, dir.join("t.mp4"));
+        assert_eq!((w, h), (800, 600), "the staged canvas, not the pane grid");
+        assert_ne!((w, h), (80 * 10, 24 * 19), "not the single-terminal grid");
+        assert_eq!(fps, 15, "the score's fps");
+        assert_eq!(frames, 16, "duration*fps + 1 frames");
+        drop(calls);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
