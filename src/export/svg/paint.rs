@@ -45,71 +45,93 @@ pub(crate) fn is_braille(ch: char) -> bool {
 }
 
 /// The cell-run merging the SVG targets are built from: adjacent cells with
-/// the same style become one `<text>` run.
+/// the same style become one `<text>` run. Bounded: a single pass over the
+/// row's cells (no manual index stepping), so the scan ends on its own
+/// whatever the cells hold; each maximal style span is flushed exactly once.
 pub(crate) fn merge_runs(tf: &TextFrame, row: usize) -> Vec<Run> {
-    let mut runs = Vec::new();
     let Some(cells) = row_cells(tf, row) else {
-        return runs;
+        return Vec::new();
     };
-    let mut i = 0;
-    while i < cells.len() {
-        if breaks_run(cells[i].ch) {
-            i += 1;
+    let mut runs = Vec::new();
+    let mut span_start: Option<usize> = None;
+    for (idx, cell) in cells.iter().enumerate() {
+        if breaks_run(cell.ch) {
+            flush_span(cells, &mut span_start, idx, &mut runs);
             continue;
         }
-        let head = cells[i];
-        let mut end = i + 1;
-        while end < cells.len()
-            && !breaks_run(cells[end].ch)
-            && cells[end].fg == head.fg
-            && cells[end].bg == head.bg
-            && cells[end].bold == head.bold
-        {
-            end += 1;
+        match span_start {
+            None => span_start = Some(idx),
+            Some(start) => {
+                let head = cells[start];
+                if cell.fg != head.fg || cell.bg != head.bg || cell.bold != head.bold {
+                    flush_span(cells, &mut span_start, idx, &mut runs);
+                    span_start = Some(idx);
+                }
+            }
         }
-        let (mut first, mut last) = (i, end);
-        while first < last && cells[first].ch == ' ' {
-            first += 1;
-        }
-        while last > first && cells[last - 1].ch == ' ' {
-            last -= 1;
-        }
-        if first < last {
-            runs.push(Run {
-                start: first,
-                text: cells[first..last].iter().map(|c| c.ch).collect(),
-                fg: head.fg,
-                bold: head.bold,
-            });
-        }
-        i = end;
     }
+    let len = cells.len();
+    flush_span(cells, &mut span_start, len, &mut runs);
     runs
 }
 
+/// Flush the open style span `[start, end)` as one trimmed run, if it draws
+/// ink: leading spaces shift `start`, trailing ones draw nothing, and an
+/// all-space span emits nothing.
+fn flush_span(
+    cells: &[TextCell],
+    span_start: &mut Option<usize>,
+    span_end: usize,
+    runs: &mut Vec<Run>,
+) {
+    let Some(start) = span_start.take() else {
+        return;
+    };
+    let slice = &cells[start..span_end];
+    let lead = slice.iter().take_while(|c| c.ch == ' ').count();
+    if lead == slice.len() {
+        return;
+    }
+    let trail = slice.iter().rev().take_while(|c| c.ch == ' ').count();
+    let first = start + lead;
+    runs.push(Run {
+        start: first,
+        text: slice[lead..slice.len() - trail]
+            .iter()
+            .map(|c| c.ch)
+            .collect(),
+        fg: slice[0].fg,
+        bold: slice[0].bold,
+    });
+}
+
 /// The structured background spans of a frame, in row order. [`bg_rects`]
-/// formats them; the animated writer consumes them directly.
+/// formats them; the animated writer consumes them directly. Bounded: one
+/// pass per row over enumerated cells (no manual column stepping), so the
+/// scan ends on its own whatever the cells hold.
 pub(crate) fn bg_spans(tf: &TextFrame) -> Vec<BgSpan> {
     let mut out = Vec::new();
     for row in 0..tf.rows {
         let Some(cells) = row_cells(tf, row) else {
             break;
         };
-        let mut col = 0;
-        while col < cells.len() {
-            let bg = cells[col].bg;
-            if bg == tf.default_bg {
-                col += 1;
+        for (col, cell) in cells.iter().enumerate() {
+            if cell.bg == tf.default_bg {
                 continue;
             }
-            let end = col + 1 + cells[col + 1..].iter().take_while(|c| c.bg == bg).count();
+            if col > 0 && cells[col - 1].bg == cell.bg {
+                continue;
+            }
+            let len = 1 + cells[col + 1..]
+                .iter()
+                .take_while(|c| c.bg == cell.bg)
+                .count();
             out.push(BgSpan {
                 row,
                 start: col,
-                cells: end - col,
-                color: bg,
+                cells: len,
+                color: cell.bg,
             });
-            col = end;
         }
     }
     out
@@ -638,5 +660,100 @@ mod tests {
 
         assert_eq!(escape_attr("plain"), "plain");
         assert_eq!(escape_attr("a\"b'c&<"), "a&quot;b'c&amp;&lt;");
+    }
+
+    #[test]
+    fn a_span_after_a_break_with_leading_spaces_shifts_start_exactly() {
+        // ⣿ breaks the row, so the second span starts at 1 with two leading
+        // spaces: start = 1 + 2 = 3 (`*` would give 2, `-` would underflow).
+        let tf = frame(
+            5,
+            1,
+            vec![
+                cell('⣿', [255, 0, 0]),
+                cell(' ', [255, 0, 0]),
+                cell(' ', [255, 0, 0]),
+                cell('a', [255, 0, 0]),
+                cell('b', [255, 0, 0]),
+            ],
+        );
+        assert_eq!(
+            merge_runs(&tf, 0),
+            vec![Run {
+                start: 3,
+                text: "ab".to_string(),
+                fg: [255, 0, 0],
+                bold: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_single_trailing_space_trims_exactly_one_cell() {
+        // "a " keeps "a": len 2 - trail 1 = 1 (`+` would give 3 and panic on
+        // the slice, `/` would give 2 and keep the space).
+        let tf = frame(2, 1, vec![cell('a', [7, 7, 7]), cell(' ', [7, 7, 7])]);
+        assert_eq!(
+            merge_runs(&tf, 0),
+            vec![Run {
+                start: 0,
+                text: "a".to_string(),
+                fg: [7, 7, 7],
+                bold: false,
+            }]
+        );
+        // "a  " (two trailing spaces) keeps "a" as well: 3 - 2 = 1.
+        let tf2 = frame(
+            3,
+            1,
+            vec![
+                cell('a', [7, 7, 7]),
+                cell(' ', [7, 7, 7]),
+                cell(' ', [7, 7, 7]),
+            ],
+        );
+        assert_eq!(
+            merge_runs(&tf2, 0),
+            vec![Run {
+                start: 0,
+                text: "a".to_string(),
+                fg: [7, 7, 7],
+                bold: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn bg_spans_split_adjacent_different_colours_and_count_three_wide() {
+        let tf = frame(
+            5,
+            1,
+            vec![
+                styled('a', [0, 0, 0], [255, 0, 0], false),
+                styled('b', [0, 0, 0], [255, 0, 0], false),
+                styled('c', [0, 0, 0], [255, 0, 0], false),
+                styled('d', [0, 0, 0], [0, 80, 160], false),
+                cell('e', [0, 0, 0]),
+            ],
+        );
+        // A three-wide run pins `1 + count` (1 + 2 = 3, not 1 * 2 = 2), and
+        // the colour change pins the continuation check (`==`, not `!=`).
+        assert_eq!(
+            bg_spans(&tf),
+            vec![
+                BgSpan {
+                    row: 0,
+                    start: 0,
+                    cells: 3,
+                    color: [255, 0, 0],
+                },
+                BgSpan {
+                    row: 0,
+                    start: 3,
+                    cells: 1,
+                    color: [0, 80, 160],
+                },
+            ]
+        );
     }
 }

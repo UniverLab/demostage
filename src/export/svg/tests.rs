@@ -1,6 +1,6 @@
 use super::animated::{
-    braille_bits, fold_scenes, render_document, scene_of, windows_for, write_animated, BgItem,
-    DocInput, DotItem, Geom, Scene, TextItem, ANIM_FAMILY,
+    braille_bits, fold_scenes, render_document, scene_hold_windows, scene_of, windows_for,
+    write_animated, BgItem, DocInput, DotItem, Geom, Hold, Scene, TextItem, ANIM_FAMILY,
 };
 use super::animated_refusal;
 use super::paint::{escape_attr, escape_xml, merge_runs};
@@ -1320,4 +1320,89 @@ fn braille_bits_subtract_the_base() {
     assert_eq!(braille_bits('\u{2801}'), 0x01);
     assert_eq!(braille_bits('\u{2847}'), 0x47);
     assert_eq!(braille_bits('\u{28ff}'), 0xff);
+}
+
+/// `scene_hold_windows` returns each maximal consecutive run of holds showing
+/// `sid`, ends exclusive: a split scene yields two windows, a trailing run
+/// ends at `holds.len()`, and gaps stay gaps.
+#[test]
+fn scene_hold_windows_groups_consecutive_runs_with_exact_bounds() {
+    let holds = vec![
+        Hold {
+            scene: 0,
+            start: 0,
+            end: 1,
+        },
+        Hold {
+            scene: 1,
+            start: 1,
+            end: 2,
+        },
+        Hold {
+            scene: 0,
+            start: 2,
+            end: 3,
+        },
+        Hold {
+            scene: 0,
+            start: 3,
+            end: 4,
+        },
+        Hold {
+            scene: 2,
+            start: 4,
+            end: 5,
+        },
+    ];
+    // Scene 0 appears at hold 0 alone, then as the consecutive pair 2..4:
+    // `end = hold + 1` (not `*`: 2 + 1 = 3, not 2) and the inner scan keeps
+    // extending while the next hold matches (not the opposite).
+    assert_eq!(scene_hold_windows(&holds, 0), vec![(0, 1), (2, 4)]);
+    // A lone middle scene is exactly its own hold.
+    assert_eq!(scene_hold_windows(&holds, 1), vec![(1, 2)]);
+    // The trailing run ends at `holds.len()` (5), not at its start.
+    assert_eq!(scene_hold_windows(&holds, 2), vec![(4, 5)]);
+}
+
+/// No hold shows the scene (or there are no holds at all): no windows.
+/// Flipping `==` to `!=` would return every other hold here instead.
+#[test]
+fn scene_hold_windows_with_no_match_is_empty() {
+    let holds = vec![
+        Hold {
+            scene: 0,
+            start: 0,
+            end: 1,
+        },
+        Hold {
+            scene: 1,
+            start: 1,
+            end: 2,
+        },
+    ];
+    assert!(scene_hold_windows(&holds, 7).is_empty());
+    assert!(scene_hold_windows(&[], 0).is_empty());
+}
+
+/// Every hold shows the scene: one window spanning the whole table.
+#[test]
+fn scene_hold_windows_covering_every_hold_is_one_window() {
+    let holds = vec![
+        Hold {
+            scene: 3,
+            start: 0,
+            end: 1,
+        },
+        Hold {
+            scene: 3,
+            start: 1,
+            end: 2,
+        },
+        Hold {
+            scene: 3,
+            start: 2,
+            end: 3,
+        },
+    ];
+    assert_eq!(scene_hold_windows(&holds, 3), vec![(0, 3)]);
 }

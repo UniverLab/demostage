@@ -529,21 +529,24 @@ fn state_layers(
     StateLayers { defs, body, rules }
 }
 
-/// The consecutive hold runs showing scene `sid`.
-fn scene_hold_windows(holds: &[Hold], sid: usize) -> Vec<(usize, usize)> {
+/// The consecutive hold runs showing scene `sid`, in order: each maximal run
+/// of holds with `scene == sid` becomes one `(first_hold, end_hold)` window
+/// with the end exclusive. Bounded over the holds table (one pass, no manual
+/// index stepping) so the scan ends on its own whatever the entries hold.
+pub(crate) fn scene_hold_windows(holds: &[Hold], sid: usize) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
-    let mut hold = 0;
-    while hold < holds.len() {
-        if holds[hold].scene != sid {
-            hold += 1;
-            continue;
+    let mut start: Option<usize> = None;
+    for (idx, hold) in holds.iter().enumerate() {
+        if hold.scene == sid {
+            if start.is_none() {
+                start = Some(idx);
+            }
+        } else if let Some(first) = start.take() {
+            out.push((first, idx));
         }
-        let mut end = hold + 1;
-        while end < holds.len() && holds[end].scene == sid {
-            end += 1;
-        }
-        out.push((hold, end));
-        hold = end;
+    }
+    if let Some(first) = start.take() {
+        out.push((first, holds.len()));
     }
     out
 }
