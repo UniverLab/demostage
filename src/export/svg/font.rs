@@ -151,12 +151,12 @@ mod tests {
     }
 
     #[test]
-    fn animated_collection_skips_controls_and_braille_but_keeps_space() {
+    fn animated_collection_skips_controls_braille_and_blocks_but_keeps_space() {
         let scene = Scene {
             text: vec![crate::export::svg::animated::TextItem {
                 row: 0,
                 start: 0,
-                text: "a\nb\u{28ff}c".into(),
+                text: "a\nb\u{28ff}c░█─".into(),
                 fg: [0, 0, 0],
                 bold: false,
             }],
@@ -166,9 +166,12 @@ mod tests {
         assert!(chars.contains(&'a'));
         assert!(chars.contains(&'b'));
         assert!(chars.contains(&'c'));
+        assert!(chars.contains(&'─'), "box drawing stays text");
         assert!(chars.contains(&' '), "space always kept");
         assert!(!chars.contains(&'\n'), "controls skipped");
         assert!(!chars.contains(&'\u{28ff}'), "braille skipped");
+        assert!(!chars.contains(&'░'), "blocks ride as rects, not glyphs");
+        assert!(!chars.contains(&'█'), "blocks ride as rects, not glyphs");
     }
 
     #[test]

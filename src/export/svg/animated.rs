@@ -112,7 +112,8 @@ struct Persistent {
     blocks: HashSet<BlockItem>,
 }
 
-/// The scene of one grid frame: background spans, merged runs, braille cells.
+/// The scene of one grid frame: background spans, merged runs, braille cells,
+/// block cells.
 pub(crate) fn scene_of(tf: &TextFrame) -> Scene {
     let mut scene = Scene::default();
     for span in bg_spans(tf) {
