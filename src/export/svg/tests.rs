@@ -1804,3 +1804,44 @@ fn animated_block_cells_are_scene_items_not_text() {
         );
     }
 }
+
+/// The residual is the scene MINUS its persistent items, so a block that never
+/// survives two consecutive holds (a transient one) is not hoisted into `#pt` and
+/// must still be drawn by its state group in `<defs>`. Keeping only the
+/// persistent blocks instead of dropping them would blank it out.
+#[test]
+fn a_transient_block_is_drawn_by_its_state_group_not_by_the_persistent_layer() {
+    // The █ lives in the first hold alone: `is_persistent` needs a window of two
+    // holds, so it is transient — the opposite of the persistent block above.
+    let f0 = frame(
+        3,
+        1,
+        vec![
+            cell('a', [200, 200, 200]),
+            cell('█', [0, 255, 0]),
+            cell(' ', [200, 200, 200]),
+        ],
+    );
+    let f1 = frame(3, 1, text_row("bbb", 3));
+    let f2 = frame(3, 1, text_row("ccc", 3));
+    let doc = animated_doc(&[f0, f1, f2], 30, 20, 3);
+    let rect = "<rect x=\"10\" y=\"0\" width=\"10\" height=\"20\" fill=\"#00ff00\"/>";
+    let defs_start = doc.find("<defs>").expect("state groups live in <defs>");
+    let defs_end = doc.find("</defs>").expect("state groups live in <defs>");
+    let defs = &doc[defs_start..defs_end];
+    assert_eq!(
+        defs.matches(rect).count(),
+        1,
+        "the transient block must ride its state group exactly once:\n{doc}"
+    );
+    // It is not persistent, so the persistent layer must not carry a copy.
+    let pt_start = doc.find("<g id=\"pt\">").expect("persistent fg layer");
+    let pt_end = doc[pt_start..]
+        .find("</g>")
+        .expect("persistent fg layer ends")
+        + pt_start;
+    assert!(
+        !doc[pt_start..pt_end].contains(rect),
+        "a block that never spans two holds is not persistent:\n{doc}"
+    );
+}

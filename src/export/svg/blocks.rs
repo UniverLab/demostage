@@ -316,6 +316,44 @@ mod tests {
         }
     }
 
+    /// The same walk on cells too small for a 10×20 grid to reach: the integer
+    /// halves and eighths round differently at an odd `h` or `w`, and the
+    /// degenerate (zero-column / zero-row) regions drop out entirely, so a
+    /// codepoint may legitimately draw nothing at all here.
+    #[test]
+    fn every_block_codepoint_matches_the_raster_on_odd_and_tiny_cells() {
+        for (w, h) in [(4, 5), (3, 3), (1, 4), (5, 1)] {
+            for cp in 0x2580..=0x259f_u32 {
+                let ch = char::from_u32(cp).unwrap();
+                let markup = block_rects(0, 0, ch, [1, 2, 3], w, h);
+                assert_eq!(
+                    coverage_of(&markup, w, h),
+                    block_cell(ch, w, h).unwrap(),
+                    "U+{cp:04X} coverage drifted from the raster at {w}x{h}"
+                );
+            }
+        }
+    }
+
+    /// ▄ is its own arm, not the middle of the lower-eighths range: at an odd
+    /// `h` the two disagree (`y >= h / 2` is one row taller than
+    /// `fill = h * 4 / 8`), so only an odd-height cell tells them apart.
+    #[test]
+    fn the_lower_half_block_is_not_the_fourth_lower_eighth() {
+        // h = 5: y >= 5 / 2 = 2 → rows 2, 3, 4. The eighths fallback would give
+        // fill = 5 * 4 / 8 = 2 → rows 3, 4 only.
+        assert_eq!(
+            block_rects(0, 0, '▄', [0, 0, 0], 4, 5),
+            "<rect x=\"0\" y=\"2\" width=\"4\" height=\"3\" fill=\"#000000\"/>"
+        );
+        // The even height the rest of the suite uses cannot tell them apart:
+        // h = 4 → h / 2 == 4 * 4 / 8 == 2, one and the same region.
+        assert_eq!(
+            block_rects(0, 0, '▄', [0, 0, 0], 4, 4),
+            "<rect x=\"0\" y=\"2\" width=\"4\" height=\"2\" fill=\"#000000\"/>"
+        );
+    }
+
     #[test]
     fn characters_outside_the_block_range_emit_nothing() {
         for ch in ['a', ' ', '─', '\u{257f}', '\u{25a0}', '⣿', '\n'] {
@@ -341,6 +379,13 @@ mod tests {
 
     #[test]
     fn degenerate_regions_emit_no_zero_area_rect() {
+        // A region with no COLUMNS is degenerate too, and `w / 8 == 0` at w = 4
+        // reaches it with `h > 0` still true: ▕'s width, ▏'s fill and a
+        // one-column cell's left quadrants are all zero columns. None of them may
+        // become a `<rect width="0">`.
+        assert_eq!(block_rects(0, 0, '▕', [0, 0, 0], 4, 20), "");
+        assert_eq!(block_rects(0, 0, '▏', [0, 0, 0], 4, 20), "");
+        assert_eq!(block_rects(0, 0, '▘', [0, 0, 0], 1, 4), "");
         // A cell too short for its region (`h / 8 == 0` or `h / 2 == 0`): the
         // raster's predicate matches nothing, so neither may we — and never a
         // `<rect height="0">`.
@@ -352,13 +397,18 @@ mod tests {
             block_rects(0, 0, '▐', [0, 0, 0], 1, 1),
             "<rect x=\"0\" y=\"0\" width=\"1\" height=\"1\" fill=\"#000000\"/>"
         );
-        // The one-pixel-wide cases still agree with the reference.
+        // The narrow cases still agree with the reference.
         for (ch, w, h) in [
             ('▀', 1, 1),
             ('▐', 1, 1),
             ('▔', 10, 4),
             ('▀', 10, 1),
             ('█', 1, 1),
+            ('▕', 4, 20),
+            ('▏', 4, 20),
+            ('▘', 1, 4),
+            ('▖', 1, 4),
+            ('▚', 3, 3),
         ] {
             assert_eq!(
                 coverage_of(&block_rects(0, 0, ch, [1, 2, 3], w, h), w, h),
