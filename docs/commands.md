@@ -136,6 +136,8 @@ A demo whose last command leaves a process in the foreground (a server, a REPL) 
 killed after a short grace period rather than blocking; end such a step with
 `Ctrl-C` or `terminate` to be clean. For a multi-pane stage, only the **terminal
 pane** is executed and recorded; `export` composites the browser panes around it.
+Before the timeline runs it waits up to 20 s for the shell to be ready and fails —
+leaving no `.rec` — instead of recording an unready shell.
 
 > Don't want to re-execute (interactive tool, needs secrets, has side effects)?
 > Skip `record` and render the faithful capture directly with `demo export --force`

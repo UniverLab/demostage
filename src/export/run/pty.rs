@@ -60,6 +60,9 @@ pub(super) struct CapturePty {
     /// `PS1` (or `PROMPT` on zsh) — the variable the pre-roll forces.
     pub(super) ps_var: &'static str,
     pub(super) prompt: String,
+    /// The shell executable this PTY was spawned with — its path is what the
+    /// pre-roll not-ready error names.
+    pub(super) shell: String,
 }
 
 /// Read the PTY until EOF, forwarding each chunk to the recorder's channel
@@ -144,11 +147,30 @@ impl CapturePty {
             rows,
             ps_var,
             prompt,
+            shell,
         })
     }
 
+    /// The not-ready failure wording: only the shell path varies — the "20 s"
+    /// is fixed text (it names the real pre-roll budget), NOT derived from the
+    /// `max_ms` a test may pass. Pure so tests can pin the whole string.
+    fn not_ready_message(shell: &str) -> String {
+        format!(
+            "the shell ({shell}) did not become ready within 20 s — its startup files \
+             (e.g. ~/.bashrc) are still running or wait for input. Nothing was recorded. \
+             Speed up or guard the rc files for non-login PTYs, or point SHELL at a lighter \
+             shell for the recording (SHELL=/bin/sh demo record)."
+        )
+    }
+
     /// ── Pre-roll (untimed): force a clean prompt + run setup, then discard. ──
-    pub(super) fn pre_roll(&mut self, score: &Score) {
+    ///
+    /// `max_ms` bounds the wait for the readiness marker (a test can lower it).
+    /// No marker within the budget means the shell is still running its startup
+    /// files or waiting for input — recording against it would yield a `.rec`
+    /// holding only the line-discipline echo (no prompt, no output), so this
+    /// fails instead.
+    pub(super) fn pre_roll(&mut self, score: &Score, max_ms: u64) -> Result<()> {
         if let Some(setup) = score.env.as_ref().and_then(|e| e.setup_script.as_deref()) {
             let _ = writeln!(self.writer, "{setup}");
         }
@@ -169,9 +191,12 @@ impl CapturePty {
         // command text — otherwise we'd match the PTY's *instant* line-discipline
         // echo of the command (15 ms) instead of the shell actually running it.
         let _ = writeln!(self.writer, "printf 'demostage_%s_ready\\n' OK");
-        wait_for_marker(&self.rx, "demostage_OK_ready", PREROLL_MAX_MS);
+        if !wait_for_marker(&self.rx, "demostage_OK_ready", max_ms) {
+            return Err(Error::Export(Self::not_ready_message(&self.shell)));
+        }
         // Discard the marker's own output and the prompt that follows it.
         drain_until_quiet(&self.rx, PREROLL_QUIET_MS, PREROLL_MAX_MS);
+        Ok(())
     }
 }
 
@@ -348,6 +373,7 @@ pub(super) fn finish(
 
 #[cfg(test)]
 mod tests {
+    use super::super::isolate_home;
     use super::*;
 
     #[test]
@@ -493,13 +519,14 @@ height = 400
     #[test]
     fn pre_roll_discards_previously_queued_output() {
         let score = pty_score();
+        isolate_home();
         let mut pty = CapturePty::new(&score, &score.layout.panes[0]).unwrap();
         // Queue known output before the pre-roll: it must be gone after.
         use std::io::Write;
         pty.writer.write_all(b"echo PRE_ROLL_NOISE123\n").unwrap();
         pty.writer.flush().unwrap();
         std::thread::sleep(Duration::from_millis(400));
-        pty.pre_roll(&score);
+        pty.pre_roll(&score, PREROLL_MAX_MS).unwrap();
         assert!(
             pty.rx.try_recv().is_err(),
             "pre-roll must drain everything queued before it"
@@ -509,8 +536,9 @@ height = 400
     #[test]
     fn type_step_delivers_characters_to_the_shell() {
         let score = pty_score();
+        isolate_home();
         let mut pty = CapturePty::new(&score, &score.layout.panes[0]).unwrap();
-        pty.pre_roll(&score);
+        pty.pre_roll(&score, PREROLL_MAX_MS).unwrap();
         let t0 = Instant::now();
         let mut events = Vec::new();
         let typing = crate::model::Typing::default();
@@ -525,8 +553,9 @@ height = 400
     #[test]
     fn secret_step_skips_the_wait_for_empty_or_seen_needles() {
         let score = pty_score();
+        isolate_home();
         let mut pty = CapturePty::new(&score, &score.layout.panes[0]).unwrap();
-        pty.pre_roll(&score);
+        pty.pre_roll(&score, PREROLL_MAX_MS).unwrap();
         let t0 = Instant::now();
         // Empty needle: no wait. Deleting the first `!` would wait 15 s.
         let start = Instant::now();
@@ -560,8 +589,9 @@ height = 400
     #[test]
     fn secret_step_types_the_collected_value() {
         let score = pty_score();
+        isolate_home();
         let mut pty = CapturePty::new(&score, &score.layout.panes[0]).unwrap();
-        pty.pre_roll(&score);
+        pty.pre_roll(&score, PREROLL_MAX_MS).unwrap();
         let t0 = Instant::now();
         let mut secrets = std::collections::HashMap::new();
         secrets.insert("Password:".to_string(), "s3cr3t-test-value".to_string());
@@ -594,8 +624,9 @@ teardown_script = "echo TEARDOWN_NOISE_456"
 "#,
         )
         .unwrap();
+        isolate_home();
         let mut pty = CapturePty::new(&score, &score.layout.panes[0]).unwrap();
-        pty.pre_roll(&score);
+        pty.pre_roll(&score, PREROLL_MAX_MS).unwrap();
         let t0 = Instant::now();
         let caps = super::super::Captures {
             events: vec![(0.1, "early".to_string())],
@@ -688,6 +719,7 @@ teardown_script = "echo TEARDOWN_NOISE_456"
             rows: 24,
             ps_var: "PS1",
             prompt: "$ ".to_string(),
+            shell: "sh".to_string(),
         };
         (pty, writer, tx)
     }
@@ -702,12 +734,73 @@ teardown_script = "echo TEARDOWN_NOISE_456"
         // (bounded: the drain below then costs only its quiet period).
         tx.send((Instant::now(), b"demostage_OK_ready\n".to_vec()))
             .unwrap();
-        pty.pre_roll(&score);
+        pty.pre_roll(&score, PREROLL_MAX_MS).unwrap();
         assert_eq!(
             writer.bytes(),
             b"PS1='$ '; clear\nprintf 'demostage_%s_ready\\n' OK\n",
             "pre-roll must force the prompt and print the readiness marker"
         );
+    }
+
+    /// A shell that never prints the marker (a PTY running `sh -c 'sleep 5'`,
+    /// which only ever line-discipline-echoes our typed input) makes `pre_roll`
+    /// fail with the exact not-ready message — and the elapsed-time bounds prove
+    /// the deadline came from the 100 ms parameter, not the 20 s constant.
+    #[test]
+    fn pre_roll_fails_when_the_shell_never_prints_the_marker() {
+        let score = pty_score();
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.args(["-c", "sleep 5"]);
+        let child = pair.slave.spawn_command(cmd).expect("spawn sh");
+        drop(pair.slave);
+        let writer = pair.master.take_writer().expect("pty writer");
+        let reader = pair.master.try_clone_reader().expect("pty reader");
+        let (tx, rx) = mpsc::channel::<(Instant, Vec<u8>)>();
+        let reader_done = Arc::new(AtomicBool::new(false));
+        let done = reader_done.clone();
+        thread::spawn(move || pump_pty_output(reader, tx, done));
+        let mut pty = CapturePty {
+            child,
+            writer,
+            rx,
+            reader_done,
+            cols: 80,
+            rows: 24,
+            ps_var: "PS1",
+            prompt: "$ ".to_string(),
+            shell: "sh".to_string(),
+        };
+
+        let start = Instant::now();
+        let err = pty
+            .pre_roll(&score, 100)
+            .expect_err("no marker can ever appear");
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            err.to_string(),
+            "the shell (sh) did not become ready within 20 s — its startup files \
+             (e.g. ~/.bashrc) are still running or wait for input. Nothing was recorded. \
+             Speed up or guard the rc files for non-login PTYs, or point SHELL at a lighter \
+             shell for the recording (SHELL=/bin/sh demo record)."
+        );
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "gave up before the 100 ms deadline: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the 100 ms parameter was ignored (looked like the 20 s constant): {elapsed:?}"
+        );
+        let _ = pty.child.kill(); // don't leave `sleep 5` orphaned behind the suite
     }
 
     /// No human salt → every delay is 0: the exact characters must reach the

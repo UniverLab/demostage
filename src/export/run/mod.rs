@@ -56,8 +56,9 @@ const EXIT_GRACE_MS: u64 = 2_000;
 const READER_JOIN_MS: u64 = 1_000;
 /// Pre-roll: discard startup chatter once output has been quiet this long…
 const PREROLL_QUIET_MS: u64 = 400;
-/// …but never wait longer than this for it to settle.
-const PREROLL_MAX_MS: u64 = 4_000;
+/// …but never wait longer than this for the shell to print its readiness
+/// marker (or for the chatter right after it to settle).
+const PREROLL_MAX_MS: u64 = 20_000;
 /// End of run: consider the demo finished once output is quiet this long (this
 /// also becomes how long the final frame is held).
 const SETTLE_QUIET_MS: u64 = 1_500;
@@ -272,7 +273,9 @@ pub fn run_with_pane(score: &Score, pane: &crate::model::Pane) -> Result<Recordi
     let secrets = collect_secrets(score)?;
 
     let mut pty = CapturePty::new(score, pane)?;
-    pty.pre_roll(score);
+    // A shell that never prints the marker aborts here — no `.rec` is written
+    // (record.rs only writes it after a successful run).
+    pty.pre_roll(score, PREROLL_MAX_MS)?;
 
     // ── Timed run. ───────────────────────────────────────────────────────
     let t0 = Instant::now();
@@ -462,9 +465,10 @@ fn screen_contains(parser: &VtParser, pattern: &str) -> bool {
     parser.screen().contents().contains(pattern)
 }
 
-/// Read and discard output until `marker` appears (or `max_ms` elapses). Used in
-/// the pre-roll to wait out slow shell startup deterministically.
-fn wait_for_marker(rx: &Receiver<(Instant, Vec<u8>)>, marker: &str, max_ms: u64) {
+/// Read and discard output until `marker` appears: `true` when it did,
+/// `false` when `max_ms` elapsed without it (the shell never became ready).
+/// Used in the pre-roll to wait out slow shell startup deterministically.
+fn wait_for_marker(rx: &Receiver<(Instant, Vec<u8>)>, marker: &str, max_ms: u64) -> bool {
     let deadline = Instant::now() + Duration::from_millis(max_ms);
     let mut seen = String::new();
     while Instant::now() < deadline {
@@ -474,12 +478,13 @@ fn wait_for_marker(rx: &Receiver<(Instant, Vec<u8>)>, marker: &str, max_ms: u64)
             got = true;
         }
         if seen.contains(marker) {
-            return;
+            return true;
         }
         if !got {
             thread::sleep(Duration::from_millis(15));
         }
     }
+    false
 }
 
 /// Discard output until none has arrived for `quiet_ms` (or `max_ms` elapses) —
@@ -716,6 +721,25 @@ fn parse_modifier_key(key: &str) -> Option<Vec<u8>> {
         seq.push(final_byte as u8);
     }
     Some(seq)
+}
+
+/// Empty `HOME` for the tests that drive a real shell through
+/// [`CapturePty::new`]: the developer's `~/.bashrc` is out of the suite's
+/// control, and on this machine its terminal-integration pre block re-execs
+/// the shell while *draining* stdin — anything typed before the prompt
+/// (including pre-roll's readiness marker) is swallowed, and `demo record`'s
+/// contract with such a shell is to fail (the spec'd not-ready error), not
+/// to record. The PTY mechanics these tests exercise need a shell that reads
+/// its input, so — like the spec's healthy recording case — they spawn one
+/// with an empty HOME. Set once for the whole test process.
+#[cfg(test)]
+fn isolate_home() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let dir = std::env::temp_dir().join("demostage-tests-home");
+        let _ = std::fs::create_dir_all(&dir);
+        std::env::set_var("HOME", &dir);
+    });
 }
 
 #[cfg(test)]
@@ -1123,6 +1147,7 @@ duration_ms = 200
         )
         .unwrap();
 
+        isolate_home();
         let start = Instant::now();
         let rec = run_terminal(&score).expect("replay should return");
         let elapsed = start.elapsed();
@@ -1273,6 +1298,38 @@ pane = "never"
         assert_eq!(screen.fed, events.len());
     }
 
+    /// A channel that never sends → `false` only once the deadline is spent:
+    /// never earlier than `max_ms`, never an optimistic `true`.
+    #[test]
+    fn wait_for_marker_returns_false_only_after_the_deadline() {
+        let (_tx, rx) = std::sync::mpsc::channel::<(Instant, Vec<u8>)>();
+        let start = Instant::now();
+        let marked = wait_for_marker(&rx, "demostage_OK_ready", 50);
+        let elapsed = start.elapsed();
+        assert!(!marked, "a silent channel must not read as ready");
+        assert!(
+            elapsed >= Duration::from_millis(50),
+            "returned before the 50 ms deadline: {elapsed:?}"
+        );
+    }
+
+    /// The marker arrives in two chunks (`demostage_OK` then `_ready\n`): only
+    /// the accumulated buffer can match — a per-chunk check misses it.
+    #[test]
+    fn wait_for_marker_matches_a_marker_split_across_two_sends() {
+        let (tx, rx) = std::sync::mpsc::channel::<(Instant, Vec<u8>)>();
+        tx.send((Instant::now(), b"demostage_OK".to_vec())).unwrap();
+        tx.send((Instant::now(), b"_ready\n".to_vec())).unwrap();
+        assert!(wait_for_marker(&rx, "demostage_OK_ready", 1_000));
+    }
+
+    /// FR 3 pins both budgets; 4_000 (or any drift) dies here.
+    #[test]
+    fn preroll_budgets_match_the_spec() {
+        assert_eq!(PREROLL_MAX_MS, 20_000);
+        assert_eq!(PREROLL_QUIET_MS, 400);
+    }
+
     /// drive_timeline runs every step until Terminate: with two focuses before
     /// it, both land. Deleting the `!` on the stop gate breaks after the
     /// first step instead, and the second focus never lands.
@@ -1363,6 +1420,7 @@ pane = "never"
             rows: 24,
             ps_var: "PS1",
             prompt: "$ ".to_string(),
+            shell: "/bin/bash".to_string(),
         };
         (pty, writer, tx)
     }
