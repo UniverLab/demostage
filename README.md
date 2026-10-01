@@ -211,6 +211,8 @@ inside a README `<img>`):
 <img src="dist/demo.svg" alt="demo">
 ```
 
+The SVG embeds its terminal font (subset to the glyphs on screen) as an inline @font-face, so it renders identically inside a README `<img>`.
+
 Need one still instead (`--at 12.5` writes `dist/<name>-at-12.5.svg`), or a
 multi-pane demo (animated SVG refuses those — use gif/mp4, or `--at` for a
 poster)? See [`docs/export-targets.md`](docs/export-targets.md).

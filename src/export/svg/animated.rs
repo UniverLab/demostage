@@ -10,18 +10,14 @@ use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::path::Path;
 
-use super::paint::{bg_spans, braille_dots, escape_attr, escape_xml, hex, is_braille, merge_runs};
+use super::font::{collect_animated_glyphs, embed_for};
+use super::paint::{bg_spans, braille_dots, escape_xml, hex, is_braille, merge_runs};
 use super::paint::{row_cells, Run};
 use super::timing::{duration_secs, item_rule, style_for, KeyGen};
 use crate::error::{Error, Result};
 use crate::export::raster::{FrameSource, TextFrame};
 use crate::export::run::Recording;
 use crate::model::Score;
-
-/// Monospace stack for the animated target: no embedded fonts, so the grid
-/// holds with whatever monospace the viewer has (`textLength` pins the width).
-pub(crate) const ANIM_FAMILY: &str =
-    "ui-monospace, SFMono-Regular, Menlo, Consolas, \"DejaVu Sans Mono\", monospace";
 
 /// One merged text run placed on the grid.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -94,6 +90,10 @@ pub(crate) struct DocInput<'a> {
     pub(crate) geom: Geom,
     pub(crate) default_bg: [u8; 3],
     pub(crate) final_tf: &'a TextFrame,
+    /// The `<text>` font stack: the embedded face first.
+    pub(crate) font_family: String,
+    /// The single `@font-face` rule for the subset font.
+    pub(crate) font_face: String,
 }
 
 /// The items that survive consecutive holds, drawn once in a persistent layer.
@@ -324,8 +324,8 @@ fn anim_bg_xml(item: &BgItem, geom: &Geom, extra: &str) -> String {
     )
 }
 
-/// One merged run as a `<text>` on the fixed monospace stack.
-fn anim_text_xml(item: &TextItem, geom: &Geom, extra: &str) -> String {
+/// One merged run as a `<text>` on the embedded font stack.
+fn anim_text_xml(item: &TextItem, geom: &Geom, family: &str, extra: &str) -> String {
     let chars = item.text.chars().count();
     let x = item.start * geom.cw;
     let y = item.row * geom.ch + geom.ch / 2 + (geom.px * 0.35) as usize;
@@ -335,10 +335,9 @@ fn anim_text_xml(item: &TextItem, geom: &Geom, extra: &str) -> String {
         ""
     };
     format!(
-        "<text x=\"{x}\" y=\"{y}\" font-family=\"{}\" font-size=\"{}\"{bold} \
+        "<text x=\"{x}\" y=\"{y}\" font-family=\"{family}\" font-size=\"{}\"{bold} \
          fill=\"{}\" textLength=\"{}\" lengthAdjust=\"spacingAndGlyphs\" \
          xml:space=\"preserve\"{extra}>{}</text>",
-        escape_attr(ANIM_FAMILY),
         geom.px.round() as usize,
         hex(item.fg),
         chars * geom.cw,
@@ -357,7 +356,7 @@ fn anim_dots_xml(item: &DotItem, geom: &Geom, extra: &str) -> String {
 }
 
 /// A scene's items as static markup: backgrounds, then dots, then text.
-fn residual_markup(scene: &Scene, geom: &Geom) -> String {
+fn residual_markup(scene: &Scene, geom: &Geom, family: &str) -> String {
     let mut out = String::new();
     for item in &scene.bg {
         out.push_str(&anim_bg_xml(item, geom, ""));
@@ -372,7 +371,7 @@ fn residual_markup(scene: &Scene, geom: &Geom) -> String {
         out.push('\n');
     }
     for item in &scene.text {
-        out.push_str(&anim_text_xml(item, geom, ""));
+        out.push_str(&anim_text_xml(item, geom, family, ""));
         out.push('\n');
     }
     out
@@ -442,6 +441,7 @@ fn persistent_text(
         out.push_str(&anim_text_xml(
             &item,
             &input.geom,
+            &input.font_family,
             &style_for(&key, total_secs),
         ));
         out.push('\n');
@@ -508,7 +508,7 @@ fn state_layers(
     let mut defs = String::new();
     for (gid, scene) in order.iter().enumerate() {
         defs.push_str(&format!("<g id=\"r{gid}\">\n"));
-        defs.push_str(&residual_markup(scene, &input.geom));
+        defs.push_str(&residual_markup(scene, &input.geom, &input.font_family));
         defs.push_str("</g>\n");
     }
     let mut body = String::new();
@@ -568,8 +568,10 @@ fn canvas_rect(w: usize, h: usize, bg: [u8; 3]) -> String {
     )
 }
 
-fn style_block(rules: &[String]) -> String {
+fn style_block(face: &str, rules: &[String]) -> String {
     let mut out = String::from("<style>\n");
+    out.push_str(face);
+    out.push('\n');
     for rule in rules {
         out.push_str(rule);
         out.push('\n');
@@ -590,21 +592,27 @@ fn style_block(rules: &[String]) -> String {
 fn final_group(input: &DocInput) -> String {
     let mut out = String::from("<g id=\"final\">\n");
     out.push_str(&canvas_rect(input.w, input.h, input.default_bg));
-    out.push_str(&residual_markup(&scene_of(input.final_tf), &input.geom));
+    out.push_str(&residual_markup(
+        &scene_of(input.final_tf),
+        &input.geom,
+        &input.font_family,
+    ));
     out.push_str("</g>\n");
     out
 }
 
-/// Degenerate timeline (no change, or one frame): the final state, static.
-fn static_document(tf: &TextFrame, w: usize, h: usize) -> String {
-    let geom = Geom {
-        cw: tf.cell_w,
-        ch: tf.cell_h,
-        px: tf.px,
-    };
-    let mut out = doc_header(w, h);
-    out.push_str(&canvas_rect(w, h, tf.default_bg));
-    out.push_str(&residual_markup(&scene_of(tf), &geom));
+/// Degenerate timeline (no change, or one frame): the final state, static —
+///
+/// still with the single `@font-face` so every `<text>` shapes the same.
+fn static_document(input: &DocInput) -> String {
+    let mut out = doc_header(input.w, input.h);
+    out.push_str(&style_block(&input.font_face, &[]));
+    out.push_str(&canvas_rect(input.w, input.h, input.default_bg));
+    out.push_str(&residual_markup(
+        &scene_of(input.final_tf),
+        &input.geom,
+        &input.font_family,
+    ));
     out.push_str("</svg>\n");
     out
 }
@@ -612,7 +620,7 @@ fn static_document(tf: &TextFrame, w: usize, h: usize) -> String {
 /// The whole animated document for one walked timeline.
 pub(crate) fn render_document(input: &DocInput) -> String {
     if input.holds.len() <= 1 {
-        return static_document(input.final_tf, input.w, input.h);
+        return static_document(input);
     }
     let total_secs = duration_secs(input.n_frames, input.fps);
     let persistent = split_persistent(input.unique, input.holds);
@@ -623,7 +631,7 @@ pub(crate) fn render_document(input: &DocInput) -> String {
     let states = state_layers(input, &persistent, &mut keys, total_secs);
     rules.extend(states.rules);
     let mut out = doc_header(input.w, input.h);
-    out.push_str(&style_block(&rules));
+    out.push_str(&style_block(&input.font_face, &rules));
     out.push_str("<defs>\n");
     out.push_str(&states.defs);
     out.push_str("</defs>\n");
@@ -678,6 +686,8 @@ pub fn write_animated(path: &Path, rec: &Recording, score: &Score) -> Result<()>
     }
     let final_tf = source.text_frame();
     let (unique, holds) = fold_scenes(scenes);
+    let (font_family, font_face) =
+        embed_for(&collect_animated_glyphs(&unique), &final_tf.font_family)?;
     let input = DocInput {
         unique: &unique,
         holds: &holds,
@@ -691,6 +701,8 @@ pub fn write_animated(path: &Path, rec: &Recording, score: &Score) -> Result<()>
         geom,
         default_bg,
         final_tf: &final_tf,
+        font_family,
+        font_face,
     };
     let doc = render_document(&input);
     std::fs::write(path, &doc).map_err(|e| Error::io(path, e))?;

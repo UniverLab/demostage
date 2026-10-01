@@ -40,5 +40,6 @@ flate2 = "1"    # tar.gz decode
 tar = "0.4"     # archive entry extraction
 sha2 = "0.11"   # SHA256 of the release asset
 tempfile = "3"  # staging directory + same-dir rename (promoted from dev-deps)
+fontcull = { version = "2", default-features = false }
 
 [dev-dependencies]

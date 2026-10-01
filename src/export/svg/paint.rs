@@ -187,10 +187,16 @@ pub(crate) fn run_xml(
     )
 }
 
-/// The poster's spelling: the frame's own font family with `spacing`.
+/// The poster's spelling: the embedded face first, then the frame's own font
+/// family with `spacing`.
 pub(crate) fn run_text(run: &Run, row: usize, tf: &TextFrame) -> String {
-    let family = format!("'{}', monospace", escape_attr(&tf.font_family));
-    run_xml(run, row, tf, &family, "spacing")
+    run_xml(
+        run,
+        row,
+        tf,
+        &super::font::text_family(&tf.font_family),
+        "spacing",
+    )
 }
 
 /// Procedural dots for a braille cell — bundled AND viewer fonts generally
@@ -607,7 +613,7 @@ mod tests {
         };
         assert_eq!(
             run_text(&run, 1, &tf),
-            "<text x=\"20\" y=\"35\" font-family=\"'IBM Plex Mono', monospace\" \
+            "<text x=\"20\" y=\"35\" font-family=\"'ds-term', 'IBM Plex Mono', monospace\" \
              font-size=\"16\" font-weight=\"bold\" fill=\"#010203\" \
              textLength=\"20\" lengthAdjust=\"spacing\" \
              xml:space=\"preserve\">ab</text>"

@@ -52,10 +52,11 @@ small, a state identical to an earlier one reuses it (`<use href>`), and runs
 that do not change between consecutive states are drawn once in a persistent
 layer spanning their lifetime.
 
-- **Text alignment without embedded fonts.** The stack is `ui-monospace,
-  SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", monospace`, and every
-  run carries `textLength` + `lengthAdjust="spacingAndGlyphs"` computed from
-  its cell count, so the grid holds with whatever monospace the viewer has.
+- **Text alignment with an embedded subset font.** The SVG embeds its terminal
+  font (subset to the glyphs on screen) as an inline `@font-face` named
+  `ds-term`, so it renders identically inside a README `<img>`; every run
+  still carries `textLength` + `lengthAdjust="spacingAndGlyphs"` computed from
+  its cell count, so the grid holds even where a glyph falls back.
 - **`prefers-reduced-motion: reduce` shows the final state**, static.
 - **README-safe:** no scripts, no external references, no `<foreignObject>` —
   everything inline. Embed it with `![demo](dist/demo.svg)` or

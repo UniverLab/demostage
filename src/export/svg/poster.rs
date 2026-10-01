@@ -4,6 +4,7 @@
 
 use std::path::Path;
 
+use super::font::{collect_poster_glyphs, embed_for};
 use super::paint::{bg_rects, braille_dots, hex, is_braille, merge_runs, row_cells, run_text};
 use crate::error::{Error, Result};
 use crate::export::raster::{FrameSource, TextFrame};
@@ -69,7 +70,7 @@ pub fn encode(
         .or(last)
         .ok_or_else(|| Error::Export("svg poster: no frames were emitted".to_string()))?;
     let svg = match kept {
-        Kept::Cells(tf) => poster_document(&tf, w, h),
+        Kept::Cells(tf) => poster_document(&tf, w, h)?,
         Kept::Rgba(rgba) => raster_document(&rgba, w, h)?,
     };
     std::fs::write(path, svg).map_err(|e| Error::io(path, e))
@@ -135,16 +136,18 @@ fn paint_text_row(tf: &TextFrame, row: usize) -> String {
     out
 }
 
-/// The whole `<svg>` for a cell-grid frame: rounded canvas, the background runs
-/// of every row, then each row's braille dots and text runs. Geometry is all
-/// integers (the one `f32` — the font size — is rounded once here), so the
-/// document is byte-stable.
-pub(crate) fn poster_document(tf: &TextFrame, w: usize, h: usize) -> String {
+/// The whole `<svg>` for a cell-grid frame: the embedded subset font, the
+/// rounded canvas, the background runs of every row, then each row's braille
+/// dots and text runs. Geometry is all integers (the one `f32` — the font
+/// size — is rounded once here), so the document is byte-stable.
+pub(crate) fn poster_document(tf: &TextFrame, w: usize, h: usize) -> Result<String> {
+    let face = embed_for(&collect_poster_glyphs(tf), &tf.font_family)?.1;
     let mut out = String::new();
     out.push_str(&format!(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" \
          width=\"{w}\" height=\"{h}\" viewBox=\"0 0 {w} {h}\">\n"
     ));
+    out.push_str(&format!("<style>\n{face}\n</style>\n"));
     out.push_str(&format!(
         "<rect x=\"0\" y=\"0\" width=\"{w}\" height=\"{h}\" rx=\"8\" fill=\"{}\"/>\n",
         hex(tf.default_bg)
@@ -158,7 +161,7 @@ pub(crate) fn poster_document(tf: &TextFrame, w: usize, h: usize) -> String {
         out.push_str(&paint_text_row(tf, row));
     }
     out.push_str("</svg>\n");
-    out
+    Ok(out)
 }
 
 /// The staged fallback: ONE composited frame embedded as a base64 PNG, both
@@ -298,23 +301,33 @@ mod tests {
         )
     }
 
-    /// The exact `<svg>` for [`poster_grid`] at 40×80.
+    /// The exact `<svg>` for [`poster_grid`] at 40×80. The `@font-face` rule
+    /// is recomputed from the fixture (its base64 is kilobytes long), so the
+    /// snapshot pins the structure while the face-shape tests pin the font.
     fn poster_grid_expected() -> String {
-        concat!(
-            "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" ",
-            "width=\"40\" height=\"80\" viewBox=\"0 0 40 80\">\n",
-            "<rect x=\"0\" y=\"0\" width=\"40\" height=\"80\" rx=\"8\" fill=\"#0b0f14\"/>\n",
-            "<rect x=\"10\" y=\"0\" width=\"10\" height=\"40\" fill=\"#0050a0\"/>\n",
-            "<text x=\"0\" y=\"25\" font-family=\"'IBM Plex Mono', monospace\" font-size=\"16\" ",
-            "fill=\"#ff0000\" textLength=\"10\" lengthAdjust=\"spacing\" xml:space=\"preserve\">a</text>\n",
-            "<text x=\"10\" y=\"25\" font-family=\"'IBM Plex Mono', monospace\" font-size=\"16\" ",
-            "fill=\"#ff0000\" textLength=\"10\" lengthAdjust=\"spacing\" xml:space=\"preserve\">b</text>\n",
-            "<text x=\"0\" y=\"65\" font-family=\"'IBM Plex Mono', monospace\" font-size=\"16\" ",
-            "font-weight=\"bold\" fill=\"#00ff00\" textLength=\"20\" lengthAdjust=\"spacing\" ",
-            "xml:space=\"preserve\">cd</text>\n",
-            "</svg>\n",
+        let face = super::super::font::embed_for(
+            &super::super::font::collect_poster_glyphs(&poster_grid()),
+            "IBM Plex Mono",
         )
-        .to_string()
+        .unwrap()
+        .1;
+        format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" \
+             width=\"40\" height=\"80\" viewBox=\"0 0 40 80\">\n\
+             <style>\n{face}\n</style>\n\
+             <rect x=\"0\" y=\"0\" width=\"40\" height=\"80\" rx=\"8\" fill=\"#0b0f14\"/>\n\
+             <rect x=\"10\" y=\"0\" width=\"10\" height=\"40\" fill=\"#0050a0\"/>\n\
+             <text x=\"0\" y=\"25\" font-family=\"'ds-term', 'IBM Plex Mono', monospace\" \
+             font-size=\"16\" fill=\"#ff0000\" textLength=\"10\" lengthAdjust=\"spacing\" \
+             xml:space=\"preserve\">a</text>\n\
+             <text x=\"10\" y=\"25\" font-family=\"'ds-term', 'IBM Plex Mono', monospace\" \
+             font-size=\"16\" fill=\"#ff0000\" textLength=\"10\" lengthAdjust=\"spacing\" \
+             xml:space=\"preserve\">b</text>\n\
+             <text x=\"0\" y=\"65\" font-family=\"'ds-term', 'IBM Plex Mono', monospace\" \
+             font-size=\"16\" font-weight=\"bold\" fill=\"#00ff00\" textLength=\"20\" \
+             lengthAdjust=\"spacing\" xml:space=\"preserve\">cd</text>\n\
+             </svg>\n",
+        )
     }
 
     #[test]
@@ -350,7 +363,7 @@ mod tests {
         let written = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
             written,
-            poster_document(&a, 10, 40),
+            poster_document(&a, 10, 40).unwrap(),
             "frame #0 must be the one kept"
         );
         assert!(written.contains(">a</text>"), "wrong frame:\n{written}");
@@ -372,7 +385,7 @@ mod tests {
         let written = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
             written,
-            poster_document(&b, 10, 40),
+            poster_document(&b, 10, 40).unwrap(),
             "the last emitted frame must be the fallback"
         );
     }
@@ -497,7 +510,7 @@ mod tests {
         );
         assert_eq!(
             paint_text_row(&tf, 0),
-            "<text x=\"0\" y=\"25\" font-family=\"'IBM Plex Mono', monospace\" \
+            "<text x=\"0\" y=\"25\" font-family=\"'ds-term', 'IBM Plex Mono', monospace\" \
              font-size=\"16\" fill=\"#ffffff\" textLength=\"10\" \
              lengthAdjust=\"spacing\" xml:space=\"preserve\">x</text>\n"
         );
@@ -506,11 +519,11 @@ mod tests {
 
     #[test]
     fn poster_document_is_the_exact_poster() {
-        let doc = poster_document(&poster_grid(), 40, 80);
+        let doc = poster_document(&poster_grid(), 40, 80).unwrap();
         assert_eq!(doc, poster_grid_expected());
         // Reproducible: same frame in, same bytes out.
         assert_eq!(
-            poster_document(&poster_grid(), 40, 80),
+            poster_document(&poster_grid(), 40, 80).unwrap(),
             poster_grid_expected(),
             "must be byte-stable"
         );
@@ -596,6 +609,18 @@ fps = 10
         }
     }
 
+    /// The last frame of [`replay_rec`]: "ab" on row 0, "cd" on row 1.
+    fn replay_last_frame() -> TextFrame {
+        let mut cells = Vec::new();
+        for ch in "ab".chars().chain(std::iter::repeat_n(' ', 8)) {
+            cells.push(cell(ch, [200, 200, 200]));
+        }
+        for ch in "cd".chars().chain(std::iter::repeat_n(' ', 8)) {
+            cells.push(cell(ch, [200, 200, 200]));
+        }
+        frame(10, 2, cells)
+    }
+
     #[test]
     fn write_svg_renders_the_selected_frame_to_the_byte() {
         let scratch = Scratch::new("write_svg");
@@ -603,17 +628,24 @@ fps = 10
         // No `--at`: the LAST frame of the replay, both rows on screen.
         write_svg(&path, &replay_rec(), &replay_score(), None).unwrap();
         let doc = std::fs::read_to_string(&path).unwrap();
-        let expected = concat!(
-            "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" ",
-            "width=\"100\" height=\"38\" viewBox=\"0 0 100 38\">\n",
-            "<rect x=\"0\" y=\"0\" width=\"100\" height=\"38\" rx=\"8\" fill=\"#0b0f14\"/>\n",
-            "<text x=\"0\" y=\"14\" font-family=\"'DejaVu Sans Mono', monospace\" font-size=\"16\" ",
-            "fill=\"#c8c8c8\" textLength=\"20\" lengthAdjust=\"spacing\" ",
-            "xml:space=\"preserve\">ab</text>\n",
-            "<text x=\"0\" y=\"33\" font-family=\"'DejaVu Sans Mono', monospace\" font-size=\"16\" ",
-            "fill=\"#c8c8c8\" textLength=\"20\" lengthAdjust=\"spacing\" ",
-            "xml:space=\"preserve\">cd</text>\n",
-            "</svg>\n",
+        let face = super::super::font::embed_for(
+            &super::super::font::collect_poster_glyphs(&replay_last_frame()),
+            "DejaVu Sans Mono",
+        )
+        .unwrap()
+        .1;
+        let expected = format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" \
+             width=\"100\" height=\"38\" viewBox=\"0 0 100 38\">\n\
+             <style>\n{face}\n</style>\n\
+             <rect x=\"0\" y=\"0\" width=\"100\" height=\"38\" rx=\"8\" fill=\"#0b0f14\"/>\n\
+             <text x=\"0\" y=\"14\" font-family=\"'ds-term', 'DejaVu Sans Mono', monospace\" \
+             font-size=\"16\" fill=\"#c8c8c8\" textLength=\"20\" lengthAdjust=\"spacing\" \
+             xml:space=\"preserve\">ab</text>\n\
+             <text x=\"0\" y=\"33\" font-family=\"'ds-term', 'DejaVu Sans Mono', monospace\" \
+             font-size=\"16\" fill=\"#c8c8c8\" textLength=\"20\" lengthAdjust=\"spacing\" \
+             xml:space=\"preserve\">cd</text>\n\
+             </svg>\n",
         );
         assert_eq!(doc, expected, "deterministic poster drifted");
     }

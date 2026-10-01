@@ -1,8 +1,11 @@
+use std::collections::BTreeSet;
+
 use super::animated::{
     braille_bits, fold_scenes, render_document, scene_hold_windows, scene_of, windows_for,
-    write_animated, BgItem, DocInput, DotItem, Geom, Hold, Scene, TextItem, ANIM_FAMILY,
+    write_animated, BgItem, DocInput, DotItem, Geom, Hold, Scene, TextItem,
 };
 use super::animated_refusal;
+use super::font::{collect_animated_glyphs, embed_for, subset_bytes, EMBED_FAMILY};
 use super::paint::{escape_attr, escape_xml, merge_runs};
 use super::poster::{base64, encode, frame_index, poster_document, write_svg, PosterFrame};
 use super::timing::keyframes_rule;
@@ -42,6 +45,7 @@ fn text_row(text: &str, cols: usize) -> Vec<TextCell> {
 
 /// Render synthetic frames through the animated document builder.
 fn animated_doc(frames: &[TextFrame], w: usize, h: usize, fps: u32) -> String {
+    let (font_family, font_face) = animated_face(frames);
     let first = &frames[0];
     let scenes: Vec<Scene> = frames.iter().map(scene_of).collect();
     let (unique, holds) = fold_scenes(scenes);
@@ -59,8 +63,18 @@ fn animated_doc(frames: &[TextFrame], w: usize, h: usize, fps: u32) -> String {
         },
         default_bg: first.default_bg,
         final_tf: &frames[frames.len() - 1],
+        font_family,
+        font_face,
     };
     render_document(&input)
+}
+
+/// The `(family, face_rule)` pair the production writer embeds for `frames`.
+fn animated_face(frames: &[TextFrame]) -> (String, String) {
+    let scenes: Vec<Scene> = frames.iter().map(scene_of).collect();
+    let (unique, _) = fold_scenes(scenes);
+    let font_name = frames[frames.len() - 1].font_family.clone();
+    embed_for(&collect_animated_glyphs(&unique), &font_name).unwrap()
 }
 
 #[test]
@@ -145,18 +159,17 @@ fn a_recurring_state_is_defined_once_and_reused_with_use() {
 }
 
 #[test]
-fn animated_runs_use_the_monospace_stack_and_spacing_and_glyphs() {
+fn animated_runs_name_the_embedded_face_first() {
     let a = frame(2, 1, text_row("ab", 2));
     let b = frame(2, 1, text_row("cd", 2));
     let doc = animated_doc(&[a, b], 20, 20, 2);
-    assert!(doc.contains("ui-monospace"), "fixed stack missing:\n{doc}");
     assert!(
-        doc.contains("DejaVu Sans Mono"),
-        "fixed stack missing:\n{doc}"
+        doc.contains("font-family=\"'ds-term', 'IBM Plex Mono', monospace\""),
+        "the embedded face must ride first:\n{doc}"
     );
     assert!(
-        doc.contains(&escape_attr(ANIM_FAMILY)),
-        "the stack must ride escaped in font-family:\n{doc}"
+        !doc.contains("ui-monospace"),
+        "the viewer-fallback stack is gone:\n{doc}"
     );
     assert!(
         doc.contains("lengthAdjust=\"spacingAndGlyphs\""),
@@ -493,7 +506,7 @@ fn braille_cells_become_dot_circles_not_tofu_text() {
             cell('\u{2800}', [255, 255, 255]),
         ],
     );
-    let svg = poster_document(&tf, 30, 20);
+    let svg = poster_document(&tf, 30, 20).unwrap();
     assert_eq!(
         svg.matches("<circle").count(),
         8,
@@ -542,24 +555,35 @@ fn the_small_replay_snapshot_is_byte_stable() {
         ],
     );
     // 'b' is red text on a blue background: the blue comes from the `<rect>`
-    // above it, while the run's `fill` is the foreground.
-    let expected = concat!(
+    // above it, while the run's `fill` is the foreground. The face rule is
+    // recomputed from the fixture (its base64 is kilobytes long).
+    let face = embed_for(&BTreeSet::from(['a', 'b', 'c', 'd', ' ']), "IBM Plex Mono")
+        .unwrap()
+        .1;
+    let fam = "'ds-term', 'IBM Plex Mono', monospace";
+    let template = concat!(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" ",
         "width=\"40\" height=\"40\" viewBox=\"0 0 40 40\">\n",
+        "<style>\n{FACE}\n</style>\n",
         "<rect x=\"0\" y=\"0\" width=\"40\" height=\"40\" rx=\"8\" fill=\"#0b0f14\"/>\n",
         "<rect x=\"10\" y=\"0\" width=\"10\" height=\"20\" fill=\"#0050a0\"/>\n",
-        "<text x=\"0\" y=\"15\" font-family=\"'IBM Plex Mono', monospace\" font-size=\"16\" ",
+        "<text x=\"0\" y=\"15\" font-family=\"{FAM}\" font-size=\"16\" ",
         "fill=\"#ff0000\" textLength=\"10\" lengthAdjust=\"spacing\" xml:space=\"preserve\">a</text>\n",
-        "<text x=\"10\" y=\"15\" font-family=\"'IBM Plex Mono', monospace\" font-size=\"16\" ",
+        "<text x=\"10\" y=\"15\" font-family=\"{FAM}\" font-size=\"16\" ",
         "fill=\"#ff0000\" textLength=\"10\" lengthAdjust=\"spacing\" xml:space=\"preserve\">b</text>\n",
-        "<text x=\"0\" y=\"35\" font-family=\"'IBM Plex Mono', monospace\" font-size=\"16\" ",
+        "<text x=\"0\" y=\"35\" font-family=\"{FAM}\" font-size=\"16\" ",
         "font-weight=\"bold\" fill=\"#00ff00\" textLength=\"20\" lengthAdjust=\"spacing\" ",
         "xml:space=\"preserve\">cd</text>\n",
         "</svg>\n",
     );
-    let doc = poster_document(&tf, 40, 40);
+    let expected = template.replace("{FACE}", &face).replace("{FAM}", fam);
+    let doc = poster_document(&tf, 40, 40).unwrap();
     assert_eq!(doc, expected);
-    assert_eq!(poster_document(&tf, 40, 40), doc, "must be reproducible");
+    assert_eq!(
+        poster_document(&tf, 40, 40).unwrap(),
+        doc,
+        "must be reproducible"
+    );
 }
 
 #[test]
@@ -686,36 +710,51 @@ fn a_small_replay_exports_a_deterministic_animated_document() {
     );
     // Byte-stable snapshot: "ab" is on screen the whole replay, so it is a
     // static persistent run; "cd" arrives at frame 3 of 6, so its group shows
-    // over 50%..100% of the 0.6s loop.
-    let expected = r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="100" height="38" viewBox="0 0 100 38">
-<style>
-@keyframes k0{0%{opacity:0}50%{opacity:1}100%{opacity:0}}
-#final{display:none}
-@media (prefers-reduced-motion: reduce){#anim{display:none}#final{display:inline}}
-</style>
-<defs>
-<g id="r0">
-<text x="0" y="33" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, &quot;DejaVu Sans Mono&quot;, monospace" font-size="16" fill="#c8c8c8" textLength="20" lengthAdjust="spacingAndGlyphs" xml:space="preserve">cd</text>
-</g>
-</defs>
-<rect x="0" y="0" width="100" height="38" rx="8" fill="#0b0f14"/>
-<g id="anim">
-<g id="pb">
-</g>
-<g id="states">
-<use href="#r0" xlink:href="#r0" style="animation:k0 0.6s steps(1,end) infinite;opacity:0"/>
-</g>
-<g id="pt">
-<text x="0" y="14" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, &quot;DejaVu Sans Mono&quot;, monospace" font-size="16" fill="#c8c8c8" textLength="20" lengthAdjust="spacingAndGlyphs" xml:space="preserve">ab</text>
-</g>
-</g>
-<g id="final">
-<rect x="0" y="0" width="100" height="38" rx="8" fill="#0b0f14"/>
-<text x="0" y="14" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, &quot;DejaVu Sans Mono&quot;, monospace" font-size="16" fill="#c8c8c8" textLength="20" lengthAdjust="spacingAndGlyphs" xml:space="preserve">ab</text>
-<text x="0" y="33" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, &quot;DejaVu Sans Mono&quot;, monospace" font-size="16" fill="#c8c8c8" textLength="20" lengthAdjust="spacingAndGlyphs" xml:space="preserve">cd</text>
-</g>
-</svg>
-"##;
+    // over 50%..100% of the 0.6s loop. The face rule is recomputed from the
+    // fixture chars (its base64 is kilobytes long); the double write above
+    // pins the byte stability.
+    let face = embed_for(
+        &BTreeSet::from(['a', 'b', 'c', 'd', ' ']),
+        "DejaVu Sans Mono",
+    )
+    .unwrap()
+    .1;
+    let fam = "'ds-term', 'DejaVu Sans Mono', monospace";
+    let expected = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" \
+         width=\"100\" height=\"38\" viewBox=\"0 0 100 38\">\n\
+         <style>\n{face}\n\
+         @keyframes k0{{0%{{opacity:0}}50%{{opacity:1}}100%{{opacity:0}}}}\n\
+         #final{{display:none}}\n\
+         @media (prefers-reduced-motion: reduce){{#anim{{display:none}}#final{{display:inline}}}}\n\
+         </style>\n\
+         <defs>\n\
+         <g id=\"r0\">\n\
+         <text x=\"0\" y=\"33\" font-family=\"{fam}\" font-size=\"16\" fill=\"#c8c8c8\" \
+         textLength=\"20\" lengthAdjust=\"spacingAndGlyphs\" \
+         xml:space=\"preserve\">cd</text>\n\
+         </g>\n\
+         </defs>\n\
+         <rect x=\"0\" y=\"0\" width=\"100\" height=\"38\" rx=\"8\" fill=\"#0b0f14\"/>\n\
+         <g id=\"anim\">\n<g id=\"pb\">\n</g>\n<g id=\"states\">\n\
+         <use href=\"#r0\" xlink:href=\"#r0\" \
+         style=\"animation:k0 0.6s steps(1,end) infinite;opacity:0\"/>\n\
+         </g>\n<g id=\"pt\">\n\
+         <text x=\"0\" y=\"14\" font-family=\"{fam}\" font-size=\"16\" fill=\"#c8c8c8\" \
+         textLength=\"20\" lengthAdjust=\"spacingAndGlyphs\" \
+         xml:space=\"preserve\">ab</text>\n\
+         </g>\n</g>\n\
+         <g id=\"final\">\n\
+         <rect x=\"0\" y=\"0\" width=\"100\" height=\"38\" rx=\"8\" fill=\"#0b0f14\"/>\n\
+         <text x=\"0\" y=\"14\" font-family=\"{fam}\" font-size=\"16\" fill=\"#c8c8c8\" \
+         textLength=\"20\" lengthAdjust=\"spacingAndGlyphs\" \
+         xml:space=\"preserve\">ab</text>\n\
+         <text x=\"0\" y=\"33\" font-family=\"{fam}\" font-size=\"16\" fill=\"#c8c8c8\" \
+         textLength=\"20\" lengthAdjust=\"spacingAndGlyphs\" \
+         xml:space=\"preserve\">cd</text>\n\
+         </g>\n\
+         </svg>\n",
+    );
     assert_eq!(doc, expected, "deterministic snapshot drifted");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -731,12 +770,24 @@ fn a_small_replay_exports_a_byte_stable_poster() {
     // also pins the default frame selection end to end.
     write_svg(&path, &rec, &score, None).unwrap();
     let doc = std::fs::read_to_string(&path).unwrap();
-    let expected = r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="100" height="38" viewBox="0 0 100 38">
-<rect x="0" y="0" width="100" height="38" rx="8" fill="#0b0f14"/>
-<text x="0" y="14" font-family="'DejaVu Sans Mono', monospace" font-size="16" fill="#c8c8c8" textLength="20" lengthAdjust="spacing" xml:space="preserve">ab</text>
-<text x="0" y="33" font-family="'DejaVu Sans Mono', monospace" font-size="16" fill="#c8c8c8" textLength="20" lengthAdjust="spacing" xml:space="preserve">cd</text>
-</svg>
-"##;
+    let face = embed_for(
+        &BTreeSet::from(['a', 'b', 'c', 'd', ' ']),
+        "DejaVu Sans Mono",
+    )
+    .unwrap()
+    .1;
+    let fam = "'ds-term', 'DejaVu Sans Mono', monospace";
+    let expected = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" \
+         width=\"100\" height=\"38\" viewBox=\"0 0 100 38\">\n\
+         <style>\n{face}\n</style>\n\
+         <rect x=\"0\" y=\"0\" width=\"100\" height=\"38\" rx=\"8\" fill=\"#0b0f14\"/>\n\
+         <text x=\"0\" y=\"14\" font-family=\"{fam}\" font-size=\"16\" fill=\"#c8c8c8\" \
+         textLength=\"20\" lengthAdjust=\"spacing\" xml:space=\"preserve\">ab</text>\n\
+         <text x=\"0\" y=\"33\" font-family=\"{fam}\" font-size=\"16\" fill=\"#c8c8c8\" \
+         textLength=\"20\" lengthAdjust=\"spacing\" xml:space=\"preserve\">cd</text>\n\
+         </svg>\n",
+    );
     assert_eq!(doc, expected, "deterministic snapshot drifted");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1003,9 +1054,12 @@ fn the_full_timeline_document_is_byte_exact() {
             cell('\u{2801}', [40, 50, 60]),
         ],
     ]);
+    let face = animated_face(&[f0.clone(), f1.clone(), f2.clone()]).1;
+    let fam = "'ds-term', 'IBM Plex Mono', monospace";
     let doc = animated_doc(&[f0, f1, f2], 40, 40, 1);
-    let expected = r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="40" height="40" viewBox="0 0 40 40">
+    let template = r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="40" height="40" viewBox="0 0 40 40">
 <style>
+{FACE}
 @keyframes k0{0%{opacity:1}66.6667%{opacity:0}100%{opacity:0}}
 @keyframes k1{0%{opacity:1}66.6667%{opacity:0}100%{opacity:0}}
 @keyframes k2{0%{opacity:1}66.6667%{opacity:0}100%{opacity:0}}
@@ -1017,16 +1071,16 @@ fn the_full_timeline_document_is_byte_exact() {
 </style>
 <defs>
 <g id="r0">
-<text x="10" y="15" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, &quot;DejaVu Sans Mono&quot;, monospace" font-size="16" fill="#c8c8c8" textLength="30" lengthAdjust="spacingAndGlyphs" xml:space="preserve">aaa</text>
+<text x="10" y="15" font-family="{FAM}" font-size="16" fill="#c8c8c8" textLength="30" lengthAdjust="spacingAndGlyphs" xml:space="preserve">aaa</text>
 </g>
 <g id="r1">
-<text x="10" y="15" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, &quot;DejaVu Sans Mono&quot;, monospace" font-size="16" fill="#c8c8c8" textLength="30" lengthAdjust="spacingAndGlyphs" xml:space="preserve">bbb</text>
+<text x="10" y="15" font-family="{FAM}" font-size="16" fill="#c8c8c8" textLength="30" lengthAdjust="spacingAndGlyphs" xml:space="preserve">bbb</text>
 </g>
 <g id="r2">
 <rect x="10" y="0" width="30" height="20" fill="#50a000"/>
 <circle cx="32" cy="22" r="2" fill="#28323c"/>
-<text x="0" y="15" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, &quot;DejaVu Sans Mono&quot;, monospace" font-size="16" fill="#ff0000" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">x</text>
-<text x="10" y="15" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, &quot;DejaVu Sans Mono&quot;, monospace" font-size="16" fill="#c8c8c8" textLength="30" lengthAdjust="spacingAndGlyphs" xml:space="preserve">yyy</text>
+<text x="0" y="15" font-family="{FAM}" font-size="16" fill="#ff0000" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">x</text>
+<text x="10" y="15" font-family="{FAM}" font-size="16" fill="#c8c8c8" textLength="30" lengthAdjust="spacingAndGlyphs" xml:space="preserve">yyy</text>
 </g>
 </defs>
 <rect x="0" y="0" width="40" height="40" rx="8" fill="#0b0f14"/>
@@ -1040,7 +1094,7 @@ fn the_full_timeline_document_is_byte_exact() {
 <use href="#r2" xlink:href="#r2" style="animation:k5 3s steps(1,end) infinite;opacity:0"/>
 </g>
 <g id="pt">
-<text x="0" y="15" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, &quot;DejaVu Sans Mono&quot;, monospace" font-size="16" fill="#ffffff" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve" style="animation:k1 3s steps(1,end) infinite;opacity:0">K</text>
+<text x="0" y="15" font-family="{FAM}" font-size="16" fill="#ffffff" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve" style="animation:k1 3s steps(1,end) infinite;opacity:0">K</text>
 <g style="animation:k2 3s steps(1,end) infinite;opacity:0"><circle cx="2" cy="22" r="2" fill="#0a141e"/> <circle cx="2" cy="27" r="2" fill="#0a141e"/> <circle cx="2" cy="32" r="2" fill="#0a141e"/> <circle cx="2" cy="37" r="2" fill="#0a141e"/> <circle cx="7" cy="22" r="2" fill="#0a141e"/> <circle cx="7" cy="27" r="2" fill="#0a141e"/> <circle cx="7" cy="32" r="2" fill="#0a141e"/> <circle cx="7" cy="37" r="2" fill="#0a141e"/></g>
 </g>
 </g>
@@ -1048,11 +1102,12 @@ fn the_full_timeline_document_is_byte_exact() {
 <rect x="0" y="0" width="40" height="40" rx="8" fill="#0b0f14"/>
 <rect x="10" y="0" width="30" height="20" fill="#50a000"/>
 <circle cx="32" cy="22" r="2" fill="#28323c"/>
-<text x="0" y="15" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, &quot;DejaVu Sans Mono&quot;, monospace" font-size="16" fill="#ff0000" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">x</text>
-<text x="10" y="15" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, &quot;DejaVu Sans Mono&quot;, monospace" font-size="16" fill="#c8c8c8" textLength="30" lengthAdjust="spacingAndGlyphs" xml:space="preserve">yyy</text>
+<text x="0" y="15" font-family="{FAM}" font-size="16" fill="#ff0000" textLength="10" lengthAdjust="spacingAndGlyphs" xml:space="preserve">x</text>
+<text x="10" y="15" font-family="{FAM}" font-size="16" fill="#c8c8c8" textLength="30" lengthAdjust="spacingAndGlyphs" xml:space="preserve">yyy</text>
 </g>
 </svg>
 "##;
+    let expected = template.replace("{FACE}", &face).replace("{FAM}", fam);
     assert_eq!(
         doc, expected,
         "the three-state timeline must assemble byte for byte"
@@ -1093,16 +1148,24 @@ fn a_recurring_state_gets_one_rule_with_two_visible_windows() {
 }
 
 /// One hold (no change over the whole timeline) renders the STATIC document:
-/// no `<style>`, no `<defs>`, no `<g id="anim">` — header, canvas, markup.
+/// header, the single `@font-face`, canvas, markup — no `<defs>`, no anim.
 #[test]
 fn a_single_hold_timeline_renders_the_static_document() {
     let f = frame(3, 1, text_row("hi!", 3));
+    let face = animated_face(&[f.clone(), f.clone()]).1;
+    let fam = "'ds-term', 'IBM Plex Mono', monospace";
     let doc = animated_doc(&[f.clone(), f], 30, 20, 5);
-    let expected = r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="30" height="20" viewBox="0 0 30 20">
+    let template = r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="30" height="20" viewBox="0 0 30 20">
+<style>
+{FACE}
+#final{display:none}
+@media (prefers-reduced-motion: reduce){#anim{display:none}#final{display:inline}}
+</style>
 <rect x="0" y="0" width="30" height="20" rx="8" fill="#0b0f14"/>
-<text x="0" y="15" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, &quot;DejaVu Sans Mono&quot;, monospace" font-size="16" fill="#c8c8c8" textLength="30" lengthAdjust="spacingAndGlyphs" xml:space="preserve">hi!</text>
+<text x="0" y="15" font-family="{FAM}" font-size="16" fill="#c8c8c8" textLength="30" lengthAdjust="spacingAndGlyphs" xml:space="preserve">hi!</text>
 </svg>
 "##;
+    let expected = template.replace("{FACE}", &face).replace("{FAM}", fam);
     assert_eq!(
         doc, expected,
         "a degenerate timeline must fall back to the static document"
@@ -1128,11 +1191,21 @@ fn a_constant_replay_writes_the_static_document() {
     let path = dir.join("static.svg");
     write_animated(&path, &rec, &score).unwrap();
     let doc = std::fs::read_to_string(&path).unwrap();
-    let expected = r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="100" height="38" viewBox="0 0 100 38">
+    let face = embed_for(&BTreeSet::from(['a', 'b', ' ']), "DejaVu Sans Mono")
+        .unwrap()
+        .1;
+    let fam = "'ds-term', 'DejaVu Sans Mono', monospace";
+    let template = r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="100" height="38" viewBox="0 0 100 38">
+<style>
+{FACE}
+#final{display:none}
+@media (prefers-reduced-motion: reduce){#anim{display:none}#final{display:inline}}
+</style>
 <rect x="0" y="0" width="100" height="38" rx="8" fill="#0b0f14"/>
-<text x="0" y="14" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, &quot;DejaVu Sans Mono&quot;, monospace" font-size="16" fill="#c8c8c8" textLength="20" lengthAdjust="spacingAndGlyphs" xml:space="preserve">ab</text>
+<text x="0" y="14" font-family="{FAM}" font-size="16" fill="#c8c8c8" textLength="20" lengthAdjust="spacingAndGlyphs" xml:space="preserve">ab</text>
 </svg>
 "##;
+    let expected = template.replace("{FACE}", &face).replace("{FAM}", fam);
     assert_eq!(
         doc, expected,
         "a one-state replay must be written as the static document"
@@ -1405,4 +1478,140 @@ fn scene_hold_windows_covering_every_hold_is_one_window() {
         },
     ];
     assert_eq!(scene_hold_windows(&holds, 3), vec![(0, 3)]);
+}
+
+/// An exported animated SVG carries exactly one `@font-face` with a TTF data
+/// source (spec: the README `<img>` cannot load fonts any other way).
+#[test]
+fn animated_export_embeds_exactly_one_ttf_font_face() {
+    let dir = std::env::temp_dir().join(format!("demostage_svg_face_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("face.svg");
+    write_animated(&path, &replay_rec(), &replay_score()).unwrap();
+    let doc = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        doc.matches("@font-face").count(),
+        1,
+        "exactly one embedded face:\n{doc}"
+    );
+    assert!(
+        doc.contains("data:font/ttf;base64,"),
+        "the face must be a TTF data URI:\n{doc}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The embedded subset parses and covers exactly the states' glyphs: every
+/// character the walks show (that the original font maps) plus space, and
+/// nothing outside that set.
+#[test]
+fn the_embedded_subset_covers_exactly_the_states_glyphs() {
+    let dir = std::env::temp_dir().join(format!("demostage_svg_cover_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("cover.svg");
+    write_animated(&path, &replay_rec(), &replay_score()).unwrap();
+    let doc = std::fs::read_to_string(&path).unwrap();
+    let face = doc
+        .lines()
+        .find(|l| l.contains("@font-face"))
+        .expect("one face rule");
+    let subset = fontdue::Font::from_bytes(subset_bytes(face), fontdue::FontSettings::default())
+        .expect("the embedded font must parse");
+    // The replay shows "ab" then "cd": those four plus the always-kept space.
+    let expected: BTreeSet<char> = ['a', 'b', 'c', 'd', ' '].into();
+    for c in &expected {
+        assert!(subset.has_glyph(*c), "subset lost {c:?}");
+    }
+    for mapped in subset.chars().keys() {
+        assert!(
+            expected.contains(mapped),
+            "subset maps {mapped:?} outside the states plus space"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Every `<text>` in both targets names the embedded face first.
+#[test]
+fn every_text_names_the_embed_first_in_both_targets() {
+    let a = frame(3, 1, text_row("aaa", 3));
+    let b = frame(3, 1, text_row("zzz", 3));
+    let animated = animated_doc(&[a, b.clone()], 30, 20, 2);
+    let poster = poster_document(&b, 30, 20).unwrap();
+    let lead = format!("'{EMBED_FAMILY}',");
+    for (tag, doc) in [("animated", animated), ("poster", poster)] {
+        assert!(doc.contains("<text"), "{tag} has no text:\n{doc}");
+        for part in doc.split("font-family=\"").skip(1) {
+            assert!(
+                part.starts_with(&lead),
+                "{tag} text does not name the embed first:\n{part}"
+            );
+        }
+    }
+}
+
+/// A character the bundled font lacks keeps the fallback behaviour: the
+/// export still succeeds, the run still names the embed first (the viewer
+/// falls back for that glyph), and the subset does not claim it.
+#[test]
+fn a_character_the_font_lacks_keeps_the_fallback() {
+    let tf = frame(
+        2,
+        1,
+        vec![
+            cell('a', [200, 200, 200]),
+            cell('\u{1f680}', [200, 200, 200]),
+        ],
+    );
+    let doc = animated_doc(&[tf.clone(), tf], 20, 20, 2);
+    assert!(
+        doc.contains("font-family=\"'ds-term', 'IBM Plex Mono', monospace\""),
+        "the run still names the embed first:\n{doc}"
+    );
+    let face = doc
+        .lines()
+        .find(|l| l.contains("@font-face"))
+        .expect("one face rule");
+    let subset = fontdue::Font::from_bytes(subset_bytes(face), fontdue::FontSettings::default())
+        .expect("the embedded font must parse");
+    assert!(subset.has_glyph('a'), "used glyph lost");
+    assert!(
+        !subset.has_glyph('\u{1f680}'),
+        "a glyph the font lacks must stay out of the subset"
+    );
+}
+
+/// The vector poster embeds the same single-face shape; the staged PNG
+/// fallback embeds no font at all.
+#[test]
+fn poster_embeds_one_face_while_the_staged_fallback_embeds_none() {
+    let tf = frame(2, 1, text_row("hi", 2));
+    let doc = poster_document(&tf, 20, 20).unwrap();
+    assert_eq!(
+        doc.matches("@font-face").count(),
+        1,
+        "exactly one embedded face:\n{doc}"
+    );
+    assert!(
+        doc.contains("data:font/ttf;base64,"),
+        "the face must be a TTF data URI:\n{doc}"
+    );
+    let dir = std::env::temp_dir().join(format!("demostage_svg_nofont_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("staged.svg");
+    encode(&path, 2, 2, 0, |emit| {
+        emit(&PosterFrame::Rgba(&[128u8; 2 * 2 * 4]));
+        Ok(())
+    })
+    .unwrap();
+    let staged = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !staged.contains("@font-face"),
+        "the PNG fallback must not embed a font:\n{staged}"
+    );
+    assert!(
+        !staged.contains("<text"),
+        "the PNG fallback must not fake vector text"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

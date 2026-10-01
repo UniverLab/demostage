@@ -3,6 +3,7 @@
 //! `<foreignObject>` — the animated document renders in a README `<img>`.
 
 mod animated;
+mod font;
 mod paint;
 mod poster;
 mod timing;
