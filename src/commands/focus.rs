@@ -198,11 +198,10 @@ fn source_hint(sources: &[Source]) -> String {
     }
 }
 
-/// Pick 1–2 sources (orientation for two, presentation, and when to reveal) from
-/// the capture's sources.
-fn wizard(sources: &[Source], args: &FocusArgs) -> Result<WizardOutcome> {
-    println!("\n  demo focus — switch the view\n");
-    // "main" (the terminal) is always available, plus any browser sources.
+/// The revealable ids: `main` (the terminal, always available) plus every
+/// browser source of the capture — with a note when there are no browser
+/// sources to pick from.
+fn pick_pane_ids(sources: &[Source]) -> Vec<String> {
     let mut ids: Vec<String> = vec!["main".to_string()];
     ids.extend(
         sources
@@ -214,6 +213,114 @@ fn wizard(sources: &[Source], args: &FocusArgs) -> Result<WizardOutcome> {
         println!("  (this capture has no browser sources — only the terminal.");
         println!("   configure them when starting `demo capture`, or reveal an ad-hoc page with `demo open <url>`)\n");
     }
+    ids
+}
+
+/// The seconds prompt's validation rule, as a pure predicate: valid iff the
+/// trimmed input parses as a positive number. Extracted from the validator
+/// closure (which reads the real TTY) so the logic is unit-testable.
+fn hold_secs_valid(s: &str) -> bool {
+    match s.trim().parse::<f64>() {
+        Ok(n) => n > 0.0,
+        Err(_) => false,
+    }
+}
+
+/// Entered seconds → hold in milliseconds: unparsable input falls back to the
+/// 6s default, and the result is floored at 0.5s (500 ms).
+fn hold_secs_to_ms(raw: &str) -> u64 {
+    let secs: f64 = raw.trim().parse().unwrap_or(6.0);
+    (secs.max(0.5) * 1000.0) as u64
+}
+
+/// How long a static browser reveal holds, in ms. Duplicates the seconds
+/// validator locally (same message as `demo open`) rather than sharing it.
+fn ask_hold_secs() -> Result<u64> {
+    let secs = ask(Text::new("Hold for how many seconds?")
+        .with_default("6")
+        .with_validator(|s: &str| {
+            if hold_secs_valid(s) {
+                Ok(inquire::validator::Validation::Valid)
+            } else {
+                Ok(inquire::validator::Validation::Invalid(
+                    "enter a positive number of seconds (e.g. 6)".into(),
+                ))
+            }
+        })
+        .prompt())?;
+    Ok(hold_secs_to_ms(&secs))
+}
+
+/// How the chosen browser pane is shown: a static hold (its duration in ms) or
+/// a scroll. Returns `(hold_ms, scroll)`.
+fn ask_browser_behavior() -> Result<(Option<u64>, bool)> {
+    let behavior = ask(Select::new(
+        "Show it as:",
+        vec![
+            "Static — hold for a few seconds",
+            "Scroll the page down (pan)",
+        ],
+    )
+    .prompt())?;
+    let scroll = behavior.starts_with("Scroll");
+    let hold_ms = if behavior.starts_with("Static") {
+        Some(ask_hold_secs()?)
+    } else {
+        None
+    };
+    Ok((hold_ms, scroll))
+}
+
+/// When the reveal fires. Same choices as the `demo open` wizard, so a focus
+/// can be armed ahead of a long-running command instead of firing immediately.
+/// Returns `(when_pattern, after)`.
+fn ask_trigger() -> Result<(Option<String>, bool)> {
+    let trigger = ask(Select::new(
+        "Switch:",
+        vec![
+            "now",
+            "when the current command finishes",
+            "when a line appears in the output",
+        ],
+    )
+    .prompt())?;
+    if trigger.starts_with("when the current") {
+        return Ok((None, true));
+    }
+    if trigger.starts_with("when a line") {
+        let pat = ask(Text::new("Cue line (a substring of the output):").prompt())?;
+        let pat = pat.trim();
+        return Ok(((!pat.is_empty()).then(|| pat.to_string()), false));
+    }
+    Ok((None, false))
+}
+
+/// Assemble the wizard result from its already-asked parts.
+fn build_outcome(
+    sources: Vec<String>,
+    orientation: String,
+    when: Option<String>,
+    after: bool,
+    hold_ms: Option<u64>,
+    scroll: bool,
+    split_with_main: bool,
+) -> WizardOutcome {
+    WizardOutcome {
+        sources,
+        orientation,
+        when,
+        after,
+        hold_ms,
+        scroll,
+        split_with_main,
+    }
+}
+
+/// Pick 1–2 sources (orientation for two, presentation, and when to reveal) from
+/// the capture's sources.
+fn wizard(sources: &[Source], args: &FocusArgs) -> Result<WizardOutcome> {
+    println!("\n  demo focus — switch the view\n");
+    let ids = pick_pane_ids(sources);
 
     let chosen = ask(MultiSelect::new("Show (pick one or two):", ids)
         .with_help_message("space toggles, enter accepts")
@@ -254,70 +361,24 @@ fn wizard(sources: &[Source], args: &FocusArgs) -> Result<WizardOutcome> {
     };
 
     let (hold_ms, scroll) = if has_browser {
-        let behavior = ask(Select::new(
-            "Show it as:",
-            vec![
-                "Static — hold for a few seconds",
-                "Scroll the page down (pan)",
-            ],
-        )
-        .prompt())?;
-        let scroll = behavior.starts_with("Scroll");
-        let hold_ms = if behavior.starts_with("Static") {
-            let secs = ask(Text::new("Hold for how many seconds?")
-                .with_default("6")
-                .with_validator(|s: &str| {
-                    let s = s.trim();
-                    match s.parse::<f64>() {
-                        Ok(n) if n > 0.0 => Ok(inquire::validator::Validation::Valid),
-                        _ => Ok(inquire::validator::Validation::Invalid(
-                            "enter a positive number of seconds (e.g. 6)".into(),
-                        )),
-                    }
-                })
-                .prompt())?;
-            let secs: f64 = secs.trim().parse().unwrap_or(6.0);
-            Some((secs.max(0.5) * 1000.0) as u64)
-        } else {
-            None
-        };
-        (hold_ms, scroll)
+        ask_browser_behavior()?
     } else {
         (None, false)
     };
+    let (when, after) = ask_trigger()?;
 
-    // When to switch — same choices as the `demo open` wizard, so a focus can be
-    // armed ahead of a long-running command instead of firing immediately.
-    let trigger = ask(Select::new(
-        "Switch:",
-        vec![
-            "now",
-            "when the current command finishes",
-            "when a line appears in the output",
-        ],
-    )
-    .prompt())?;
-    let (when, after) = if trigger.starts_with("when the current") {
-        (None, true)
-    } else if trigger.starts_with("when a line") {
-        let pat = ask(Text::new("Cue line (a substring of the output):").prompt())?;
-        let pat = pat.trim();
-        ((!pat.is_empty()).then(|| pat.to_string()), false)
-    } else {
-        (None, false)
-    };
-
-    Ok(WizardOutcome {
-        sources: chosen,
+    Ok(build_outcome(
+        chosen,
         orientation,
         when,
         after,
         hold_ms,
         scroll,
         split_with_main,
-    })
+    ))
 }
 
+/// Unwrap a prompt result, mapping inquire's failure onto our own error.
 fn ask<T>(r: std::result::Result<T, inquire::InquireError>) -> Result<T> {
     r.map_err(|e| Error::Export(format!("wizard: {e}")))
 }
@@ -325,6 +386,15 @@ fn ask<T>(r: std::result::Result<T, inquire::InquireError>) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The wizard's `ask` wrapper compiles against inquire's error type (0.9):
+    /// a prompt that cannot run (no TTY) surfaces as our own error.
+    #[test]
+    fn ask_maps_inquire_errors_to_export_errors() {
+        let err = ask::<String>(Err(inquire::InquireError::NotTTY)).unwrap_err();
+        assert!(matches!(err, Error::Export(_)));
+        assert_eq!(ask::<String>(Ok("ok".to_string())).unwrap(), "ok");
+    }
 
     #[test]
     fn is_terminal_id_matches_main_and_terminal() {
@@ -576,5 +646,116 @@ mod tests {
         assert!(hint.contains("main"));
         assert!(hint.contains("docs"));
         assert!(hint.contains("code"));
+    }
+
+    // --- pick_pane_ids -----------------------------------------------------
+
+    /// No capture sources → just the terminal id. Exact vector equality (not
+    /// `len()`/`contains`) so body-replacement mutants (`vec!["xyzzy".into()]`,
+    /// `vec![String::new()]`, `vec![]`) die here.
+    #[test]
+    fn pick_pane_ids_no_sources_returns_exactly_main() {
+        assert_eq!(pick_pane_ids(&[]), vec!["main".to_string()]);
+    }
+
+    /// Only `Browser` sources are appended after `main`; a `Terminal` source is
+    /// skipped, and the order matches the capture's source order exactly.
+    #[test]
+    fn pick_pane_ids_adds_only_browser_sources_in_order() {
+        let sources = vec![
+            Source {
+                id: "docs".into(),
+                kind: SourceKind::Browser,
+                url: None,
+                theme: None,
+            },
+            Source {
+                id: "term".into(),
+                kind: SourceKind::Terminal,
+                url: None,
+                theme: None,
+            },
+        ];
+        assert_eq!(
+            pick_pane_ids(&sources),
+            vec!["main".to_string(), "docs".to_string()]
+        );
+    }
+
+    /// Several browsers keep the capture's order after the leading `main`.
+    #[test]
+    fn pick_pane_ids_keeps_capture_order_for_browsers() {
+        let sources = vec![
+            Source {
+                id: "term".into(),
+                kind: SourceKind::Terminal,
+                url: None,
+                theme: None,
+            },
+            Source {
+                id: "docs".into(),
+                kind: SourceKind::Browser,
+                url: None,
+                theme: None,
+            },
+            Source {
+                id: "web".into(),
+                kind: SourceKind::Browser,
+                url: None,
+                theme: None,
+            },
+        ];
+        assert_eq!(
+            pick_pane_ids(&sources),
+            vec!["main".to_string(), "docs".to_string(), "web".to_string()]
+        );
+    }
+
+    // --- ask_hold_secs: pure validation/conversion helpers -----------------
+
+    /// The validator's positive-number rule. Kills the extracted `>` mutants
+    /// in the helper: `>`→`<` and `>`→`==` both reject "6" (asserted true).
+    #[test]
+    fn hold_secs_valid_accepts_positive_numbers() {
+        assert!(hold_secs_valid("6"));
+        assert!(hold_secs_valid(" 3 "));
+        assert!(hold_secs_valid("0.5"));
+    }
+
+    /// Zero, negatives and garbage are rejected. Also kills `>`→`>=`
+    /// (0.0 >= 0.0 would be true) and any `false`→`true` literal mutant.
+    #[test]
+    fn hold_secs_valid_rejects_non_positive_or_unparsable() {
+        assert!(!hold_secs_valid("0"));
+        assert!(!hold_secs_valid("0.0"));
+        assert!(!hold_secs_valid("-1"));
+        assert!(!hold_secs_valid("abc"));
+        assert!(!hold_secs_valid(""));
+    }
+
+    /// Seconds → milliseconds, exact values. `*`→`+` gives 1001 for "1.5",
+    /// `*`→`/` gives 0 — both caught by the exact 1500; a `1000.0` literal
+    /// change is caught by the exact 6000.
+    #[test]
+    fn hold_secs_to_ms_converts_seconds_exactly() {
+        assert_eq!(hold_secs_to_ms("6"), 6000);
+        assert_eq!(hold_secs_to_ms("1.5"), 1500);
+        assert_eq!(hold_secs_to_ms(" 2 "), 2000);
+    }
+
+    /// Sub-half-second inputs are floored at 0.5s = 500 ms (kills `0.5`
+    /// literal mutants in `.max(0.5)`).
+    #[test]
+    fn hold_secs_to_ms_floors_at_half_a_second() {
+        assert_eq!(hold_secs_to_ms("0.1"), 500);
+        assert_eq!(hold_secs_to_ms("0.01"), 500);
+    }
+
+    /// Unparsable input falls back to the 6s default (kills `6.0` literal
+    /// mutants in `.unwrap_or(6.0)`).
+    #[test]
+    fn hold_secs_to_ms_defaults_to_six_seconds_when_unparsable() {
+        assert_eq!(hold_secs_to_ms("abc"), 6000);
+        assert_eq!(hold_secs_to_ms(""), 6000);
     }
 }

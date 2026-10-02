@@ -60,6 +60,17 @@ pub fn parse_font_name(display: &str) -> &str {
     display.split("   ").next().unwrap_or(display).trim()
 }
 
+/// Raw bytes of a bundled font by its key name. Falls back to the default.
+/// Mirrors [`load`]'s lookup so the SVG embedder subsets the same bytes the
+/// raster path draws with.
+pub fn bytes(name: &str) -> &'static [u8] {
+    BUNDLED
+        .iter()
+        .find(|f| f.name.eq_ignore_ascii_case(name))
+        .map(|f| f.bytes)
+        .unwrap_or(BUNDLED[0].bytes)
+}
+
 /// Load a font by its key name. Falls back to the default if unknown.
 pub fn load(name: &str) -> Font {
     let bytes = BUNDLED

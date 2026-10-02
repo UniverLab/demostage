@@ -78,6 +78,16 @@ pub struct Scene {
 }
 
 impl Scene {
+    /// Build a scene from explicit keyframes (used by tests and the Chrome
+    /// PDF fallback, which collects its shots before constructing).
+    pub fn from_keyframes(width: usize, height: usize, keyframes: Vec<(f64, Vec<u8>)>) -> Self {
+        Scene {
+            width,
+            height,
+            keyframes,
+        }
+    }
+
     /// The frame to show at `progress` (the latest keyframe at or before it).
     pub fn frame_at(&self, progress: f64) -> &[u8] {
         let mut chosen = &self.keyframes[0].1;
@@ -216,6 +226,106 @@ impl From<Scene> for AnyScene {
     }
 }
 
+/// Whether a pane URL points at a PDF (case-insensitive). Pure so the
+/// gate is unit-testable without rendering anything.
+fn is_pdf_url(url: &str) -> bool {
+    url.to_lowercase().ends_with(".pdf")
+}
+
+/// Progress of the i-th Chrome-viewer keyframe: the first shot is the top
+/// (0.0); scrolling shots span 0.5..=1.0. Pure so the spacing is testable
+/// without a live browser.
+fn chrome_pdf_progress(i: usize, scroll_keyframes: usize) -> f64 {
+    0.5 + 0.5 * ((i + 1) as f64 / scroll_keyframes as f64)
+}
+
+/// Render a native PDF scene (hayro) for `url`, when it *is* a PDF.
+/// `None` for non-PDF URLs and when the native render fails — the caller then
+/// falls back to Chrome's own viewer, reporting the failure.
+fn native_pdf_scene(
+    url: &str,
+    w: usize,
+    h: usize,
+    output_frames: usize,
+    fps: f64,
+    pan: Option<ScrollParams>,
+    effective_speed: f64,
+) -> Option<CaptureResult> {
+    if !is_pdf_url(url) {
+        return None;
+    }
+    match local_file_path(url)
+        .and_then(|p| super::pdf::capture_scene(&p, w, h, output_frames, fps, pan, effective_speed))
+    {
+        Ok(scene) => Some(CaptureResult {
+            scene: AnyScene::Pdf(scene),
+            _guard: TempDirGuard(None),
+            report: None,
+        }),
+        Err(e) => {
+            eprintln!("demo: native PDF render failed ({e}), falling back to Chrome viewer");
+            None
+        }
+    }
+}
+
+/// Open a tab sized to the pane and force the viewport to its exact
+/// dimensions, applying the pane's theme preference.
+fn open_tab_for_pane(browser: &Browser, pane: &Pane, w: usize, h: usize) -> Result<Arc<Tab>> {
+    let tab = browser
+        .new_tab()
+        .map_err(|e| Error::Export(format!("open tab: {e}")))?;
+    let _ = tab.set_bounds(headless_chrome::types::Bounds::Normal {
+        left: Some(0),
+        top: Some(0),
+        width: Some(w as f64),
+        height: Some(h as f64),
+    });
+    emulate_theme(&tab, pane.theme.as_deref());
+    Ok(tab)
+}
+
+/// Fallback for PDFs when the native hayro render fails: drive Chrome's own
+/// PDF viewer, paging through `scroll_keyframes` captures. The viewer may
+/// still paint blank in headless mode on some systems.
+fn capture_chrome_pdf_scene(
+    tab: &Arc<Tab>,
+    url: &str,
+    w: usize,
+    h: usize,
+    scroll_keyframes: usize,
+) -> Result<CaptureResult> {
+    let _ = tab.call_method(Navigate {
+        url: url.to_string(),
+        referrer: None,
+        transition_Type: None,
+        frame_id: None,
+        referrer_policy: None,
+    });
+    std::thread::sleep(Duration::from_millis(3000));
+
+    let mut keyframes = vec![(0.0, shot(tab, w, h)?)];
+    for i in 0..scroll_keyframes {
+        let _ = tab.evaluate(
+            "window.scrollBy(0, Math.round(window.innerHeight * 0.85));",
+            false,
+        );
+        let _ = tab.press_key("PageDown");
+        std::thread::sleep(Duration::from_millis(350));
+        let progress = chrome_pdf_progress(i, scroll_keyframes);
+        keyframes.push((progress, shot(tab, w, h)?));
+    }
+    Ok(CaptureResult {
+        scene: AnyScene::Keyframe(Scene {
+            width: w,
+            height: h,
+            keyframes,
+        }),
+        _guard: TempDirGuard(None),
+        report: None,
+    })
+}
+
 /// Render a browser pane's `url`, emitting a scene that covers `output_frames`
 /// of output. For headless web panes, captures one screenshot per output frame
 /// with absolute scroll positions, writing PNGs to a temporary directory that
@@ -252,21 +362,8 @@ pub fn capture(
 
     // PDFs render natively (hayro) — no Chromium launch, no blank-viewer risk,
     // and the scene starts instantly. Chrome's viewer is only a fallback.
-    if url.to_lowercase().ends_with(".pdf") {
-        match local_file_path(&url).and_then(|p| {
-            super::pdf::capture_scene(&p, w, h, output_frames, fps, pan, effective_speed)
-        }) {
-            Ok(scene) => {
-                return Ok(CaptureResult {
-                    scene: AnyScene::Pdf(scene),
-                    _guard: TempDirGuard(None),
-                    report: None,
-                })
-            }
-            Err(e) => {
-                eprintln!("demo: native PDF render failed ({e}), falling back to Chrome viewer");
-            }
-        }
+    if let Some(scene) = native_pdf_scene(&url, w, h, output_frames, fps, pan, effective_speed) {
+        return Ok(scene);
     }
 
     if provision::find_chromium().is_none() {
@@ -298,52 +395,12 @@ pub fn capture(
         ))
     })?;
 
-    let tab = browser
-        .new_tab()
-        .map_err(|e| Error::Export(format!("open tab: {e}")))?;
-    // Force the viewport to the exact pane dimensions.
-    let _ = tab.set_bounds(headless_chrome::types::Bounds::Normal {
-        left: Some(0),
-        top: Some(0),
-        width: Some(w as f64),
-        height: Some(h as f64),
-    });
-    emulate_theme(&tab, pane.theme.as_deref());
+    let tab = open_tab_for_pane(&browser, pane, w, h)?;
 
     let is_pdf = url.to_lowercase().ends_with(".pdf");
 
     if is_pdf {
-        // Fallback: Chrome's PDF viewer (native hayro render failed above; the
-        // viewer may still paint blank in headless mode on some systems).
-        let _ = tab.call_method(Navigate {
-            url: url.to_string(),
-            referrer: None,
-            transition_Type: None,
-            frame_id: None,
-            referrer_policy: None,
-        });
-        std::thread::sleep(Duration::from_millis(3000));
-
-        let mut keyframes = vec![(0.0, shot(&tab, w, h)?)];
-        for i in 0..scroll_keyframes {
-            let _ = tab.evaluate(
-                "window.scrollBy(0, Math.round(window.innerHeight * 0.85));",
-                false,
-            );
-            let _ = tab.press_key("PageDown");
-            std::thread::sleep(Duration::from_millis(350));
-            let progress = 0.5 + 0.5 * ((i + 1) as f64 / scroll_keyframes as f64);
-            keyframes.push((progress, shot(&tab, w, h)?));
-        }
-        Ok(CaptureResult {
-            scene: AnyScene::Keyframe(Scene {
-                width: w,
-                height: h,
-                keyframes,
-            }),
-            _guard: TempDirGuard(None),
-            report: None,
-        })
+        capture_chrome_pdf_scene(&tab, &url, w, h, scroll_keyframes)
     } else {
         tab.navigate_to(&url)
             .and_then(|t| t.wait_until_navigated())
@@ -1208,5 +1265,82 @@ mod tests {
             !dir.exists(),
             "temp directory should be removed after failure path"
         );
+    }
+
+    // --- mutant-killing tests: pdf gate, chrome progress, native render ---
+
+    #[test]
+    fn is_pdf_url_matches_case_insensitively() {
+        assert!(super::is_pdf_url("file:///tmp/doc.pdf"));
+        assert!(super::is_pdf_url("https://x.com/DOC.PDF"));
+        assert!(super::is_pdf_url("https://x.com/dOc.PdF"));
+        assert!(!super::is_pdf_url("https://x.com/page.html"));
+        assert!(!super::is_pdf_url("https://x.com/pdf/viewer"));
+        assert!(!super::is_pdf_url(""));
+    }
+
+    #[test]
+    fn chrome_pdf_progress_spans_half_to_one() {
+        // scroll_keyframes = 2 → first scroll shot 0.75, last exactly 1.0.
+        assert_eq!(super::chrome_pdf_progress(0, 2), 0.75);
+        assert_eq!(super::chrome_pdf_progress(1, 2), 1.0);
+        // scroll_keyframes = 1 → single shot exactly 1.0.
+        assert_eq!(super::chrome_pdf_progress(0, 1), 1.0);
+        // Strictly increasing within a run.
+        let run: Vec<f64> = (0..4).map(|i| super::chrome_pdf_progress(i, 4)).collect();
+        assert_eq!(run, vec![0.625, 0.75, 0.875, 1.0]);
+    }
+
+    /// One blank page with computed xref offsets, so the structure is valid
+    /// by construction.
+    fn minimal_pdf_bytes() -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"%PDF-1.4\n");
+        let objs = [
+            "1 0 obj\n<</Type/Catalog/Pages 2 0 R>>\nendobj\n",
+            "2 0 obj\n<</Type/Pages/Kids[3 0 R]/Count 1>>\nendobj\n",
+            "3 0 obj\n<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]>>\nendobj\n",
+        ];
+        let mut offsets = Vec::new();
+        for o in objs {
+            offsets.push(out.len());
+            out.extend_from_slice(o.as_bytes());
+        }
+        let xref_at = out.len();
+        out.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+        for off in offsets {
+            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!("trailer\n<</Size 4/Root 1 0 R>>\nstartxref\n{xref_at}\n%%EOF\n").as_bytes(),
+        );
+        out
+    }
+
+    #[test]
+    fn native_pdf_scene_rejects_non_pdf_without_rendering() {
+        assert!(
+            super::native_pdf_scene("https://x.com/page.html", 800, 600, 2, 15.0, None, 1.0)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn native_pdf_scene_renders_a_real_pdf_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "demo-test-native-pdf-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pdf = dir.join("doc.pdf");
+        std::fs::write(&pdf, minimal_pdf_bytes()).unwrap();
+        let url = format!("file://{}", pdf.display());
+        let got = super::native_pdf_scene(&url, 800, 600, 2, 15.0, None, 1.0);
+        assert!(got.is_some(), "a valid local PDF must render natively");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

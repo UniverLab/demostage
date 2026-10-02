@@ -2,18 +2,72 @@
 name = "demo"
 output_dir = "./dist"
 speed = "2x"
-targets = ["gif", "mp4"]
+targets = ["gif", "mp4", "svg"]
 prompt = '\[\e[1;32m\]demoStage@univerlab\[\e[0m\]:\[\e[1;34m\]~\[\e[0m\]$ '
 
+# A self-contained tour: the setup writes a tiny "thing to show" (a truecolor
+# banner) and the score that demos it into a scratch dir, then the timeline
+# shows the whole loop — the output, the score, record, export, doctor.
+# Terminal-only on purpose, so the animated SVG export works too.
+[env]
+setup_script = '''
+rm -rf /tmp/demostage-tour && mkdir -p /tmp/demostage-tour && cd /tmp/demostage-tour
+cat > banner.py <<'PY'
+import time
+W = 56
+def grad(t):
+    stops = [(168, 85, 247), (34, 211, 238), (74, 222, 128)]
+    seg = t * (len(stops) - 1); i = min(int(seg), len(stops) - 2); f = seg - i
+    a, b = stops[i], stops[i + 1]
+    return tuple(int(a[k] + (b[k] - a[k]) * f) for k in range(3))
+def bar(text):
+    out = ""
+    for n, ch in enumerate(text.ljust(W)):
+        r, g, b = grad(n / (W - 1))
+        out += f"\x1b[48;2;{r};{g};{b}m\x1b[38;2;11;15;20m{ch}"
+    return out + "\x1b[0m"
+print("╭" + "─" * W + "╮")
+print("│" + bar("  ◆  demoStage · demos as code") + "│")
+print("│" + bar("      record once · export gif · mp4 · svg") + "│")
+print("╰" + "─" * W + "╯")
+for label, val in [("frames", "15 fps"), ("font", "embedded"), ("output", "dist/")]:
+    time.sleep(0.25)
+    print(f"  \x1b[38;2;74;222;128m✔\x1b[0m {label:<8}\x1b[2m{val}\x1b[0m")
+PY
+cat > hello.toml <<'TOML'
+# what happens, in order
+timeline = [
+  { action = "focus", pane = "main" },
+  { action = "type", text = "python3 banner.py" },
+  { action = "keypress", key = "enter" },
+  { action = "wait_for_screen", match = "output" },
+  { action = "terminate" },
+]
+
+[demo]
+name = "hello"
+targets = ["gif", "svg"]
+
+[env]
+setup_script = "cd /tmp/demostage-tour"
+
+[layout]
+width = 720
+height = 300
+panes = [{ id = "main", type = "terminal", x = 0, y = 0, width = 720, height = 300 }]
+TOML
+'''
+teardown_script = "rm -rf /tmp/demostage-tour"
+
 [typing]
-base_ms = 80
+base_ms = 70
 salt_ms = 15
 
 [layout]
-width = 1440
-height = 1080
+width = 1000
+height = 600
 fps = 15
-line_height = 1.2000000476837158
+line_height = 1.2
 background = "#0b0f14"
 font_family = "IBM Plex Mono"
 
@@ -22,116 +76,141 @@ id = "main"
 type = "terminal"
 x = 0
 y = 0
-width = 1440
-height = 1080
+width = 1000
+height = 600
 font_family = "monospace"
-font_size = 16
+font_size = 20
 
 [[timeline]]
 action = "focus"
 pane = "main"
 
+# 1 — the thing worth showing
 [[timeline]]
-action = "type"
-text = 'echo "Hello world!"'
-human_salt = true
+action = "caption"
+text = "1 · something worth showing"
 
 [[timeline]]
-action = "wait"
-duration_ms = 200
+action = "type"
+text = "python3 banner.py"
+human_salt = true
 
 [[timeline]]
 action = "keypress"
 key = "enter"
 
 [[timeline]]
+action = "wait_for_screen"
+match = "output"
+timeout_ms = 10000
+
+[[timeline]]
 action = "wait"
-duration_ms = 1325
+duration_ms = 1800
+
+# 2 — written down as a score
+[[timeline]]
+action = "keypress"
+key = "ctrl+l"
+
+[[timeline]]
+action = "caption"
+text = "2 · write it down as a score"
 
 [[timeline]]
 action = "type"
-text = "mapscii"
+text = "cat hello.toml"
 human_salt = true
-
-[[timeline]]
-action = "wait"
-duration_ms = 200
 
 [[timeline]]
 action = "keypress"
 key = "enter"
 
 [[timeline]]
+action = "wait_for_quiet"
+quiet_ms = 400
+max_ms = 3000
+
+[[timeline]]
 action = "wait"
-duration_ms = 2500
+duration_ms = 5000
+
+# 3 — record: the score runs in a real PTY
+[[timeline]]
+action = "keypress"
+key = "ctrl+l"
+
+[[timeline]]
+action = "caption"
+text = "3 · record it — a real PTY runs the score"
 
 [[timeline]]
 action = "type"
-text = "hhhaaaañlllljjjhhhhjjjhhhhhhjjjllllallllllllllllallllllllqclear"
+text = "demo record hello.toml"
 human_salt = true
-
-[[timeline]]
-action = "wait"
-duration_ms = 200
 
 [[timeline]]
 action = "keypress"
 key = "enter"
 
 [[timeline]]
+action = "wait_for_screen"
+match = "recorded hello.toml"
+timeout_ms = 90000
+
+[[timeline]]
 action = "wait"
-duration_ms = 2500
+duration_ms = 1200
+
+# 4 — export, playback only, never re-executes
+[[timeline]]
+action = "caption"
+text = "4 · export — gif and svg from one recording"
 
 [[timeline]]
 action = "type"
-text = "mkdir demo"
+text = "demo export"
 human_salt = true
-
-[[timeline]]
-action = "wait"
-duration_ms = 200
 
 [[timeline]]
 action = "keypress"
 key = "enter"
 
 [[timeline]]
+action = "wait_for_screen"
+match = "exported demo.rec"
+timeout_ms = 90000
+
+[[timeline]]
 action = "wait"
-duration_ms = 439
+duration_ms = 600
 
 [[timeline]]
 action = "type"
-text = "cd demo"
+text = "tree dist"
 human_salt = true
-
-[[timeline]]
-action = "wait"
-duration_ms = 200
 
 [[timeline]]
 action = "keypress"
 key = "enter"
 
 [[timeline]]
-action = "wait"
-duration_ms = 2500
-
-[[timeline]]
-action = "type"
-text = "demo --help"
-human_salt = true
+action = "wait_for_quiet"
+quiet_ms = 400
+max_ms = 3000
 
 [[timeline]]
 action = "wait"
-duration_ms = 200
+duration_ms = 1500
 
+# 5 — everything it needs is checked, not assumed
 [[timeline]]
 action = "keypress"
-key = "enter"
+key = "ctrl+l"
 
 [[timeline]]
-action = "wait"
-duration_ms = 1082
+action = "caption"
+text = "5 · doctor checks what export needs"
 
 [[timeline]]
 action = "type"
@@ -139,173 +218,21 @@ text = "demo doctor"
 human_salt = true
 
 [[timeline]]
-action = "wait"
-duration_ms = 200
-
-[[timeline]]
 action = "keypress"
 key = "enter"
 
 [[timeline]]
-action = "wait"
-duration_ms = 656
-
-[[timeline]]
-action = "type"
-text = "demo capture"
-human_salt = true
-
-[[timeline]]
-action = "wait"
-duration_ms = 200
-
-[[timeline]]
-action = "keypress"
-key = "enter"
-
-[[timeline]]
-action = "wait"
-duration_ms = 200
-
-[[timeline]]
-action = "keypress"
-key = "enter"
-
-[[timeline]]
-action = "wait"
-duration_ms = 200
-
-[[timeline]]
-action = "keypress"
-key = "enter"
-
-[[timeline]]
-action = "wait"
-duration_ms = 200
-
-[[timeline]]
-action = "keypress"
-key = "enter"
-
-[[timeline]]
-action = "wait"
-duration_ms = 200
-
-[[timeline]]
-action = "keypress"
-key = "enter"
-
-[[timeline]]
-action = "wait"
-duration_ms = 200
-
-[[timeline]]
-action = "keypress"
-key = "enter"
-
-[[timeline]]
-action = "wait"
-duration_ms = 200
-
-[[timeline]]
-action = "keypress"
-key = "enter"
+action = "wait_for_screen"
+match = "All set"
+timeout_ms = 15000
 
 [[timeline]]
 action = "wait"
 duration_ms = 2500
 
 [[timeline]]
-action = "type"
-text = "y"
-human_salt = true
-
-[[timeline]]
-action = "wait"
-duration_ms = 200
-
-[[timeline]]
-action = "keypress"
-key = "enter"
-
-[[timeline]]
-action = "wait"
-duration_ms = 1843
-
-[[timeline]]
-action = "type"
-text = "github"
-human_salt = true
-
-[[timeline]]
-action = "wait"
-duration_ms = 200
-
-[[timeline]]
-action = "keypress"
-key = "enter"
-
-[[timeline]]
-action = "wait"
-duration_ms = 1619
-
-[[timeline]]
-action = "type"
-text = "github.com/univerlab"
-human_salt = true
-
-[[timeline]]
-action = "wait"
-duration_ms = 200
-
-[[timeline]]
-action = "keypress"
-key = "enter"
-
-[[timeline]]
-action = "wait"
-duration_ms = 1497
-
-[[timeline]]
-action = "keypress"
-key = "down"
-
-[[timeline]]
-action = "wait"
-duration_ms = 240
-
-[[timeline]]
-action = "keypress"
-key = "down"
-
-[[timeline]]
-action = "wait"
-duration_ms = 200
-
-[[timeline]]
-action = "keypress"
-key = "enter"
-
-[[timeline]]
-action = "wait"
-duration_ms = 2310
-
-[[timeline]]
-action = "type"
-text = "n"
-human_salt = true
-
-[[timeline]]
-action = "wait"
-duration_ms = 200
-
-[[timeline]]
-action = "keypress"
-key = "enter"
-
-[[timeline]]
-action = "wait"
-duration_ms = 1500
+action = "caption"
+text = ""
 
 [[timeline]]
 action = "terminate"
