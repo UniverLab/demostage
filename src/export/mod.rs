@@ -270,10 +270,10 @@ fn render_svg(
         ));
     }
     // Single terminal: walk the whole replay as vector states — the frames in
-    // between are never rasterized.
-    progress_bar("exporting svg", 1, 1);
+    // between are never rasterized. No progress bar here: `write_animated`
+    // announces its own one-line summary on stderr, and a bar left on that
+    // line would glue the summary onto it.
     svg::write_animated(&path, rec, score)?;
-    progress_clear();
     Ok(path)
 }
 
