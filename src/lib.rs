@@ -56,14 +56,20 @@ use std::process::ExitCode;
 use cli::{Cli, Command};
 
 /// Dispatch a parsed CLI invocation to its command, returning the process exit
-/// code. Only `check` reports failure through the exit code; everything else
-/// surfaces problems as an [`Error`].
+/// code. Only `update` reports through the exit code: `0` = up to date
+/// (also: update installed, prompt declined, or a cargo-managed install),
+/// `1` = `--check` found an update is available (plain `update`: a failure
+/// after a successful check), `2` = the release check could not be completed
+/// (the cause is the single line on stderr); everything else surfaces
+/// problems as an [`Error`].
 pub fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command {
         Command::Capture(args) => commands::capture::run(args).map(|()| ExitCode::SUCCESS),
         Command::Record(args) => commands::record::run(args).map(|()| ExitCode::SUCCESS),
         Command::Export(args) => commands::export::run(args).map(|()| ExitCode::SUCCESS),
         Command::Doctor(args) => commands::doctor::run(args).map(|()| ExitCode::SUCCESS),
+        Command::Update(args) => commands::update::run_update(args.check, args.yes)
+            .map(|code| ExitCode::from(code as u8)),
         Command::Edit(args) => commands::edit::run(args).map(|()| ExitCode::SUCCESS),
         Command::Stop => commands::stop::run().map(|()| ExitCode::SUCCESS),
         Command::Open(args) => commands::open::run(args).map(|()| ExitCode::SUCCESS),
@@ -122,6 +128,23 @@ mod tests {
     fn banner_has_multiple_lines() {
         let lines: Vec<&str> = crate::BANNER.lines().collect();
         assert!(lines.len() > 5);
+    }
+
+    /// A failing subcommand surfaces as `Err` — `run` must not flatten it
+    /// into a success exit code (`replace run -> Result<ExitCode> with
+    /// Ok(Default::default())` dies here).
+    #[test]
+    fn run_surfaces_subcommand_errors_as_errors() {
+        use crate::cli::{Cli, Command, EditArgs};
+        let cli = Cli {
+            command: Command::Edit(EditArgs {
+                input: "/nonexistent/demostage-missing-score-42.toml".into(),
+            }),
+        };
+        assert!(
+            crate::run(cli).is_err(),
+            "a failing subcommand must come back as Err, not as an exit code"
+        );
     }
 
     #[test]

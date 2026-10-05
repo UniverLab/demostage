@@ -125,4 +125,4 @@ fi
 
 info "done" "$($INSTALL_DIR/$BINARY --version 2>/dev/null || echo "$BINARY installed")"
 echo ""
-info "ready" "Run 'demo-stage --help' to get started!"
+info "ready" "Run '$BINARY --help' to get started!"

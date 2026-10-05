@@ -216,6 +216,7 @@ fn resolve(args: OpenArgs, in_session: bool) -> Result<Reveal> {
     }
 }
 
+/// Unwrap a prompt result, mapping inquire's failure onto our own error.
 fn ask<T>(r: std::result::Result<T, inquire::InquireError>) -> Result<T> {
     r.map_err(|e| Error::Export(format!("wizard: {e}")))
 }
@@ -243,45 +244,32 @@ fn capture_roots() -> BrowseRoots {
     }
 }
 
-fn wizard(in_session: bool) -> Result<Reveal> {
-    println!("\n  demo open — reveal a browser scene\n");
-
+/// Ask which source to reveal: a URL (fixed up against the launch directory)
+/// or a local file, which is also served over HTTP for this session. Returns
+/// the URL and the live server backing it, if any.
+fn pick_source_url(roots: &BrowseRoots, in_session: bool) -> Result<(String, Option<LocalServer>)> {
     let source = ask(Select::new(
         "Source:",
         vec!["URL (web page, localhost)", "Local file (PDF, PNG, HTML)"],
     )
     .prompt())?;
 
-    let roots = capture_roots();
-    let mut local_server = None;
-    let url = if source.starts_with("Local") {
-        let path = pick_local_file(&roots, in_session)?;
+    if source.starts_with("Local") {
+        let path = pick_local_file(roots, in_session)?;
         let (url, server) = local_server::serve_local_file(&path)?;
         eprintln!("● serving local file on http://127.0.0.1:{}", server.port());
-        local_server = Some(server);
-        url
-    } else {
-        let raw = ask(Text::new("URL:")
-            .with_help_message("a repo page, http://localhost…")
-            .prompt())?;
-        repair_browser_url(&raw, &roots.launch_dir)?
-    };
-
-    let scene_name = ask(inquire::Text::new("Scene name:")
-        .with_help_message("identifier for this scene (e.g. 'browser', 'preview')")
-        .with_default("browser")
+        return Ok((url, Some(server)));
+    }
+    let raw = ask(Text::new("URL:")
+        .with_help_message("a repo page, http://localhost…")
         .prompt())?;
-    let scene_name = scene_name.trim().to_string();
+    Ok((repair_browser_url(&raw, &roots.launch_dir)?, None))
+}
 
-    let theme = ask(Select::new("Browser theme:", vec!["default", "light", "dark"]).prompt())?;
-    let theme = match theme {
-        "light" => Some("light".to_string()),
-        "dark" => Some("dark".to_string()),
-        _ => None,
-    };
-
-    // How to present it — a static hold, a scroll, or an interactive view. These
-    // are mutually exclusive, so they're one question.
+/// How to present the reveal — a static hold, a scroll, or an interactive view.
+/// These are mutually exclusive, so they're one question. Returns
+/// `(view, scroll, hold_ms)`.
+fn ask_behavior() -> Result<(bool, bool, Option<u64>)> {
     let behavior = ask(Select::new(
         "Show it as:",
         vec![
@@ -313,6 +301,80 @@ fn wizard(in_session: bool) -> Result<Reveal> {
     } else {
         None
     };
+    Ok((view, scroll, hold_ms))
+}
+
+/// When the reveal fires: now, after the current command, or when a line
+/// appears in the output. Returns `(when_pattern, after)`.
+fn ask_trigger() -> Result<(Option<String>, bool)> {
+    let trigger = ask(Select::new(
+        "Reveal:",
+        vec![
+            "now",
+            "when the current command finishes",
+            "when a line appears in the output",
+        ],
+    )
+    .prompt())?;
+    if trigger.starts_with("when the current") {
+        return Ok((None, true));
+    }
+    if trigger.starts_with("when a line") {
+        let pat = ask(Text::new("Cue line (a substring of the output):").prompt())?;
+        let pat = pat.trim();
+        return Ok(((!pat.is_empty()).then(|| pat.to_string()), false));
+    }
+    Ok((None, false))
+}
+
+/// Ask for the scene identifier (e.g. `browser`, `preview`).
+fn ask_scene_name() -> Result<String> {
+    let scene_name = ask(inquire::Text::new("Scene name:")
+        .with_help_message("identifier for this scene (e.g. 'browser', 'preview')")
+        .with_default("browser")
+        .prompt())?;
+    Ok(scene_name.trim().to_string())
+}
+
+/// Ask for the emulated colour scheme, or `None` for the page default.
+fn ask_theme() -> Result<Option<String>> {
+    let theme = ask(Select::new("Browser theme:", vec!["default", "light", "dark"]).prompt())?;
+    Ok(match theme {
+        "light" => Some("light".to_string()),
+        "dark" => Some("dark".to_string()),
+        _ => None,
+    })
+}
+
+/// Ask how the reveal is placed: full-screen scene swap or split beside the
+/// terminal. Returns the mode string.
+fn ask_placement() -> Result<String> {
+    let mode = ask(Select::new(
+        "Place it:",
+        vec![
+            "replace — full screen (scene swap)",
+            "split — beside the terminal",
+        ],
+    )
+    .prompt())?;
+    Ok(if mode.starts_with("split") {
+        "split"
+    } else {
+        "replace"
+    }
+    .to_string())
+}
+
+fn wizard(in_session: bool) -> Result<Reveal> {
+    println!("\n  demo open — reveal a browser scene\n");
+
+    let roots = capture_roots();
+    let (url, local_server) = pick_source_url(&roots, in_session)?;
+
+    let scene_name = ask_scene_name()?;
+    let theme = ask_theme()?;
+
+    let (view, scroll, hold_ms) = ask_behavior()?;
 
     // An interactive view always takes over the whole frame and opens immediately.
     if view {
@@ -330,38 +392,9 @@ fn wizard(in_session: bool) -> Result<Reveal> {
         });
     }
 
-    let mode = ask(Select::new(
-        "Place it:",
-        vec![
-            "replace — full screen (scene swap)",
-            "split — beside the terminal",
-        ],
-    )
-    .prompt())?;
-    let mode = if mode.starts_with("split") {
-        "split"
-    } else {
-        "replace"
-    };
+    let mode = ask_placement()?;
 
-    let trigger = ask(Select::new(
-        "Reveal:",
-        vec![
-            "now",
-            "when the current command finishes",
-            "when a line appears in the output",
-        ],
-    )
-    .prompt())?;
-    let (when, after) = if trigger.starts_with("when the current") {
-        (None, true)
-    } else if trigger.starts_with("when a line") {
-        let pat = ask(Text::new("Cue line (a substring of the output):").prompt())?;
-        let pat = pat.trim();
-        ((!pat.is_empty()).then(|| pat.to_string()), false)
-    } else {
-        (None, false)
-    };
+    let (when, after) = ask_trigger()?;
 
     Ok(Reveal {
         url: finalize_url(&url),
@@ -389,6 +422,15 @@ fn finalize_url(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ask_maps_inquire_errors_to_export_errors() {
+        // The wizard's `ask` wrapper compiles against inquire's error type
+        // (0.9): a prompt that cannot run (no TTY) surfaces as our own error.
+        let err = ask::<String>(Err(inquire::InquireError::NotTTY)).unwrap_err();
+        assert!(matches!(err, Error::Export(_)));
+        assert_eq!(ask::<String>(Ok("ok".to_string())).unwrap(), "ok");
+    }
 
     #[test]
     fn reveal_panes_split_returns_two() {

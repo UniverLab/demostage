@@ -16,7 +16,7 @@ the typing parameters, the canvas layout, and the timeline.
 name = "my-demo"          # used for the output filename
 output_dir = "./dist"     # default
 speed = "2x"              # how this demo is published; omit for 1x
-targets = ["gif", "mp4"]  # formats to build; omit for every supported format
+targets = ["gif", "mp4"]  # formats to build; omit for the defaults (gif, mp4; svg is opt-in)
 # prompt = "\[\e[32m\]❯\[\e[0m\] "   # custom prompt; omit for the default `$ `
 ```
 

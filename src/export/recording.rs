@@ -497,6 +497,39 @@ fn browser_pane(
     }
 }
 
+/// Does this completed input line end the capture (`demo stop`)?
+fn is_stop_line(line: &str) -> bool {
+    line.trim() == crate::STOP_COMMAND
+}
+
+/// Fold one recorded input chunk into the stop-line scan: `line`/`line_start`
+/// track the command currently being typed, and `cutoff` remembers where that
+/// command started when it turns out to be `demo stop`.
+fn feed_stop_line(
+    line: &mut String,
+    line_start: &mut Option<u64>,
+    t_ms: u64,
+    cutoff: &mut Option<u64>,
+    bytes: &str,
+) {
+    for ch in bytes.chars() {
+        match ch {
+            '\r' | '\n' => {
+                if is_stop_line(line) {
+                    *cutoff = *line_start;
+                }
+                line.clear();
+                *line_start = None;
+            }
+            c if c.is_control() => {}
+            c => {
+                line_start.get_or_insert(t_ms);
+                line.push(c);
+            }
+        }
+    }
+}
+
 /// The `t_ms` at which the user started typing the final `demo stop` line, if the
 /// capture ended that way — so its echo (and the "stopping" message) is dropped.
 pub fn stop_cutoff_ms(raw: &RawMacro) -> Option<u64> {
@@ -504,26 +537,12 @@ pub fn stop_cutoff_ms(raw: &RawMacro) -> Option<u64> {
     let mut line_start: Option<u64> = None;
     let mut cutoff: Option<u64> = None;
     for e in &raw.events {
-        if let RawEvent::Input { t_ms, bytes } = e {
-            for ch in bytes.chars() {
-                match ch {
-                    '\r' | '\n' => {
-                        if line.trim() == crate::STOP_COMMAND {
-                            cutoff = line_start;
-                        }
-                        line.clear();
-                        line_start = None;
-                    }
-                    c if c.is_control() => {}
-                    c => {
-                        line_start.get_or_insert(*t_ms);
-                        line.push(c);
-                    }
-                }
-            }
-        }
+        let RawEvent::Input { t_ms, bytes } = e else {
+            continue;
+        };
+        feed_stop_line(&mut line, &mut line_start, *t_ms, &mut cutoff, bytes);
     }
-    if line.trim() == crate::STOP_COMMAND {
+    if is_stop_line(&line) {
         cutoff = cutoff.or(line_start);
     }
     cutoff
@@ -1049,6 +1068,31 @@ data = "file.txt\n"
         }]);
         let cutoff = stop_cutoff_ms(&r);
         assert_eq!(cutoff, Some(500));
+    }
+
+    /// Control-only input must not start a line: a later `demo stop` is cut
+    /// at its own timestamp, not the earlier control noise. Deleting the
+    /// control-skip arm would keep the bytes, plant `line_start` early, and
+    /// report the wrong cutoff.
+    #[test]
+    fn stop_cutoff_ms_ignores_leading_control_noise() {
+        let r = raw(vec![
+            RawEvent::Input {
+                t_ms: 100,
+                bytes: "\x1b\x00".into(),
+            },
+            RawEvent::Input {
+                t_ms: 200,
+                bytes: "demo stop\r".into(),
+            },
+        ]);
+        assert_eq!(stop_cutoff_ms(&r), Some(200));
+        // Control-only input alone creates no line and no cutoff.
+        let r2 = raw(vec![RawEvent::Input {
+            t_ms: 100,
+            bytes: "\x1b\x00".into(),
+        }]);
+        assert_eq!(stop_cutoff_ms(&r2), None);
     }
 
     #[test]

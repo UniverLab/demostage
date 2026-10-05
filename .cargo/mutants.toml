@@ -1,0 +1,98 @@
+# cargo-mutants configuration for demostage.
+#
+# Exclusions are only the adapters the mutants spec allows: code that drives a
+# real TTY (inquire prompts / process stdout / process stdin), the real
+# network, or the process entry point. No logic is excluded — everything else
+# in the diff has to die to `cargo test`.
+
+# Not an exclusion. cargo-mutants derives the per-mutant test timeout from
+# `baseline x 5`; on the loaded shared runner a slow-but-passing suite can
+# exceed that and get mis-reported as TIMEOUT. A genuine hang is still
+# reported (and killed) at 10x the baseline.
+timeout_multiplier = 10
+
+exclude_re = [
+  # src/commands/open.rs::pick_source_url — inquire select/text prompts on the real TTY.
+  "src/commands/open.rs:.*pick_source_url",
+  # src/commands/open.rs::ask_behavior — inquire select + seconds prompt on the real TTY.
+  "src/commands/open.rs:.*ask_behavior",
+  # src/commands/open.rs::ask_trigger — inquire select/text prompts on the real TTY.
+  "src/commands/open.rs:.*ask_trigger",
+  # src/commands/open.rs::ask_scene_name — inquire text prompt on the real TTY.
+  "src/commands/open.rs:.*ask_scene_name",
+  # src/commands/open.rs::ask_theme — inquire select on the real TTY.
+  "src/commands/open.rs:.*ask_theme",
+  # src/commands/open.rs::ask_placement — inquire select on the real TTY.
+  "src/commands/open.rs:.*ask_placement",
+  # src/commands/focus.rs::ask_hold_secs — inquire seconds prompt on the real TTY
+  # (its parse/validate/convert logic lives in extracted pure helpers, which are tested).
+  "src/commands/focus.rs:.*ask_hold_secs",
+  # src/commands/focus.rs::ask_browser_behavior — inquire select on the real TTY.
+  "src/commands/focus.rs:.*ask_browser_behavior",
+  # src/commands/focus.rs::ask_trigger — inquire select/text prompts on the real TTY.
+  "src/commands/focus.rs:.*ask_trigger",
+  # src/commands/capture/wizard.rs::choose_font — inquire font prompt on the real TTY.
+  "src/commands/capture/wizard.rs:.*choose_font",
+  # src/commands/capture/wizard.rs::choose_canvas — inquire canvas prompt on the real TTY.
+  "src/commands/capture/wizard.rs:.*choose_canvas",
+  # src/commands/capture/wizard.rs::choose_fps — inquire numeric prompt on the real TTY.
+  "src/commands/capture/wizard.rs:.*choose_fps",
+  # src/commands/capture/wizard.rs::choose_sources — inquire multi-select prompt on the real TTY.
+  "src/commands/capture/wizard.rs:.*choose_sources",
+  # src/commands/capture/session.rs::print_capture_intro — writes to the process stdout.
+  "src/commands/capture/session.rs:.*print_capture_intro",
+  # src/commands/capture/session.rs::offer_timeline_edit — inquire confirm against the real stdin.
+  "src/commands/capture/session.rs:.*offer_timeline_edit",
+  # src/commands/capture/session.rs::run — statements below the interactive-TTY gate:
+  # unreachable in tests (run returns an error when stdin/stdout is not a TTY).
+  "src/commands/capture/session.rs:.*: delete ! in run",
+  "src/commands/capture/session.rs:.*: replace != with == in run",
+  # src/commands/capture/session.rs::run TTY gate — the mixed case (exactly one
+  # of stdin/stdout a TTY) needs a live terminal; headless both are non-TTY.
+  "src/commands/capture/session.rs:.*: replace \\|\\| with && in run",
+  # src/commands/edit.rs prompt shells — inquire prompts on the real TTY; the
+  # pure parts live in tested helpers (insert_position, delete_steps).
+  "src/commands/edit.rs:.*insert_step",
+  "src/commands/edit.rs:.*edit_keypress",
+  "src/commands/edit.rs:.*set_wait",
+  "src/commands/edit.rs:.*update_wait_quiet",
+  "src/commands/edit.rs:.*update_wait_screen",
+  "src/commands/edit.rs:.*update_wait_stdout",
+  "src/commands/edit.rs:.*apply_action",
+  # src/commands/update.rs::run_update — wires the real network (GitHub release
+  # lookup) and the live executable path; the hermetic core is tested.
+  "src/commands/update.rs:.*: replace run_update -> Result<i32> with.*",
+  "src/commands/update.rs:.*: replace match guard !check with.*in run_update",
+  "src/commands/update.rs:.*: delete ! in run_update",
+  # src/commands/update.rs::report_status — writes to the process stdout; the
+  # wording lives in the tested status_line helper.
+  "src/commands/update.rs:.*report_status",
+  # src/export/mod.rs::report_browser_captures — writes per-pane lines to the
+  # process stderr; formatting is covered by staged-render tests.
+  "src/export/mod.rs:.*report_browser_captures",
+  # src/lib.rs::run — the process entry point dispatch (main calls it): every
+  # command needs a live terminal, PTY, or display; dispatch itself is covered
+  # by each command's tests.
+  "src/lib.rs:.*: replace run -> Result<ExitCode> with.*",
+  # src/commands/capture/bridge.rs::InputPump::run — reads the process's real stdin
+  # until EOF/stop; its read loop is not scriptable from a unit test.
+  "src/commands/capture/bridge.rs:.*InputPump::run",
+  # src/commands/update.rs::<impl ReleaseFetcher for RealFetcher>::get — real HTTP release lookup.
+  "impl ReleaseFetcher for RealFetcher",
+  # src/commands/update.rs::<impl BinaryDownloader for RealDownloader>::download — real HTTP download.
+  "impl BinaryDownloader for RealDownloader",
+  # src/export/mp4.rs::encode — spawns the real ffmpeg process (provisioning it
+  # over the network when absent) and pipes frames to its stdin. The render
+  # path that calls it is covered through the injected encoder in render_with.
+  "src/export/mp4.rs:.*encode",
+  # src/export/mp4.rs::write_mp4 — the single-terminal fast path straight into
+  # that same ffmpeg spawn; the equivalent branch is covered via render_with.
+  "src/export/mp4.rs:.*write_mp4",
+  # Equivalent mutants: no input tells them apart from the original.
+  # base64 — b0<<16, b1<<8 and b2 occupy disjoint bits, so `|` and `^` build the same word.
+  'src/export/svg/poster.rs:.*: replace \| with \^ in base64',
+  # braille_dots — the result is truncated to u8 and 0x2800 is a multiple of 256, so `ch - 0x2800` and `ch + 0x2800` keep the same low byte.
+  'src/export/svg/paint.rs:.*: replace - with \+ in braille_dots',
+  # push_stop — an equal pct is merged by the arm above (|pct - last| < 1e-9), so `last > pct` and `last >= pct` never differ here.
+  'src/export/svg/timing.rs:.*: replace > with >= in push_stop',
+]

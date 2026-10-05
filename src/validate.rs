@@ -1,4 +1,5 @@
-//! Static validation of a [`Score`] — the engine behind `demo check`.
+//! Static validation of a [`Score`] — the engine behind CLI checks and the
+//! pre-capture gate.
 //!
 //! Pure and dependency-free: returns the list of problems found (empty = valid)
 //! so it is trivially unit-testable and reusable by `export`.

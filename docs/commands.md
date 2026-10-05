@@ -1,6 +1,6 @@
 ---
 title: Commands
-description: Reference for demo capture, record, export, edit, doctor and the live capture-control commands.
+description: Reference for demo capture, record, export, edit, doctor, update and the live capture-control commands.
 order: 5
 ---
 
@@ -136,6 +136,8 @@ A demo whose last command leaves a process in the foreground (a server, a REPL) 
 killed after a short grace period rather than blocking; end such a step with
 `Ctrl-C` or `terminate` to be clean. For a multi-pane stage, only the **terminal
 pane** is executed and recorded; `export` composites the browser panes around it.
+Before the timeline runs it waits up to 20 s for the shell to be ready and fails —
+leaving no `.rec` — instead of recording an unready shell.
 
 > Don't want to re-execute (interactive tool, needs secrets, has side effects)?
 > Skip `record` and render the faithful capture directly with `demo export --force`
@@ -151,13 +153,14 @@ Render a **recording** to one or more formats. Pure playback — it replays a
 recording and **never executes** the demo.
 
 ```sh
-demo export [fmt[,fmt…]] [demo.rec] [--speed 2x]
+demo export [fmt[,fmt…]] [demo.rec] [--speed 2x] [--at SECONDS]
 ```
 
 - `[formats]` — which formats to build, the first argument, **comma-separated**:
-  `gif`, `mp4`, or `all` (see [export targets](export-targets.md)).
+  `gif`, `mp4`, `svg`, or `all` (see [export targets](export-targets.md)).
   Pass several at once (`demo export gif,mp4`) — and **omit it entirely to build
-  every supported format** (`demo export` ≡ `demo export all`).
+  the default formats** (`demo export` ≡ `demo export all` ≡ `gif,mp4`). `svg`
+  is **opt-in**: name it (`demo export svg`, `demo export gif,svg`).
 - `[input]` — the recording to render; defaults to `demo.rec`. Accepts a `.rec`
   from `demo capture` (faithful — handles interactive tools, secrets and side
   effects that re-execution can't) or from `demo record` (a re-executed, humanized
@@ -165,6 +168,12 @@ demo export [fmt[,fmt…]] [demo.rec] [--speed 2x]
   render it directly.
 - `--speed` — retimes the recording: `2x`, `3x`, `0.5x` (a bare number works too).
   `1x` (the default) keeps the recorded pace.
+- `--at` — for `svg`: without it, a terminal-only demo exports the whole
+  timeline as an **animated SVG**; with it (e.g. `--at 12.5`), the SVG is a
+  **static poster** of that frame, written to `dist/<name>-at-12.5.svg`
+  (defaults to the **last frame**; a value past the end clamps to it).
+  Multi-pane demos refuse the animated path — use gif/mp4, or `--at` for a
+  poster. Ignored by `gif`/`mp4`, which render the whole timeline.
 - `--force` — render a **faithful capture** as-is. By default `export` refuses a
   capture's `.rec` (its typing/idle aren't humanized) and points you at
   `demo record` for a clean re-take; pass `--force` to render the live capture
@@ -172,11 +181,18 @@ demo export [fmt[,fmt…]] [demo.rec] [--speed 2x]
   (a wizard that creates a repo, a flow needing secrets) that a `demo record`
   re-run would repeat or desync — there, faithful + `--force` is the only option.
 
-Each format is written to its default path `<output_dir>/<name>.<ext>`.
+Each format is written to its default path `<output_dir>/<name>.<ext>` — except an
+`svg` poster with `--at`, which carries its timestamp
+(`<output_dir>/<name>-at-12.5.svg`) so posters never overwrite each other or
+the animated `<name>.svg`.
 
 For a **multi-pane stage**, `gif`/`mp4` composite the recorded terminal with its
 browser panes — each captured via headless Chromium (auto-provisioned) and
-revealed at the moment the timeline focuses it.
+revealed at the moment the timeline focuses it. `demo export svg` without
+`--at` refuses a staged score (the animated SVG is terminal-only); with `--at`
+it draws an `svg` poster of a staged score, falling back to embedding **one**
+composited frame as a base64 PNG — a composited canvas has no cell grid to
+draw as vector text.
 
 ## `demo doctor`
 
@@ -203,6 +219,41 @@ It reports three checks:
 `--fix` installs what's missing on apt-based Linux (a non-snap Google Chrome, and
 ffmpeg) — it runs `sudo`, so it prompts in your terminal. On other platforms it
 prints the exact `fix:` commands to run yourself.
+
+## `demo update`
+
+```sh
+demo update [--check] [--yes]
+```
+
+Check GitHub for a newer stable release and — only after you say yes — replace
+the running `demo` binary.
+
+- **It always asks first.** The prompt defaults to **no**; declining (or
+  Ctrl-C) leaves everything exactly as it was. `--yes` skips the prompt for
+  scripts.
+- **`--check` changes nothing.** Read-only: downloads nothing and touches no local path.
+- **Exit codes.** `exit 0` = up to date (update installed, prompt declined, or cargo
+  refusal), `exit 1` = a newer stable release exists (`--check`), `exit 2` = the check
+  could not be completed (network, DNS, TLS, HTTP ≥ 400 or an unparsable response) —
+  the cause is printed as one line on stderr, for `--check` and plain `demo update`
+  alike. Failures after a successful check (download, checksum, permissions) exit `1`.
+- **Stable only.** Releases are read from the `/releases` list and filtered in
+  code: no drafts, no prereleases, and only tags strictly newer than your
+  version (numeric per-component compare, so `0.3.10` beats `0.3.9`).
+- **The right asset, verified.** The archive is named exactly as the release
+  workflow publishes it — `demo-<tag>-<target>.tar.gz`, e.g.
+  `demo-v0.3.2-x86_64-unknown-linux-musl.tar.gz` — and is checked against the
+  release's `SHA256SUMS.txt` when one ships (a missing file skips, a mismatch
+  is fatal).
+- **State survives the swap.** The new binary is staged beside the running one
+  and renamed over it. `demo.toml` scores, recordings (`.rec`), the raw macro
+  and the capture sources are never read or written.
+- **Refusals.** A `demo` installed under `~/.cargo/bin` is owned by cargo —
+  run `cargo install --force demo-stage`. Platforms with no published
+  `tar.gz` asset (Windows, linux/arm64) are refused before any download.
+- **No background check.** DemoStage only ever contacts GitHub when you run
+  `demo update`, and a failed check exits `2` with the cause on one stderr line.
 
 ## `demo edit`
 

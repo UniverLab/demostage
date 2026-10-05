@@ -24,11 +24,13 @@ Instead of capturing brittle pixels, it records a session as **events**, normali
 human imperfections into a clean **score** (`demo.toml`), and compiles that score to
 several formats. One demo, version-controlled, re-runnable, diffable.
 
+Project home: [univerlab.org/demostage](https://univerlab.org/demostage/)
+
 <p align="center">
-  <img src="demo/dist/demo.gif" alt="A ghScaff wizard demo captured and rendered with DemoStage" width="800"/>
+  <img src="demo/dist/demo.svg" alt="A DemoStage tour: a score recorded in a real PTY, exported to gif and svg, checked by doctor" width="800"/>
 </p>
 
-<p align="center"><em>An interactive ghScaff wizard — captured, normalized and rendered with DemoStage, browser scene composited in.</em></p>
+<p align="center"><em>DemoStage demoing itself: write a score, record it in a real PTY, export gif and svg from one recording. This animation is the svg export.</em></p>
 
 ---
 
@@ -53,15 +55,9 @@ several formats. One demo, version-controlled, re-runnable, diffable.
 ## Install
 
 ```sh
-cargo install --path .          # from this repo
-# or, once published:
-# curl -fsSL https://get.univerlab.org/demo-stage | sh
-```
-
-### Via cargo
-
-```bash
-cargo install demo-stage
+curl -fsSL https://install.univerlab.org/demostage | sh
+cargo install demo-stage        # from crates.io
+cargo install --path .          # from a checkout
 ```
 
 ### Uninstall
@@ -78,14 +74,14 @@ rm -f ~/.local/bin/demo-stage
 demo capture                      # run the demo, then `demo stop` (or exit / Ctrl-D) to finish
                                   # → demo.toml (editable score) + demo.rec (faithful take)
 demo record                       # re-run demo.toml for a clean, humanized demo.rec
-demo export                       # no args → every format (gif, mp4)
+demo export                       # no args → the defaults (gif, mp4 — svg is opt-in)
 demo export gif,mp4 --speed 2x        # several at once, retimed 2× faster
 ```
 
 ## Documentation
 
 See [`docs/`](docs/) — overview, the `demo.toml` DSL, the commands, the normalizer,
-and the export targets. (Published on the UniverLab site at `/demo-stage/docs`.)
+and the export targets. (Published on the UniverLab site at `/demostage/docs`.)
 
 ---
 
@@ -124,9 +120,40 @@ the clean path the default.
 |---|---|
 | `demo capture` | Live capture: record the session, auto-normalize into a clean score and faithful `.rec` |
 | `demo record` | Re-execute `demo.toml` cleanly, producing a humanized recording |
-| `demo export` | Pure playback: render to gif or mp4 (no re-execution, ffmpeg/chromium auto-provisioned) |
+| `demo export` | Pure playback: render to gif or mp4 — or the opt-in `svg` animation (terminal-only; `--at` for a poster) (no re-execution, ffmpeg/chromium auto-provisioned) |
 | `demo edit` | Edit the timeline interactively — mark several steps (space) for bulk delete/convert/replace |
 | `demo doctor` | Verify the environment and install missing tools |
+| `demo update` | Check for / install a newer stable release — always asks first (default: no) |
+
+### demo update
+
+```sh
+demo update            # look for a newer stable release, then ask (default: NO)
+demo update --check    # report only — exit 0 = current, exit 1 = update available, exit 2 = the check could not be completed
+demo update --yes      # install without the prompt (scriptable)
+```
+
+Never runs on its own: DemoStage has **no background update check** — the only
+network `demo` opens is this explicit command, and it fails loudly when it
+can't reach GitHub. It picks the newest *stable* GitHub release (drafts and
+prereleases excluded), compares it to your version with a semver compare, and
+**asks before doing anything** (the prompt defaults to **no**).
+
+- **Your state survives.** Only the running binary is replaced — `demo.toml`
+  scores, recordings (`.rec`), the raw macro and the capture sources are never
+  touched.
+- **Checksums.** The downloaded archive is verified against the release's
+  `SHA256SUMS.txt` when one ships; a mismatch aborts, a missing file (older
+  releases) skips.
+- **Cargo installs are refused.** A `demo` under `~/.cargo/bin` is owned by
+  cargo: run `cargo install --force demo-stage`.
+- **Exit codes.** `exit 0` = up to date (update installed, prompt declined, or cargo
+  refusal), `exit 1` = an update is available (`--check`), `exit 2` = the check could not
+  be completed (network, DNS, TLS, HTTP ≥ 400 or an unparsable response — the cause is
+  the single line on stderr). Plain `demo update` exits `2` for the same failures.
+- **No published asset? No guessing.** Windows and linux/arm64 have no
+  `tar.gz` in the release matrix, so `update` refuses instead of inventing a
+  name.
 
 ### Live control (during a capture)
 
@@ -161,6 +188,7 @@ wizards are kept out of the finished demo.
 |---|---|---|---|
 | `gif`  | animated GIF (rasterized) | READMEs, chat, anywhere `<img>` works | — (pure Rust, embedded font) |
 | `mp4`  | H.264 video | landings / the web (`<video>`) | ffmpeg — **auto-fetched on first use** |
+| `svg`  | animated SVG (vector text), terminal-only; `--at` for a poster | crisp README embeds (`<img>`), print, docs — **opt-in** | — (pure Rust) |
 | browser panes (PDF/web) | composited into gif/mp4 | a scene beside the terminal | Chromium — **auto-fetched on first use** |
 
 `gif` works fully offline. `mp4` and multi-scene **browser panes** provision
@@ -168,6 +196,26 @@ their tool **tectonic-style** — the first export downloads a managed ffmpeg /
 Chromium into a cache (a system install is used if present). Run **`demo doctor`**
 to check these and get platform-specific fixes (`--fix` installs them on apt-based
 Linux; it also flags the snap Chromium, which can't be driven headless).
+
+### Embed the animated SVG
+
+For a terminal-only demo, `demo export svg` writes `dist/<name>.svg` — an
+animated, terminal-only vector version of the timeline (no scripts, so it plays
+inside a README `<img>`):
+
+```md
+![demo](dist/demo.svg)
+```
+
+```html
+<img src="dist/demo.svg" alt="demo">
+```
+
+The SVG embeds its terminal font (subset to the glyphs on screen) as an inline @font-face, so it renders identically inside a README `<img>`.
+
+Need one still instead (`--at 12.5` writes `dist/<name>-at-12.5.svg`), or a
+multi-pane demo (animated SVG refuses those — use gif/mp4, or `--at` for a
+poster)? See [`docs/export-targets.md`](docs/export-targets.md).
 
 ---
 
@@ -178,6 +226,12 @@ cargo fmt
 cargo clippy --all-targets -- -D warnings
 cargo test
 ```
+
+---
+
+## Contributing
+
+`docs/` is published at univerlab.org/demostage/docs and holds user documentation only; design records are kept outside the repository.
 
 ---
 

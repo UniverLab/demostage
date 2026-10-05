@@ -125,95 +125,126 @@ fn apply_action(score: &mut Score, indices: &[usize]) -> Result<Option<usize>> {
         Some(EditAction::EditReveal) => {
             edit_reveal::edit_browser_reveal(score, indices[0])?;
         }
-        Some(EditAction::EditKey) => {
-            let current = match &score.timeline[indices[0]] {
-                Step::Keypress { key } => key.clone(),
-                _ => String::new(),
-            };
-            let new_key = inquire::Text::new("key name:")
-                .with_help_message(
-                    "enter, tab, esc, up, down, left, right, f1-f12, ctrl+c, shift-up, alt-f5, ...",
-                )
-                .with_default(&current)
-                .prompt()
-                .map_err(|e| Error::Export(format!("edit: {e}")))?;
-            let new_key = new_key.trim().to_string();
-            if new_key.is_empty() {
-                return Err(Error::Export("key name cannot be empty".to_string()));
-            }
-            for &i in indices {
-                if let Step::Keypress { key } = &mut score.timeline[i] {
-                    *key = new_key.clone();
-                }
-            }
-            println!("  ✓ updated {}\n", plural(indices.len()));
-        }
-        Some(EditAction::Insert) => {
-            let new_step = ask_insert_step()?;
-            let insert_at = indices[0] + 1;
-            score.timeline.insert(insert_at, new_step);
-            println!("  ✓ inserted after step {}\n", indices[0] + 1);
-            return Ok(Some(insert_at));
-        }
-        Some(EditAction::ToWait) => {
-            let ms = ask_u64("duration_ms", current_ms(&score.timeline[indices[0]]))?;
-            for &i in indices {
-                score.timeline[i] = Step::Wait { duration_ms: ms };
-            }
-            println!("  ✓ converted to wait {}\n", plural(indices.len()));
-        }
-        Some(EditAction::WaitForQuiet) => {
-            let quiet = ask_u64("quiet_ms", current_ms(&score.timeline[indices[0]]))?;
-            for &i in indices {
-                score.timeline[i] = Step::WaitForQuiet {
-                    quiet_ms: quiet,
-                    max_ms: None,
-                };
-            }
-            println!("  ✓ updated {}\n", plural(indices.len()));
-        }
-        Some(EditAction::WaitForScreen) => {
-            let pattern = ask_string("match pattern")?;
-            for &i in indices {
-                score.timeline[i] = Step::WaitForScreen {
-                    pattern: pattern.clone(),
-                    timeout_ms: None,
-                };
-            }
-            println!("  ✓ updated {}\n", plural(indices.len()));
-        }
-        Some(EditAction::WaitForStdout) => {
-            let pattern = ask_string("match pattern")?;
-            for &i in indices {
-                score.timeline[i] = Step::WaitForStdout {
-                    pattern: pattern.clone(),
-                    pane: None,
-                };
-            }
-            println!("  ✓ updated {}\n", plural(indices.len()));
-        }
-        Some(EditAction::ChangeDuration) => {
-            let ms = ask_u64("duration_ms", current_ms(&score.timeline[indices[0]]))?;
-            for &i in indices {
-                score.timeline[i] = Step::Wait { duration_ms: ms };
-            }
-            println!("  ✓ updated {}\n", plural(indices.len()));
-        }
+        Some(EditAction::EditKey) => edit_keypress(score, indices)?,
+        Some(EditAction::Insert) => return Ok(Some(insert_step(score, indices)?)),
+        Some(EditAction::ToWait) => set_wait(score, indices, "converted to wait")?,
+        Some(EditAction::WaitForQuiet) => update_wait_quiet(score, indices)?,
+        Some(EditAction::WaitForScreen) => update_wait_screen(score, indices)?,
+        Some(EditAction::WaitForStdout) => update_wait_stdout(score, indices)?,
+        Some(EditAction::ChangeDuration) => set_wait(score, indices, "updated")?,
         Some(EditAction::SplitType) => {
             split_type_step(&mut score.timeline, indices[0])?;
         }
         Some(EditAction::ReplaceInTypes) => {
             replace_in_types(&mut score.timeline, indices)?;
         }
-        Some(EditAction::Delete) => {
-            // Back to front so earlier indices stay valid while removing.
-            for &i in indices.iter().rev() {
-                score.timeline.remove(i);
-            }
-            println!("  ✓ deleted {}\n", plural(indices.len()));
-        }
+        Some(EditAction::Delete) => delete_steps(score, indices)?,
     }
     Ok(None)
+}
+
+/// Ask the user what kind of step to insert and splice it after the selected
+/// step. Returns the new cursor position.
+fn insert_step(score: &mut Score, indices: &[usize]) -> Result<usize> {
+    let new_step = ask_insert_step()?;
+    let insert_at = insert_position(indices);
+    score.timeline.insert(insert_at, new_step);
+    println!("  ✓ inserted after step {}\n", indices[0] + 1);
+    Ok(insert_at)
+}
+
+/// Pure insertion index for [`insert_step`], so the `+ 1` is testable
+/// without a TTY.
+fn insert_position(indices: &[usize]) -> usize {
+    indices[0] + 1
+}
+
+/// Replace the key of every selected `keypress` step with the key the user
+/// types (an empty answer is rejected).
+fn edit_keypress(score: &mut Score, indices: &[usize]) -> Result<()> {
+    let current = match &score.timeline[indices[0]] {
+        Step::Keypress { key } => key.clone(),
+        _ => String::new(),
+    };
+    let new_key = inquire::Text::new("key name:")
+        .with_help_message(
+            "enter, tab, esc, up, down, left, right, f1-f12, ctrl+c, shift-up, alt-f5, ...",
+        )
+        .with_default(&current)
+        .prompt()
+        .map_err(|e| Error::Export(format!("edit: {e}")))?;
+    let new_key = new_key.trim().to_string();
+    if new_key.is_empty() {
+        return Err(Error::Export("key name cannot be empty".to_string()));
+    }
+    for &i in indices {
+        if let Step::Keypress { key } = &mut score.timeline[i] {
+            *key = new_key.clone();
+        }
+    }
+    println!("  ✓ updated {}\n", plural(indices.len()));
+    Ok(())
+}
+
+/// Turn every selected step into a `wait` of the duration the user picks.
+/// `message` is what the confirmation says: `converted to wait` when the step
+/// kind changed, `updated` when only the duration did.
+fn set_wait(score: &mut Score, indices: &[usize], message: &str) -> Result<()> {
+    let ms = ask_u64("duration_ms", current_ms(&score.timeline[indices[0]]))?;
+    for &i in indices {
+        score.timeline[i] = Step::Wait { duration_ms: ms };
+    }
+    println!("  ✓ {message} {}\n", plural(indices.len()));
+    Ok(())
+}
+
+/// Give every selected step the `quiet_ms` the user picks.
+fn update_wait_quiet(score: &mut Score, indices: &[usize]) -> Result<()> {
+    let quiet = ask_u64("quiet_ms", current_ms(&score.timeline[indices[0]]))?;
+    for &i in indices {
+        score.timeline[i] = Step::WaitForQuiet {
+            quiet_ms: quiet,
+            max_ms: None,
+        };
+    }
+    println!("  ✓ updated {}\n", plural(indices.len()));
+    Ok(())
+}
+
+/// Point every selected step at the match pattern the user picks.
+fn update_wait_screen(score: &mut Score, indices: &[usize]) -> Result<()> {
+    let pattern = ask_string("match pattern")?;
+    for &i in indices {
+        score.timeline[i] = Step::WaitForScreen {
+            pattern: pattern.clone(),
+            timeout_ms: None,
+        };
+    }
+    println!("  ✓ updated {}\n", plural(indices.len()));
+    Ok(())
+}
+
+/// Point every selected step at the stdout pattern the user picks.
+fn update_wait_stdout(score: &mut Score, indices: &[usize]) -> Result<()> {
+    let pattern = ask_string("match pattern")?;
+    for &i in indices {
+        score.timeline[i] = Step::WaitForStdout {
+            pattern: pattern.clone(),
+            pane: None,
+        };
+    }
+    println!("  ✓ updated {}\n", plural(indices.len()));
+    Ok(())
+}
+
+/// Remove every selected step, back to front so earlier indices stay valid
+/// while removing.
+fn delete_steps(score: &mut Score, indices: &[usize]) -> Result<()> {
+    for &i in indices.iter().rev() {
+        score.timeline.remove(i);
+    }
+    println!("  ✓ deleted {}\n", plural(indices.len()));
+    Ok(())
 }
 
 fn plural(n: usize) -> String {
@@ -938,5 +969,53 @@ mod tests {
         do_split(&mut timeline, 0, ",", false, "a,b,c").unwrap();
         // "a,b,c" split by "," → ["a,", "b,", "c"] → 3 steps
         assert!(timeline.len() >= 3);
+    }
+
+    /// delete_steps removes exactly the selected indices, back to front, so
+    /// earlier indices stay valid. `Ok(())`-without-removal dies here.
+    #[test]
+    fn delete_steps_removes_exactly_the_selected() {
+        let mut score: Score = toml::from_str(
+            r#"
+[demo]
+name = "t"
+[layout]
+width = 100
+height = 100
+  [[layout.panes]]
+  id = "c"
+  type = "terminal"
+  x = 0
+  y = 0
+  width = 100
+  height = 100
+[[timeline]]
+action = "type"
+text = "a"
+[[timeline]]
+action = "type"
+text = "b"
+[[timeline]]
+action = "type"
+text = "c"
+"#,
+        )
+        .unwrap();
+        assert_eq!(score.timeline.len(), 3);
+        delete_steps(&mut score, &[0, 2]).unwrap();
+        assert_eq!(score.timeline.len(), 1, "two of three steps must go");
+        match &score.timeline[0] {
+            Step::Type { text, .. } => assert_eq!(text, "b", "middle step survives"),
+            other => panic!("expected Type, got {other:?}"),
+        }
+    }
+
+    /// Pure splice used by insert_step, so the `indices[0] + 1` position is
+    /// pinned without a TTY: `+`→`*` inserts at 0, `+`→`-` at the cursor.
+    #[test]
+    fn splice_position_is_right_after_the_cursor() {
+        assert_eq!(insert_position(&[0]), 1);
+        assert_eq!(insert_position(&[2]), 3);
+        assert_eq!(insert_position(&[5]), 6);
     }
 }

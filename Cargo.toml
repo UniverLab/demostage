@@ -1,10 +1,10 @@
 [package]
 name = "demo-stage"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 description = "Demos as Code — declarative terminal capture and multi-scene orchestration"
 license = "MIT"
-homepage = "https://univerlab.org"
+homepage = "https://univerlab.org/demostage/"
 repository = "https://github.com/UniverLab/demostage"
 publish = true
 
@@ -18,12 +18,12 @@ path = "src/lib.rs"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
-inquire = "0.7"
+inquire = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 thiserror = "2"
-portable-pty = "0.8"
+portable-pty = "0.9"
 crossterm = "0.28"
 vt100 = "0.15"
 fontdue = "0.9"
@@ -33,6 +33,13 @@ headless_chrome = { version = "1", features = ["fetch"] }
 png = "0.17"
 regex = "1"
 hayro = "0.7.1"
+# Update path (`demo update`) — all already in the lock as transitives of
+# headless_chrome/ffmpeg-sidecar, so promoting them adds no new crate.
+ureq = "3"      # existing HTTP stack (rustls + webpki-roots) — NOT reqwest
+flate2 = "1"    # tar.gz decode
+tar = "0.4"     # archive entry extraction
+sha2 = "0.11"   # SHA256 of the release asset
+tempfile = "3"  # staging directory + same-dir rename (promoted from dev-deps)
+fontcull = { version = "2", default-features = false }
 
 [dev-dependencies]
-tempfile = "3"
