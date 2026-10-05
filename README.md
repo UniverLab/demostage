@@ -27,10 +27,10 @@ several formats. One demo, version-controlled, re-runnable, diffable.
 Project home: [univerlab.org/demostage](https://univerlab.org/demostage/)
 
 <p align="center">
-  <img src="demo/dist/demo.gif" alt="A ghScaff wizard demo captured and rendered with DemoStage" width="800"/>
+  <img src="demo/dist/demo.svg" alt="A DemoStage tour: a score recorded in a real PTY, exported to gif and svg, checked by doctor" width="800"/>
 </p>
 
-<p align="center"><em>An interactive ghScaff wizard — captured, normalized and rendered with DemoStage, browser scene composited in.</em></p>
+<p align="center"><em>DemoStage demoing itself: write a score, record it in a real PTY, export gif and svg from one recording. This animation is the svg export.</em></p>
 
 ---
 
