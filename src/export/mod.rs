@@ -2,8 +2,10 @@
 //!
 //! `cast`/`html` run the score in a PTY and capture text (no external deps).
 //! `gif` rasterizes that capture in pure Rust. `mp4` provisions ffmpeg on first
-//! use. Multi-pane scores (with a `browser` pane) composite via the stage, which
-//! drives Chromium for browser panes (PDF panes render natively via hayro).
+//! use. `svg` (opt-in) exports the whole timeline as animated vector text for
+//! terminal-only demos, or one static poster frame with `--at <seconds>`.
+//! Multi-pane scores (with a `browser` pane) composite via the stage,
+//! which drives Chromium for browser panes (PDF panes render natively via hayro).
 
 pub mod browser;
 pub mod composite;
@@ -16,6 +18,7 @@ pub mod raster;
 pub mod recording;
 pub mod run;
 pub mod stage;
+pub mod svg;
 
 use std::path::{Path, PathBuf};
 
@@ -24,7 +27,7 @@ use crate::error::{Error, Result};
 use crate::model::Score;
 use crate::validate::validate;
 
-use run::{progress_bar, progress_clear, Recording};
+use run::{progress_bar, progress_clear, Progress, Recording};
 
 /// Start a local HTTP server if any pane needs one (local `file://` URLs or
 /// wizard localhost URLs). Returns the server (must be kept alive while
@@ -69,11 +72,68 @@ pub fn rewrite_local_urls(score: &Score, server_port: u16) -> Score {
     score
 }
 
+/// The MP4 encoder [`render_mp4`] drives: it receives the resolved geometry and
+/// a frame source, and writes the container at the given path. Production always
+/// passes [`mp4::encode`], which spawns a real ffmpeg (provisioned on first
+/// use) — taking it as a parameter is what lets the render path be tested
+/// without a provisioned ffmpeg on the machine.
+type Mp4Encoder<'a> = &'a dyn Fn(&Path, usize, usize, u32, mp4::FrameSource<'_>) -> Result<()>;
+
+/// The resolved geometry and rate a target renders at, plus how the frames are
+/// produced (staged compositing vs. a single terminal grid).
+struct RenderPlan {
+    /// Multi-pane scores composite on the canvas through [`stage::render_stage`].
+    staged: bool,
+    cw: usize,
+    ch: usize,
+    fps: u32,
+    total_frames: usize,
+    /// The resolved export speed multiplier, threaded through to the PDF pan path.
+    speed: f64,
+}
+
+/// Print one line per browser pane that was captured for a staged export.
+fn report_browser_captures(reports: &[browser::BrowserCaptureReport]) {
+    for br in reports {
+        eprintln!(
+            "demo: browser pane '{}' — {} frames captured in {:.1}s",
+            br.pane_id,
+            br.frame_count,
+            br.elapsed.as_secs_f64()
+        );
+    }
+}
+
 /// Render an already-captured `recording` to `target`, returning the path
 /// written. Pure playback — it never executes the demo. `score` carries the
 /// layout/styling (its timeline is unused here). `speed` is the resolved export
-/// speed multiplier, threaded through to the PDF pan path.
-pub fn render(rec: &Recording, score: &Score, target: Target, speed: f64) -> Result<PathBuf> {
+/// speed multiplier, threaded through to the PDF pan path. `at_secs` is only
+/// `Target::Svg`: `None` exports the animated timeline (terminal-only), while
+/// `Some(t)` draws the poster of the frame at `t` seconds (default: the last
+/// one) — gif/mp4 ignore it.
+pub fn render(
+    rec: &Recording,
+    score: &Score,
+    target: Target,
+    speed: f64,
+    at_secs: Option<f64>,
+) -> Result<PathBuf> {
+    render_with(rec, score, target, speed, at_secs, &mp4::encode)
+}
+
+/// [`render`] with the MP4 encoder injected. `render` always uses the real
+/// ffmpeg-backed [`mp4::encode`]; this seam exists so a test can drive the
+/// whole render path (geometry resolution, frame production, the exact output
+/// path) with a stub encoder, on a machine where ffmpeg is neither installed
+/// nor downloadable. Behaviour is otherwise identical.
+fn render_with(
+    rec: &Recording,
+    score: &Score,
+    target: Target,
+    speed: f64,
+    at_secs: Option<f64>,
+    encode: Mp4Encoder<'_>,
+) -> Result<PathBuf> {
     let problems = validate(score);
     if !problems.is_empty() {
         return Err(Error::Validation(problems.join("\n")));
@@ -93,97 +153,169 @@ pub fn render(rec: &Recording, score: &Score, target: Target, speed: f64) -> Res
         (plan.width, plan.height)
     };
     let total_frames = (rec.duration * fps as f64).ceil() as usize + 1;
+    let plan = RenderPlan {
+        staged,
+        cw,
+        ch,
+        fps,
+        total_frames,
+        speed,
+    };
 
     match target {
-        Target::Gif => {
-            let path = resolve_output(&score, "gif");
-            ensure_parent(&path)?;
-            let mut report = raster::FallbackReport::new();
-            if staged {
-                let mut n = 0usize;
-                let mut browser_reports = Vec::new();
-                gif::encode(&path, cw, ch, fps, |emit| {
-                    let r = stage::render_stage(rec, &score, speed, |f| {
-                        n += 1;
-                        progress_bar("exporting gif", n, total_frames);
-                        emit(f);
-                    })?;
-                    report = r.0;
-                    browser_reports = r.1;
-                    Ok(())
-                })?;
-                progress_clear();
-                for br in &browser_reports {
-                    eprintln!(
-                        "demo: browser pane '{}' — {} frames captured in {:.1}s",
-                        br.pane_id,
-                        br.frame_count,
-                        br.elapsed.as_secs_f64()
-                    );
-                }
-            } else {
-                let mut n = 0usize;
-                gif::encode(&path, cw, ch, fps, |emit| {
-                    let (_plan, r) = raster::render_frames(rec, &score, |f| {
-                        n += 1;
-                        progress_bar("exporting gif", n, total_frames);
-                        emit(f);
-                    })?;
-                    report = r;
-                    Ok(())
-                })?;
-                progress_clear();
-            }
-            for line in report.format(&score.demo.name) {
-                eprintln!("{line}");
-            }
-            Ok(path)
-        }
-        Target::Mp4 => {
-            let path = resolve_output(&score, "mp4");
-            ensure_parent(&path)?;
-            let mut report = raster::FallbackReport::new();
-            if staged {
-                let mut n = 0usize;
-                let mut browser_reports = Vec::new();
-                mp4::encode(&path, cw, ch, fps, |emit| {
-                    let r = stage::render_stage(rec, &score, speed, |f| {
-                        n += 1;
-                        progress_bar("exporting mp4", n, total_frames);
-                        emit(f);
-                    })?;
-                    report = r.0;
-                    browser_reports = r.1;
-                    Ok(())
-                })?;
-                progress_clear();
-                for br in &browser_reports {
-                    eprintln!(
-                        "demo: browser pane '{}' — {} frames captured in {:.1}s",
-                        br.pane_id,
-                        br.frame_count,
-                        br.elapsed.as_secs_f64()
-                    );
-                }
-            } else {
-                let mut n = 0usize;
-                mp4::encode(&path, cw, ch, fps, |emit| {
-                    let (_plan, r) = raster::render_frames(rec, &score, |f| {
-                        n += 1;
-                        progress_bar("exporting mp4", n, total_frames);
-                        emit(f);
-                    })?;
-                    report = r;
-                    Ok(())
-                })?;
-                progress_clear();
-            }
-            for line in report.format(&score.demo.name) {
-                eprintln!("{line}");
-            }
-            Ok(path)
-        }
+        Target::Gif => render_gif(rec, &score, &plan),
+        Target::Mp4 => render_mp4(rec, &score, &plan, encode),
+        Target::Svg => render_svg(rec, &score, &plan, at_secs),
     }
+}
+
+/// Render every frame into an animated GIF at the resolved geometry.
+fn render_gif(rec: &Recording, score: &Score, plan: &RenderPlan) -> Result<PathBuf> {
+    let path = resolve_output(score, "gif");
+    ensure_parent(&path)?;
+    let mut report = raster::FallbackReport::new();
+    if plan.staged {
+        let mut progress = Progress::new("exporting gif", plan.total_frames);
+        let mut browser_reports = Vec::new();
+        gif::encode(&path, plan.cw, plan.ch, plan.fps, |emit| {
+            let r = stage::render_stage(rec, score, plan.speed, |f| {
+                progress.tick();
+                emit(f);
+            })?;
+            report = r.0;
+            browser_reports = r.1;
+            Ok(())
+        })?;
+        progress_clear();
+        report_browser_captures(&browser_reports);
+    } else {
+        let mut progress = Progress::new("exporting gif", plan.total_frames);
+        gif::encode(&path, plan.cw, plan.ch, plan.fps, |emit| {
+            let (_plan, r) = raster::render_frames(rec, score, |f| {
+                progress.tick();
+                emit(f);
+            })?;
+            report = r;
+            Ok(())
+        })?;
+        progress_clear();
+    }
+    for line in report.format(&score.demo.name) {
+        eprintln!("{line}");
+    }
+    Ok(path)
+}
+
+/// Render every frame into an MP4 (via ffmpeg) at the resolved geometry.
+fn render_mp4(
+    rec: &Recording,
+    score: &Score,
+    plan: &RenderPlan,
+    encode: Mp4Encoder<'_>,
+) -> Result<PathBuf> {
+    let path = resolve_output(score, "mp4");
+    ensure_parent(&path)?;
+    let mut report = raster::FallbackReport::new();
+    if plan.staged {
+        let mut progress = Progress::new("exporting mp4", plan.total_frames);
+        let mut browser_reports = Vec::new();
+        encode(&path, plan.cw, plan.ch, plan.fps, &mut |emit| {
+            let r = stage::render_stage(rec, score, plan.speed, |f| {
+                progress.tick();
+                emit(f);
+            })?;
+            report = r.0;
+            browser_reports = r.1;
+            Ok(())
+        })?;
+        progress_clear();
+        report_browser_captures(&browser_reports);
+    } else {
+        let mut progress = Progress::new("exporting mp4", plan.total_frames);
+        encode(&path, plan.cw, plan.ch, plan.fps, &mut |emit| {
+            let (_plan, r) = raster::render_frames(rec, score, |f| {
+                progress.tick();
+                emit(f);
+            })?;
+            report = r;
+            Ok(())
+        })?;
+        progress_clear();
+    }
+    for line in report.format(&score.demo.name) {
+        eprintln!("{line}");
+    }
+    Ok(path)
+}
+
+/// Draw one frame as vector text (the poster) — staged scores replay the stage
+/// and keep ONE composited frame, embedded as a base64 PNG in the SVG.
+/// Without `--at`, a single-terminal score exports the whole timeline as an
+/// animated SVG; staged scores refuse the animated path (no cell grid to walk)
+/// and must name `--at` for a poster.
+fn render_svg(
+    rec: &Recording,
+    score: &Score,
+    plan: &RenderPlan,
+    at_secs: Option<f64>,
+) -> Result<PathBuf> {
+    let path = resolve_svg_output(score, at_secs);
+    ensure_parent(&path)?;
+    if at_secs.is_some() {
+        return render_svg_poster(rec, score, plan, &path, at_secs);
+    }
+    if plan.staged {
+        return Err(Error::Export(
+            svg::animated_refusal(score).expect("staged score without --at must refuse"),
+        ));
+    }
+    // Single terminal: walk the whole replay as vector states — the frames in
+    // between are never rasterized. No progress bar here: `write_animated`
+    // announces its own one-line summary on stderr, and a bar left on that
+    // line would glue the summary onto it.
+    svg::write_animated(&path, rec, score)?;
+    Ok(path)
+}
+
+/// The `--at` poster: one frame, vector text for a single terminal or one
+/// embedded PNG for a staged score.
+fn render_svg_poster(
+    rec: &Recording,
+    score: &Score,
+    plan: &RenderPlan,
+    path: &Path,
+    at_secs: Option<f64>,
+) -> Result<PathBuf> {
+    let mut report = raster::FallbackReport::new();
+    if plan.staged {
+        // Fallback, documented in docs/export-targets.md: a staged
+        // score has no cell grid to draw, so replay the stage and keep
+        // ONE composited frame, embedded as a base64 PNG in the SVG.
+        let keep = svg::frame_index(at_secs, plan.fps, plan.total_frames);
+        let mut progress = Progress::new("exporting svg", plan.total_frames);
+        let mut browser_reports = Vec::new();
+        svg::encode(path, plan.cw, plan.ch, keep, |emit| {
+            let r = stage::render_stage(rec, score, plan.speed, |f| {
+                progress.tick();
+                emit(&svg::PosterFrame::Rgba(f));
+            })?;
+            report = r.0;
+            browser_reports = r.1;
+            Ok(())
+        })?;
+        progress_clear();
+        report_browser_captures(&browser_reports);
+    } else {
+        // Single terminal: seek to the chosen frame and draw it as
+        // vector text — the frames in between are never rasterized.
+        progress_bar("exporting svg", 1, 1);
+        svg::write_svg(path, rec, score, at_secs)?;
+        progress_clear();
+    }
+    for line in report.format(&score.demo.name) {
+        eprintln!("{line}");
+    }
+    Ok(path.to_path_buf())
 }
 
 /// Retime a recording by `1/speed` (so `speed = 2.0` plays twice as fast, `0.5`
@@ -268,6 +400,20 @@ fn resolve_output(score: &Score, ext: &str) -> PathBuf {
         .demo
         .output_dir
         .join(format!("{}.{ext}", sanitize(&score.demo.name)))
+}
+
+/// The SVG output path: the animated timeline is `dist/<name>.svg`, while a
+/// `--at` poster carries its timestamp (`dist/<name>-at-12.5.svg`) so posters
+/// never overwrite each other or the animation. The filename uses the
+/// requested value, not the clamped frame.
+fn resolve_svg_output(score: &Score, at_secs: Option<f64>) -> PathBuf {
+    match at_secs {
+        None => resolve_output(score, "svg"),
+        Some(t) => score
+            .demo
+            .output_dir
+            .join(format!("{}-at-{t}.svg", sanitize(&score.demo.name))),
+    }
 }
 
 fn sanitize(name: &str) -> String {
@@ -524,6 +670,38 @@ height = 100
         .unwrap();
         let path = resolve_output(&score, "gif");
         assert_eq!(path, std::path::PathBuf::from("./dist/my-demo-.gif"));
+    }
+
+    fn svg_score() -> Score {
+        toml::from_str(
+            r#"
+[demo]
+name = "demo"
+output_dir = "./dist"
+[layout]
+width = 100
+height = 100
+"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn poster_filename_is_per_at() {
+        assert_eq!(
+            resolve_svg_output(&svg_score(), None),
+            std::path::PathBuf::from("./dist/demo.svg")
+        );
+        assert_eq!(
+            resolve_svg_output(&svg_score(), Some(12.5)),
+            std::path::PathBuf::from("./dist/demo-at-12.5.svg")
+        );
+        // Rust prints 12.0 as "12": posters never overwrite each other or the
+        // animation, and the name uses the requested value, not the clamp.
+        assert_eq!(
+            resolve_svg_output(&svg_score(), Some(12.0)),
+            std::path::PathBuf::from("./dist/demo-at-12.svg")
+        );
     }
 
     #[test]
@@ -828,5 +1006,231 @@ pane = "p"
         } else {
             panic!("expected Scroll step");
         }
+    }
+
+    // --- render() mutants: invalid score errors; every format writes its
+    // exact path for a single-terminal replay (headless, no browser/ffmpeg
+    // gate beyond the provisioned binary).
+
+    fn single_terminal_score(dir: &std::path::Path) -> Score {
+        let mut score: Score = toml::from_str(
+            r#"
+[demo]
+name = "t"
+[layout]
+width = 800
+height = 600
+fps = 15
+  [[layout.panes]]
+  id = "main"
+  type = "terminal"
+  x = 0
+  y = 0
+  width = 800
+  height = 600
+"#,
+        )
+        .unwrap();
+        score.demo.output_dir = dir.to_path_buf();
+        score
+    }
+
+    fn render_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "demo-test-render-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn render_rejects_an_invalid_score() {
+        let dir = render_dir("invalid");
+        let mut score = single_terminal_score(&dir);
+        score.layout.width = 0;
+        let err = render(&rec(), &score, Target::Gif, 1.0, None).unwrap_err();
+        assert!(err.to_string().contains("width"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_gif_writes_its_exact_path() {
+        let dir = render_dir("gif");
+        let score = single_terminal_score(&dir);
+        let path = render(&rec(), &score, Target::Gif, 1.0, None).unwrap();
+        assert_eq!(path, dir.join("t.gif"));
+        assert!(path.exists(), "gif file must be written");
+        assert!(std::fs::metadata(&path).unwrap().len() > 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stand-in for `mp4::encode` that records what the render path asked for
+    /// and writes a placeholder container, so the mp4 branch of `render` is
+    /// covered without a real ffmpeg. Mutating the real encoder is out of scope
+    /// for a unit test: it spawns a process and may download a binary.
+    type StubCalls =
+        std::rc::Rc<std::cell::RefCell<Vec<(std::path::PathBuf, usize, usize, u32, usize)>>>;
+
+    /// Owned form of [`Mp4Encoder`] so the capturing stub closure below can be
+    /// stored (and named) without repeating the function type inline.
+    type OwnedMp4Encoder =
+        Box<dyn Fn(&Path, usize, usize, u32, mp4::FrameSource<'_>) -> Result<()>>;
+
+    struct StubEncoder {
+        calls: StubCalls,
+        encode: OwnedMp4Encoder,
+    }
+
+    impl StubEncoder {
+        /// Each recorded call ends with the number of frames the render path
+        /// produced for the resolved geometry.
+        fn new() -> Self {
+            let calls: StubCalls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let record = std::rc::Rc::clone(&calls);
+            let encode =
+                move |path: &Path, w: usize, h: usize, fps: u32, frames: mp4::FrameSource<'_>| {
+                    let mut n = 0usize;
+                    frames(&mut |_frame: &[u8]| n += 1)?;
+                    record.borrow_mut().push((path.to_path_buf(), w, h, fps, n));
+                    std::fs::write(path, b"stub-mp4").map_err(|e| Error::io(path, e))
+                };
+            Self {
+                calls,
+                encode: Box::new(encode),
+            }
+        }
+
+        /// The stub as the encoder `render` expects.
+        fn as_encoder(&self) -> Mp4Encoder<'_> {
+            &*self.encode
+        }
+    }
+
+    #[test]
+    fn render_mp4_writes_its_exact_path() {
+        let dir = render_dir("mp4");
+        let score = single_terminal_score(&dir);
+        let encoder = StubEncoder::new();
+        let path =
+            render_with(&rec(), &score, Target::Mp4, 1.0, None, encoder.as_encoder()).unwrap();
+        assert_eq!(path, dir.join("t.mp4"));
+        assert!(path.exists(), "mp4 file must be written");
+
+        // The render path resolved the pane grid's geometry (cols*cell_w by
+        // rows*cell_h), not the layout canvas, and the score's fps.
+        let calls = encoder.calls.borrow();
+        assert_eq!(calls.len(), 1, "the encoder must be driven exactly once");
+        let (asked_path, w, h, fps, frames) = calls[0].clone();
+        assert_eq!(asked_path, dir.join("t.mp4"));
+        // 80x24 cells of 10x19 px (font 16: 16*0.6 and 16*1.2) — the pane grid,
+        // NOT the 800x600 layout canvas, which only the staged path uses.
+        assert_eq!(
+            (w, h),
+            (80 * 10, 24 * 19),
+            "pane grid geometry, not the canvas"
+        );
+        assert_ne!((w, h), (800, 600), "a single terminal is not staged");
+        assert_eq!(fps, 15, "the score's fps");
+        assert_eq!(frames, 16, "duration*fps + 1 frames");
+        drop(calls);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_mp4_propagates_an_encoder_failure() {
+        let dir = render_dir("mp4-fail");
+        let score = single_terminal_score(&dir);
+        let fail = |_p: &Path, _w: usize, _h: usize, _fps: u32, _frames: mp4::FrameSource<'_>| {
+            Err(Error::Export("stub encode failed".to_string()))
+        };
+        let err = render_with(&rec(), &score, Target::Mp4, 1.0, None, &fail).unwrap_err();
+        assert!(err.to_string().contains("stub encode failed"), "got: {err}");
+        assert!(
+            !dir.join("t.mp4").exists(),
+            "a failed encode must not leave a container behind"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A two-terminal score: `needs_stage` is true (more than one pane), so
+    /// the staged branch of `render_mp4` runs and composites on the canvas.
+    /// Terminal-only, so it stays headless — no browser pane, no Chromium.
+    fn two_terminal_score(dir: &std::path::Path) -> Score {
+        let mut score: Score = toml::from_str(
+            r#"
+[demo]
+name = "t"
+[layout]
+width = 800
+height = 600
+fps = 15
+  [[layout.panes]]
+  id = "left"
+  type = "terminal"
+  x = 0
+  y = 0
+  width = 400
+  height = 600
+  [[layout.panes]]
+  id = "right"
+  type = "terminal"
+  x = 400
+  y = 0
+  width = 400
+  height = 600
+"#,
+        )
+        .unwrap();
+        score.demo.output_dir = dir.to_path_buf();
+        score
+    }
+
+    #[test]
+    fn render_mp4_staged_composites_on_the_canvas() {
+        let dir = render_dir("mp4-staged");
+        let score = two_terminal_score(&dir);
+        let encoder = StubEncoder::new();
+        let path =
+            render_with(&rec(), &score, Target::Mp4, 1.0, None, encoder.as_encoder()).unwrap();
+        assert_eq!(path, dir.join("t.mp4"));
+        assert!(path.exists(), "mp4 file must be written");
+
+        // A staged score renders at the layout canvas (800x600), NOT the pane
+        // grid — this is the branch a single terminal never reaches.
+        let calls = encoder.calls.borrow();
+        assert_eq!(calls.len(), 1, "the encoder must be driven exactly once");
+        let (asked_path, w, h, fps, frames) = calls[0].clone();
+        assert_eq!(asked_path, dir.join("t.mp4"));
+        assert_eq!((w, h), (800, 600), "the staged canvas, not the pane grid");
+        assert_ne!((w, h), (80 * 10, 24 * 19), "not the single-terminal grid");
+        assert_eq!(fps, 15, "the score's fps");
+        assert_eq!(frames, 16, "duration*fps + 1 frames");
+        drop(calls);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_svg_animation_writes_its_exact_path() {
+        let dir = render_dir("svg");
+        let score = single_terminal_score(&dir);
+        let path = render(&rec(), &score, Target::Svg, 1.0, None).unwrap();
+        assert_eq!(path, dir.join("t.svg"));
+        assert!(path.exists(), "svg file must be written");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_svg_poster_writes_its_timestamped_path() {
+        let dir = render_dir("poster");
+        let score = single_terminal_score(&dir);
+        let path = render(&rec(), &score, Target::Svg, 1.0, Some(0.5)).unwrap();
+        assert_eq!(path, dir.join("t-at-0.5.svg"));
+        assert!(path.exists(), "poster file must be written");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

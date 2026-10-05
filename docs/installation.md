@@ -8,6 +8,18 @@ order: 2
 
 DemoStage ships a single binary, `demo`.
 
+## One-line installer
+
+```sh
+curl -fsSL https://install.univerlab.org/demostage | sh
+```
+
+## With cargo
+
+```sh
+cargo install demo-stage
+```
+
 ## From source
 
 ```sh
@@ -16,16 +28,25 @@ cd demo-stage
 cargo install --path .
 ```
 
-## With cargo (once published)
+## Self-update
+
+If you installed the `demo` binary yourself (installer script or a GitHub
+release archive), it updates itself — only when you ask:
 
 ```sh
-cargo install demo-stage
+demo update           # asks first; the default answer is no
+demo update --check   # exit 0 = current, exit 1 = a newer stable release exists, exit 2 = the check could not be completed
 ```
 
-## One-line installer (once the domain is live)
+There is **no background update check**: `demo` only contacts GitHub when you
+run `demo update`. The swap replaces just the binary — your `demo.toml`
+scores, recordings and capture sources are untouched.
+
+A binary installed with **cargo** is owned by cargo, so `demo update` refuses
+and tells you to run:
 
 ```sh
-curl -fsSL https://get.univerlab.org/demo-stage | sh
+cargo install --force demo-stage
 ```
 
 ## Optional external tools

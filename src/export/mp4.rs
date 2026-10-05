@@ -12,15 +12,21 @@ use super::{provision, raster};
 use crate::error::{Error, Result};
 use crate::model::Score;
 
-/// Encode an MP4 at `path` from frames produced by `render` (each `w`×`h` RGBA).
-/// ffmpeg is provisioned on first use.
-pub fn encode(
-    path: &Path,
-    w: usize,
-    h: usize,
-    fps: u32,
-    render: impl FnOnce(&mut dyn FnMut(&[u8])) -> Result<()>,
-) -> Result<()> {
+/// Where an encoder's frames go: the encoder calls it with each `w`×`h` RGBA
+/// frame as it is produced.
+pub type FrameSink<'a> = &'a mut dyn FnMut(&[u8]);
+
+/// The frame source an encoder drives: it is handed a [`FrameSink`] and pushes
+/// every frame of the export into it.
+pub type FrameSource<'a> = &'a mut dyn FnMut(FrameSink<'_>) -> Result<()>;
+
+/// Encode an MP4 at `path` from the frames `render` pushes into the sink it is
+/// handed (each frame `w`×`h` RGBA). ffmpeg is provisioned on first use.
+///
+/// The frame source is a [`FrameSource`] trait object (not a generic closure) so
+/// this doubles as a value: [`crate::export::render`] takes the encoder as a
+/// parameter, which lets the render path be tested without a real ffmpeg.
+pub fn encode(path: &Path, w: usize, h: usize, fps: u32, render: FrameSource<'_>) -> Result<()> {
     provision::ensure_ffmpeg()?;
 
     let size = format!("{w}x{h}");
@@ -122,7 +128,7 @@ fn ffmpeg_tail(stderr: &str) -> String {
 /// Single-terminal fast path: encode an MP4 straight from a recording.
 pub fn write_mp4(rec: &Recording, score: &Score, path: &Path) -> Result<()> {
     let plan = raster::plan(rec, score);
-    encode(path, plan.width, plan.height, plan.fps, |emit| {
+    encode(path, plan.width, plan.height, plan.fps, &mut |emit| {
         raster::render_frames(rec, score, |f| emit(f)).map(|_| ())
     })
 }

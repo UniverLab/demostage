@@ -210,7 +210,6 @@ pub fn lead_in_frames(output_frames: usize, fps: f64) -> usize {
 /// `direction` and `velocity` control the scroll behavior.
 /// `effective_speed` is the export speed multiplier (1.0 for panes with
 /// `ignore_speed`). The pan is computed in recording time and converted once.
-#[allow(clippy::too_many_arguments)]
 pub fn capture_scene(
     pdf_path: &Path,
     pane_w: usize,
