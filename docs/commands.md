@@ -41,7 +41,7 @@ demo capture [-r demo.rec] [-O demo.toml | --no-score] [--raw macro.raw.toml] [-
   **Defaults to `0` (disabled)** so a pause to think never cuts the capture
   short; set a positive value for an unattended capture. Any trailing idle is
   trimmed when normalizing.
-- `--shell` — shell to run (defaults to `$SHELL`).
+- `--shell` — shell to run (defaults to `$SHELL`; without it, Git Bash on Windows, `/bin/bash` elsewhere).
 - `--into` — splice this capture into a hand-authored stage score's timeline
   instead of building a fresh single-pane score (advanced); defaults `--score` to
   `demo.toml`.

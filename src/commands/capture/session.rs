@@ -388,8 +388,8 @@ pub fn run(args: CaptureArgs) -> Result<()> {
     let shell = args
         .shell
         .clone()
-        .or_else(|| std::env::var("SHELL").ok())
-        .unwrap_or("/bin/bash".to_string());
+        .map(Ok)
+        .unwrap_or_else(crate::shell::default_shell)?;
     let (cols, rows) = size_or_default(size());
     let pair = open_pty(cols, rows)?;
     let control_abs = create_control_file()?;

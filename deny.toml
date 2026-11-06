@@ -17,6 +17,15 @@ unmaintained = "all"
 # by upgrading.
 ignore = [
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser via fontdue, no maintained release; revisit when fontdue moves off it" },
+    # zip 8.6.0 via headless_chrome 1.0.22 (the latest release, requires zip
+    # ^8.6.0): the fix needs zip >= 9, so only an upstream headless_chrome
+    # release unblocks it. The vulnerable paths are extract() on
+    # attacker-controlled archives; demostage only extracts the Chrome build
+    # it downloads from Google. Revisit on every headless_chrome update.
+    { id = "RUSTSEC-2026-0367", reason = "zip 8.6.0 via headless_chrome 1.0.22 (latest, pins ^8.6.0); fix needs zip >= 9, upstream only" },
+    { id = "RUSTSEC-2026-0368", reason = "zip 8.6.0 via headless_chrome 1.0.22 (latest, pins ^8.6.0); fix needs zip >= 9, upstream only" },
+    { id = "RUSTSEC-2026-0369", reason = "zip 8.6.0 via headless_chrome 1.0.22 (latest, pins ^8.6.0); fix needs zip >= 9, upstream only" },
+    { id = "RUSTSEC-2026-0429", reason = "zip 8.6.0 via headless_chrome 1.0.22 (latest, pins ^8.6.0); fix needs zip >= 9, upstream only" },
 ]
 
 [licenses]
