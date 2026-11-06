@@ -100,7 +100,7 @@ pub struct CaptureArgs {
     #[arg(long, default_value_t = 0)]
     pub idle_timeout_ms: u64,
 
-    /// Shell/command to run inside the capture (defaults to `$SHELL`).
+    /// Shell/command to run inside the capture (defaults to `$SHELL`, else Git Bash on Windows, else /bin/bash).
     #[arg(long)]
     pub shell: Option<String>,
 

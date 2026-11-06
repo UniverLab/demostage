@@ -13,6 +13,7 @@ pub mod fonts;
 pub mod model;
 pub mod normalize;
 pub mod paths;
+pub mod shell;
 pub mod validate;
 
 pub use error::{Error, Result};

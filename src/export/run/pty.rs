@@ -106,7 +106,7 @@ impl CapturePty {
             })
             .map_err(|e| Error::Export(format!("openpty: {e}")))?;
 
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+        let shell = crate::shell::default_shell()?;
         let prompt = score
             .demo
             .prompt
