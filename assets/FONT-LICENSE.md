@@ -11,4 +11,4 @@ pure-Rust GIF renderer).
   for the full terms.
 
 The font files are licensed by their respective authors; DemoStage's own code is
-under the repository's `LICENSE`.
+under the repository's license: MIT (`LICENSE-MIT`) or Apache-2.0 (`LICENSE-APACHE`).

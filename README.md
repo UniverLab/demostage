@@ -6,7 +6,7 @@
   <a href="https://github.com/UniverLab/demo-stage/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/UniverLab/demo-stage/ci.yml?branch=main&style=for-the-badge&label=CI" alt="CI"/></a>
   <img src="https://img.shields.io/badge/Status-Alpha-E6C84A?style=for-the-badge" alt="Status"/>
   <img src="https://img.shields.io/badge/Demos-as%20Code-8e8ff0?style=for-the-badge" alt="Demos as Code"/>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-2E8B57?style=for-the-badge" alt="License"/></a>
+  <a href="#license"><img src="https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-2E8B57?style=for-the-badge" alt="License"/></a>
 </p>
 
 **DemoStage** turns terminal demos into reproducible engineering — *Demos as Code*.
@@ -227,7 +227,8 @@ cargo test
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE). The embedded font has its own permissive license,
+Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+Releases up to 0.4.1 were published under MIT only. The embedded font has its own permissive license,
 see [`assets/FONT-LICENSE.md`](assets/FONT-LICENSE.md).
 
 ---
